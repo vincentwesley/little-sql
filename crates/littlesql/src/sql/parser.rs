@@ -252,6 +252,8 @@ impl<'a> Parser<'a> {
             return Ok(Some(self.ident()?));
         }
         match self.peek() {
+            // `t INDEXED BY i` and `t NOT INDEXED` are not aliases.
+            Tok::Word(w) if w.eq_ignore_ascii_case("INDEXED") && self.is_kw_at(1, "BY") => Ok(None),
             Tok::Word(w) if !is_reserved(w) => Ok(Some(self.ident()?)),
             Tok::Quoted { .. } | Tok::Str(_) => Ok(Some(self.ident()?)),
             _ => Ok(None),
@@ -1074,11 +1076,13 @@ impl<'a> Parser<'a> {
             TableSource::Table { schema, name }
         };
         let alias = self.opt_alias()?;
+        let mut indexed = Indexed::Any;
         if self.eat_kw("INDEXED") {
             self.expect_kw("BY")?;
-            self.ident()?;
+            indexed = Indexed::By(self.ident()?);
         } else if self.is_kw("NOT") && self.is_kw_at(1, "INDEXED") {
             self.pos += 2;
+            indexed = Indexed::No;
         }
         Ok(FromItem {
             join,
@@ -1087,6 +1091,7 @@ impl<'a> Parser<'a> {
             alias,
             on: None,
             using: Vec::new(),
+            indexed,
         })
     }
 

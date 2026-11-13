@@ -18,3 +18,14 @@ SELECT c.name, o.id FROM customers c JOIN orders o ON o.customer_id = c.id WHERE
 SELECT l.qty, p.title FROM lines l JOIN products p ON p.sku = l.sku WHERE l.order_id = 99;
 SELECT * FROM customers WHERE id IN (1, 2, 3);
 SELECT city, count(*) FROM customers GROUP BY city;
+SELECT id FROM customers WHERE id > 290 ORDER BY id DESC;
+SELECT id, city FROM customers ORDER BY city DESC LIMIT 12;
+SELECT id FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE city = 'Clementi');
+SELECT * FROM lines WHERE order_id IN (10, 11) ORDER BY order_id DESC, sku DESC;
+SELECT order_id, sku FROM lines WHERE sku = 'SKU-002' ORDER BY order_id;
+SELECT order_id, count(*) FROM lines WHERE order_id < 30 GROUP BY order_id;
+SELECT customer_id, count(*) FROM orders GROUP BY customer_id;
+SELECT * FROM customers NOT INDEXED WHERE city = 'Bedok';
+SELECT sku FROM products INDEXED BY products_cat_price WHERE category = 'veg' ORDER BY price;
+SELECT c.name, count(*) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.id;
+SELECT p.sku, sum(l.qty) FROM products p LEFT JOIN lines l ON l.sku = p.sku GROUP BY p.sku;

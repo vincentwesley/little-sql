@@ -115,6 +115,18 @@ pub struct FromItem {
     pub alias: Option<String>,
     pub on: Option<Expr>,
     pub using: Vec<String>,
+    pub indexed: Indexed,
+}
+
+/// `INDEXED BY name` / `NOT INDEXED` after a table in FROM.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum Indexed {
+    #[default]
+    Any,
+    /// Use no index (the rowid is still allowed).
+    No,
+    /// Use exactly this index.
+    By(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -200,25 +200,43 @@ impl Shell {
                     let _ = writeln!(out, "{}", rs.columns.join(sep));
                 }
                 for row in &rs.rows {
-                    let cells: Vec<String> = row.iter().map(|v| text(v, &null)).collect();
-                    let _ = writeln!(out, "{}", cells.join(sep));
+                    let mut line: Vec<u8> = Vec::new();
+                    for (i, v) in row.iter().enumerate() {
+                        if i > 0 {
+                            line.extend_from_slice(sep.as_bytes());
+                        }
+                        line.extend_from_slice(&cell_bytes(v, &null));
+                    }
+                    line.push(b'\n');
+                    let _ = out.write_all(&line);
                 }
             }
             Mode::Csv => {
-                let quote = |s: &str| {
-                    if s.contains([',', '"', '\n', '\r']) {
-                        format!("\"{}\"", s.replace('"', "\"\""))
+                let quote = |s: &[u8]| -> Vec<u8> {
+                    if s.iter().any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r')) {
+                        let mut q = vec![b'"'];
+                        for b in s {
+                            if *b == b'"' {
+                                q.push(b'"');
+                            }
+                            q.push(*b);
+                        }
+                        q.push(b'"');
+                        q
                     } else {
-                        s.to_string()
+                        s.to_vec()
                     }
                 };
                 if self.headers {
-                    let h: Vec<String> = rs.columns.iter().map(|c| quote(c)).collect();
-                    let _ = writeln!(out, "{}", h.join(","));
+                    let h: Vec<Vec<u8>> = rs.columns.iter().map(|c| quote(c.as_bytes())).collect();
+                    let _ = out.write_all(&h.join(&b","[..]));
+                    let _ = out.write_all(b"\n");
                 }
                 for row in &rs.rows {
-                    let cells: Vec<String> = row.iter().map(|v| quote(&text(v, &null))).collect();
-                    let _ = writeln!(out, "{}", cells.join(","));
+                    let cells: Vec<Vec<u8>> =
+                        row.iter().map(|v| quote(&cell_bytes(v, &null))).collect();
+                    let _ = out.write_all(&cells.join(&b","[..]));
+                    let _ = out.write_all(b"\n");
                 }
             }
             Mode::Line => {
@@ -227,7 +245,8 @@ impl Shell {
                     .iter()
                     .map(|c| c.chars().count())
                     .max()
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    .max(5);
                 for (i, row) in rs.rows.iter().enumerate() {
                     if i > 0 {
                         let _ = writeln!(out);
@@ -272,72 +291,55 @@ impl Shell {
                             .collect()
                     })
                     .collect();
-                let numeric: Vec<bool> = (0..rs.columns.len())
-                    .map(|i| {
-                        rs.rows
-                            .iter()
-                            .all(|r| matches!(r[i], Value::Int(_) | Value::Real(_) | Value::Null))
-                            && !rs.rows.is_empty()
-                    })
-                    .collect();
                 let mut width: Vec<usize> = rs.columns.iter().map(|c| c.chars().count()).collect();
                 for r in &cells {
                     for (i, c) in r.iter().enumerate() {
                         width[i] = width[i].max(c.chars().count());
                     }
                 }
+                // Like sqlite3: cells left-aligned, headers centred in the
+                // boxed modes.
                 let pad = |s: &str, i: usize| -> String {
                     let n = width[i].saturating_sub(s.chars().count());
-                    if numeric[i] && self.mode != Mode::Column {
-                        format!("{}{s}", " ".repeat(n))
-                    } else {
-                        format!("{s}{}", " ".repeat(n))
-                    }
+                    format!("{s}{}", " ".repeat(n))
+                };
+                let centre = |s: &str, i: usize| -> String {
+                    let n = width[i].saturating_sub(s.chars().count());
+                    format!("{}{s}{}", " ".repeat(n / 2), " ".repeat(n - n / 2))
                 };
                 let rule = |l: &str, m: &str, r: &str, fill: &str| -> String {
                     let parts: Vec<String> = width.iter().map(|w| fill.repeat(w + 2)).collect();
                     format!("{l}{}{r}", parts.join(m))
                 };
+                let header: Vec<String> = rs
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| centre(c, i))
+                    .collect();
                 match self.mode {
                     Mode::Column => {
-                        let line = |v: Vec<String>| v.join("  ").trim_end().to_string();
                         if self.headers {
-                            let h = rs
+                            let h: Vec<String> = rs
                                 .columns
                                 .iter()
                                 .enumerate()
                                 .map(|(i, c)| pad(c, i))
                                 .collect();
-                            let _ = writeln!(out, "{}", line(h));
-                            let d = width.iter().map(|w| "-".repeat(*w)).collect();
-                            let _ = writeln!(out, "{}", line(d));
+                            let _ = writeln!(out, "{}", h.join("  "));
+                            let d: Vec<String> = width.iter().map(|w| "-".repeat(*w)).collect();
+                            let _ = writeln!(out, "{}", d.join("  "));
                         }
                         for r in &cells {
-                            let v = r.iter().enumerate().map(|(i, c)| pad(c, i)).collect();
-                            let _ = writeln!(out, "{}", line(v));
+                            let v: Vec<String> =
+                                r.iter().enumerate().map(|(i, c)| pad(c, i)).collect();
+                            let _ = writeln!(out, "{}", v.join("  "));
                         }
                     }
                     Mode::Markdown => {
                         let row = |v: Vec<String>| format!("| {} |", v.join(" | "));
-                        let h = rs
-                            .columns
-                            .iter()
-                            .enumerate()
-                            .map(|(i, c)| pad(c, i))
-                            .collect();
-                        let _ = writeln!(out, "{}", row(h));
-                        let d = width
-                            .iter()
-                            .zip(&numeric)
-                            .map(|(w, n)| {
-                                if *n {
-                                    format!("{}:", "-".repeat(w.saturating_sub(1)))
-                                } else {
-                                    "-".repeat(*w)
-                                }
-                            })
-                            .collect();
-                        let _ = writeln!(out, "{}", row(d));
+                        let _ = writeln!(out, "{}", row(header));
+                        let _ = writeln!(out, "{}", rule("|", "|", "|", "-"));
                         for r in &cells {
                             let v = r.iter().enumerate().map(|(i, c)| pad(c, i)).collect();
                             let _ = writeln!(out, "{}", row(v));
@@ -354,13 +356,7 @@ impl Shell {
                             format!("{v} {} {v}", cells.join(&format!(" {v} ")))
                         };
                         let _ = writeln!(out, "{}", rule(top[0], top[1], top[2], fill));
-                        let h = rs
-                            .columns
-                            .iter()
-                            .enumerate()
-                            .map(|(i, c)| pad(c, i))
-                            .collect();
-                        let _ = writeln!(out, "{}", row(h));
+                        let _ = writeln!(out, "{}", row(header));
                         let _ = writeln!(out, "{}", rule(mid[0], mid[1], mid[2], fill));
                         for r in &cells {
                             let c = r.iter().enumerate().map(|(i, c)| pad(c, i)).collect();
@@ -436,13 +432,29 @@ impl Shell {
                     None => String::new(),
                 };
                 let sql = format!(
-                    "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL \
+                    "SELECT sql, type, name FROM sqlite_schema WHERE sql IS NOT NULL \
                      AND name NOT LIKE 'sqlite_%'{filter} ORDER BY rowid"
                 );
                 match self.query_rows(&sql) {
                     Ok(rows) => {
                         for r in rows {
-                            let _ = writeln!(self.out, "{};", r[0].to_text());
+                            let mut text = r[0].to_text();
+                            // Like sqlite3, follow a view with its column names.
+                            if r[1].to_text() == "view" {
+                                let name = r[2].to_text();
+                                let q = format!(
+                                    "SELECT * FROM \"{}\" LIMIT 0",
+                                    name.replace('"', "\"\"")
+                                );
+                                if let Ok(rs) = self.db.query(&q) {
+                                    text.push_str(&format!(
+                                        "\n/* {}({}) */",
+                                        name,
+                                        rs.columns.join(",")
+                                    ));
+                                }
+                            }
+                            let _ = writeln!(self.out, "{text};");
                         }
                     }
                     Err(e) => self.print_error(&e),
@@ -461,12 +473,7 @@ impl Shell {
                 );
             }
             ".mode" => match arg1.and_then(Mode::parse) {
-                Some(m) => {
-                    self.mode = m;
-                    if matches!(m, Mode::Column | Mode::Table | Mode::Box | Mode::Markdown) {
-                        self.headers = true;
-                    }
-                }
+                Some(m) => self.mode = m,
                 None => self.print_error(
                     "mode should be one of: list csv tabs line json column table box markdown",
                 ),
@@ -562,6 +569,19 @@ impl Shell {
         }
         None
     }
+}
+
+/// A value as the sqlite3 shell writes it in list and CSV modes: the bytes
+/// of its text form, up to the first NUL (the shell prints C strings), so
+/// blobs come out raw.
+fn cell_bytes(v: &Value, null: &str) -> Vec<u8> {
+    let bytes = match v {
+        Value::Null => return null.as_bytes().to_vec(),
+        Value::Blob(b) => b.to_vec(),
+        other => other.to_text().into_bytes(),
+    };
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    bytes[..end].to_vec()
 }
 
 fn json_string(s: &str) -> String {
@@ -691,16 +711,12 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let table_like = matches!(
-        mode,
-        Mode::Column | Mode::Table | Mode::Box | Mode::Markdown
-    );
     let mut shell = Shell {
         db,
         path,
         readonly,
         mode,
-        headers: headers.unwrap_or(table_like),
+        headers: headers.unwrap_or(false),
         separator,
         null,
         eqp,

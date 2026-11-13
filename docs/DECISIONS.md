@@ -136,3 +136,41 @@ the standard we are graded against:
 `evidence/slt_lang_aggfunc.test` (lines 480-496): sqlite3 itself raises the
 overflow, and its own printf gives the 16-digit rendering. Anything looser
 would risk counting a failure as a pass.
+
+## D15. The corpus is fetched, not vendored
+
+`scripts/fetch-sqllogictest.sh` does a sparse, shallow fetch of the files
+listed in `tests/slt/SAMPLE` (or of everything with `--full`) from a pinned
+commit of a GitHub mirror of SQLite's sqllogictest. *Why:* the sample is
+66 MB and the full corpus 1.1 GB; committing either would bloat every clone
+of a small project. Pinning the commit keeps the score reproducible. The
+sample choice is explained in `tests/slt/MANIFEST.md`.
+
+## D16. The planner uses SQLite's no-statistics heuristics
+
+Without ANALYZE data SQLite assumes an equality on the first column of an
+index leaves about 10 rows, each further equality halves that, and each
+range bound keeps a quarter. Little SQL uses the same rules, prefers a
+covering index for a full scan, walks an index (or the rowid, backwards if
+needed) instead of sorting when that gives the ORDER BY or GROUP BY order,
+and looks up `IN (...)` values one by one. *Why:* plans that agree with
+SQLite's can be checked mechanically (acceptance check A4.1 compares
+`EXPLAIN QUERY PLAN` output line by line), and the heuristics are good ones.
+Join order is still greedy (cheapest next table), which is what lets
+select5's 64-table joins plan instantly.
+
+## D17. Bare columns follow SQLite's row choice
+
+In `SELECT a, b FROM t GROUP BY a`, `b` comes from the last row of the group
+when the engine hashes groups (SQLite sorts and keeps the last row), from the
+first row when groups stream from an index in order (as SQLite does), and
+from the row that set the value of a lone `min()`/`max()`. *Why:* SQLite
+documents the value as arbitrary but programs depend on its actual choice;
+the differential suite checks it.
+
+## D18. `UNION` keeps the later of two equal rows
+
+`SELECT 1 UNION SELECT 1.0` returns `1.0`, and `'a' COLLATE NOCASE UNION
+'A'` returns `A`, because SQLite inserts rows into a temporary index where an
+equal key replaces the earlier one. Little SQL does the same. INTERSECT and
+EXCEPT return the left side's (last) row.

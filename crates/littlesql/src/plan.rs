@@ -104,6 +104,9 @@ pub struct Subquery {
     /// Cursors of enclosing queries that the subquery reads. Empty means
     /// the result is the same for every outer row and can be cached.
     pub outer_refs: Vec<usize>,
+    /// The right-hand side of `IN (SELECT ...)`, rather than a scalar or
+    /// EXISTS subquery.
+    pub list: bool,
 }
 
 #[derive(Clone)]
@@ -170,6 +173,9 @@ pub struct Core {
 pub struct Agg {
     pub slot: usize,
     pub group_by: Vec<(Expr, Collation)>,
+    /// Rows arrive in GROUP BY order, so each group is finished as soon as
+    /// the next one starts (no hash table).
+    pub sorted: bool,
     pub calls: Vec<AggCall>,
     pub having: Option<Expr>,
 }
@@ -188,6 +194,9 @@ pub struct Source {
     pub name: String,
     pub kind: SourceKind,
     pub left_join: bool,
+    /// Visit rows in descending key order (to deliver an ORDER BY ... DESC
+    /// without sorting).
+    pub reverse: bool,
     /// LEFT JOIN: ON terms that decide whether a row matches.
     pub on_filters: Vec<Expr>,
     /// WHERE (and inner-join ON) terms that can be checked once this source
@@ -218,11 +227,28 @@ pub struct HashProbe {
     pub cmps: Vec<(Affinity, Collation)>,
 }
 
+/// The value(s) an equality lookup searches for.
+#[derive(Clone)]
+pub enum KeyExpr {
+    /// `col = expr`
+    One(Expr),
+    /// `col IN (e1, e2, ...)`: one lookup per distinct value, in key order.
+    List(Vec<Expr>),
+    /// `col IN (SELECT ...)`: one lookup per distinct value of the result.
+    Sub(Rc<Subquery>),
+}
+
+impl KeyExpr {
+    pub fn is_one(&self) -> bool {
+        matches!(self, KeyExpr::One(_))
+    }
+}
+
 pub enum Access {
     /// Visit every row.
     Scan,
-    /// `rowid = expr`
-    Rowid(Expr),
+    /// `rowid = expr` or `rowid IN (...)`
+    Rowid(KeyExpr),
     /// `rowid` between optional bounds; the flag says "inclusive".
     RowidRange {
         lo: Option<(Expr, bool)>,
@@ -236,7 +262,7 @@ pub struct IndexAccess {
     pub index: Rc<Index>,
     /// Equality keys for the leading index columns, with the affinity to
     /// apply to each key value.
-    pub eq: Vec<(Expr, Affinity)>,
+    pub eq: Vec<(KeyExpr, Affinity)>,
     /// Optional bounds on the next index column: (value, affinity, inclusive).
     pub lo: Option<(Expr, Affinity, bool)>,
     pub hi: Option<(Expr, Affinity, bool)>,
@@ -465,12 +491,14 @@ fn describe_source(s: &Source) -> String {
                 Access::Scan => format!("SCAN {named}"),
                 Access::Rowid(_) => format!("SEARCH {named} USING INTEGER PRIMARY KEY (rowid=?)"),
                 Access::RowidRange { lo, hi } => {
+                    // SQLite prints rowid ranges as > and < whether or not
+                    // the bounds are inclusive.
                     let mut terms = Vec::new();
-                    if let Some((_, inc)) = lo {
-                        terms.push(format!("rowid{}?", op_text(*inc, true)));
+                    if lo.is_some() {
+                        terms.push("rowid>?".to_string());
                     }
-                    if let Some((_, inc)) = hi {
-                        terms.push(format!("rowid{}?", op_text(*inc, false)));
+                    if hi.is_some() {
+                        terms.push("rowid<?".to_string());
                     }
                     format!(
                         "SEARCH {named} USING INTEGER PRIMARY KEY ({})",
@@ -487,12 +515,20 @@ fn describe_source(s: &Source) -> String {
                     if let Some((_, _, inc)) = &ix.hi {
                         terms.push(format!("{}{}?", col(ix.eq.len()), op_text(*inc, false)));
                     }
-                    format!(
-                        "SEARCH {named} USING {}INDEX {} ({})",
-                        if ix.covering { "COVERING " } else { "" },
-                        ix.index.name,
-                        terms.join(" AND ")
-                    )
+                    let which = if ix.index.primary {
+                        "PRIMARY KEY".to_string()
+                    } else {
+                        format!(
+                            "{}INDEX {}",
+                            if ix.covering { "COVERING " } else { "" },
+                            ix.index.name
+                        )
+                    };
+                    match (terms.is_empty(), ix.index.primary) {
+                        (true, true) => format!("SCAN {named}"),
+                        (true, false) => format!("SCAN {named} USING {which}"),
+                        _ => format!("SEARCH {named} USING {which} ({})", terms.join(" AND ")),
+                    }
                 }
                 Access::Hash(h) => {
                     let terms: Vec<String> = h
@@ -528,14 +564,15 @@ fn explain_exprs<'a>(exprs: impl Iterator<Item = &'a Expr>, depth: usize, out: &
         subqueries(e, &mut subs);
     }
     for s in subs {
-        let kind = if s.outer_refs.is_empty() {
-            "SCALAR"
-        } else {
-            "CORRELATED SCALAR"
+        let kind = match (s.list, s.outer_refs.is_empty()) {
+            (true, true) => "LIST",
+            (true, false) => "CORRELATED LIST",
+            (false, true) => "SCALAR",
+            (false, false) => "CORRELATED SCALAR",
         };
         out.push(PlanLine {
             depth,
-            text: format!("{kind} SUBQUERY {}", s.id),
+            text: format!("{kind} SUBQUERY {}", s.id + 1),
             cursor: None,
         });
         explain_query(&s.query, depth + 1, out);
@@ -584,7 +621,7 @@ pub fn explain_query(q: &Query, depth: usize, out: &mut Vec<PlanLine>) {
                     depth,
                     out,
                 );
-                if !agg.group_by.is_empty() {
+                if !agg.group_by.is_empty() && !agg.sorted {
                     out.push(PlanLine {
                         depth,
                         text: "USE TEMP HASH TABLE FOR GROUP BY".into(),

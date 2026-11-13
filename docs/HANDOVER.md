@@ -2,59 +2,74 @@
 
 Updated after every milestone so a new session can continue from here.
 
-## Status (checkpoint, 2026-11-13)
+## Status (after M4, 2026-11-13)
 
-Work in progress on M0–M4 together; nothing below has been through the
-acceptance script yet (it does not exist yet).
+M0–M4 are done: `scripts/acceptance.sh` passes all 12 checks for M0–M4.
 
-**Written and compiling**
+| Suite | Passed | Failed | Rate |
+|-------|-------:|-------:|-----:|
+| sqllogictest full corpus, read mode | 5,729,099 | 0 | 100.00 % |
+| sqllogictest CI sample (49 files), read mode | 240,267 | 0 | 100.00 % |
+| Differential (14 files, 5 fixtures) | 251 | 6 | 97.66 % |
+| Planner: plans identical to sqlite3's EQP | 29 | 0 | — |
 
-- `crates/littlesql` (engine, zero dependencies): `value`, `record`,
-  `storage`, `pager` (with dirty pages, commit, checkpoint), `wal` (SQLite
-  WAL format, read + append), `btree` (read cursors, seek, overflow),
-  `schema`, `sql/{lexer,ast,parser}`, `bind` (name resolution + join
-  planner), `plan` (bound plan + EXPLAIN rendering), `exec` (executor),
-  `func`, `datetime`, `db` (public `Database`).
-- `crates/slt`: sqllogictest runner (`slt run`, read and native modes) and
-  differential runner (`slt diff`), own MD5, JSON/text reports.
-- `crates/littlesql-cli`: **placeholder** `main.rs` (two args: db, sql).
-- Docs: RESEARCH, DECISIONS, PLAN, ACCEPTANCE, NEEDS-VIN.
+The read side has stopped climbing (nothing left to fix in read mode), so
+per the brief the next work is writes. The six differential failures are
+known (window functions ×5, JSON ×1), marked `-- known-failure:` and still
+counted.
 
-**First measurement** (read mode, sqlite3 3.45.1 as reference):
-select1 + select2 + select3 + evidence = 5640 pass / 4 fail (99.93 %).
-The 4 failures are `sum()`/`total()` near the int64 limit in
-`evidence/slt_lang_aggfunc.test`. select4, select5, `index/` and `random/`
-have not been run yet.
+**What exists**
 
-**Stubs** — `write.rs` (all DML/DDL returns Unsupported) and `check.rs`
-(integrity check returns ok without checking).
+- `crates/littlesql` (engine, zero dependencies): storage, pager, WAL
+  (read + append), B-tree read cursors, records, schema (incl. WITHOUT ROWID
+  primary keys as a pseudo-index), lexer/parser/AST, binder + planner
+  (SQLite's no-stats heuristics, IN lookups, ORDER BY / GROUP BY by index
+  order, covering scans, INDEXED BY / NOT INDEXED), executor (nested loops,
+  hash joins, streaming or hashed aggregation, recursive CTEs), functions,
+  date/time, `Database` API.
+- `crates/littlesql-cli`: the `littlesql` shell, output identical to sqlite3
+  in list/csv/tabs/line/json/column/table/box/markdown modes.
+- `crates/slt`: sqllogictest runner (read and native modes), differential
+  runner, reports.
+- `scripts/fetch-sqllogictest.sh` (sample or `--full`), `scripts/acceptance.sh`.
+- CI: `.github/workflows/ci.yml` (fmt, clippy, test, build; then the
+  acceptance checks on the sample; manual dispatch input `full` for the
+  whole corpus).
+
+**Stubs**: `write.rs` (all DML/DDL returns Unsupported), `check.rs`
+(integrity check returns ok without checking). `Database::explicit_txn` and
+`reload_schema` are unused until writes land.
 
 ## Next steps, in order
 
-1. `cargo clippy` is not clean yet (unused `mut`, dead fields); fix.
-2. Run select4, select5, a slice of `index/` and `random/`; fix failures.
-3. Real CLI (shell, dot commands, modes).
-4. M0 leftovers: LICENSE (MIT), SECURITY.md, README, CI workflow,
-   `scripts/acceptance.sh`, `scripts/fetch-sqllogictest.sh`.
-5. Vendor the CI sample into `tests/slt/` with `MANIFEST.md` and `FLOOR`.
-6. Differential tests under `tests/differential/` with fixtures.
-7. Then M5 (wasm + playground + demo DB), M6–M9 per PLAN.md.
+1. M5: `crates/littlesql-wasm` (raw C ABI, no wasm-bindgen), static
+   playground under `playground/` built into `playground/dist/` by
+   `scripts/build-playground.sh`, demo DB from the HDB CSV
+   (`scripts/build-demo-db.sh`), `scripts/playground-smoke.mjs`,
+   `scripts/publish-results.sh [--check]` that writes the README table and
+   `results.json` from `results/*.json`. Then add M5 to `IMPLEMENTED` in
+   `scripts/acceptance.sh`.
+2. M7 writes: B-tree insert/split/delete, freelist, CREATE/DROP/INSERT/
+   UPDATE/DELETE, real `check.rs`; `slt run --mode native`; `write-check.sh`.
+3. M8 transactions + WAL crash tests (`crash-check.sh`); M9 benchmarks
+   (`bench.sh`); M10 fresh-clone acceptance + stranger review + single PR.
+4. Read-side extras if time allows: window functions, JSON.
 
 ## Environment notes for a new session
 
 - `sqlite3` comes from `apt-get install -y sqlite3`; the wasm target from
   `rustup target add wasm32-unknown-unknown`.
-- The corpus: `git clone --depth 1 https://github.com/gregrahn/sqllogictest`
-  (sqlite.org's Fossil server blocks scripts). In the first session it was
-  at `/home/user/gregrahn/sqllogictest`.
+- Corpus: `scripts/fetch-sqllogictest.sh [--full]` (into `./corpus`,
+  gitignored). In the first session a full clone was also at
+  `/home/user/gregrahn/sqllogictest`.
 - HDB CSV: `https://api-open.data.gov.sg/v1/public/api/datasets/d_8b84c4ee58e3cfc0ece0d773c8ca6abc/poll-download`
-  returns a JSON with a signed download URL.
-- Probe command:
-  `cargo build --release && ./target/release/slt run --failures /tmp/f.txt <corpus>/test/select1.test`
+  returns JSON with a signed download URL. A copy was in the session
+  scratchpad (`hdb/hdb.csv`); it is not in the repo.
 
 ## Known issues
 
 - `slt run DIR` derives categories from the path relative to DIR, so pass
-  the corpus `test/` directory (or the vendored `tests/slt/`) as the root.
-- Recursive CTEs, window functions, RIGHT/FULL JOIN (beyond the simple
-  two-table RIGHT JOIN), triggers and row values are not implemented.
+  the corpus `test/` directory as the root.
+- Join order is greedy; it can pick a worse order than SQLite's for 3+
+  table joins with skewed sizes (results are still correct).
+- The CLI has no line editing (no dependencies); use `rlwrap` if wanted.

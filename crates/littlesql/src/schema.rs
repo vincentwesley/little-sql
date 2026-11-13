@@ -49,6 +49,20 @@ pub struct Index {
     /// (and which make their table read-only for this engine).
     pub usable: bool,
     pub sql: Option<String>,
+    /// Columns stored after the key in every entry, before nothing else:
+    /// for an index on a WITHOUT ROWID table, the primary key columns not
+    /// already in the key. (Entries of other indexes end with the rowid.)
+    pub extra: Vec<usize>,
+    /// True for the primary key of a WITHOUT ROWID table, whose "index" is
+    /// the table b-tree itself.
+    pub primary: bool,
+}
+
+impl Index {
+    /// Does every entry carry column `col` (in its key or after it)?
+    pub fn holds(&self, col: usize) -> bool {
+        self.cols.iter().any(|c| c.col == col) || self.extra.contains(&col)
+    }
 }
 
 #[derive(Debug)]
@@ -65,6 +79,9 @@ pub struct Table {
     /// Primary key columns of a WITHOUT ROWID table.
     pub pk: Vec<IndexCol>,
     pub indexes: Vec<Rc<Index>>,
+    /// The primary key of a WITHOUT ROWID table, as an index over the
+    /// table's own b-tree.
+    pub pk_index: Option<Rc<Index>>,
     pub autoincrement: bool,
     pub sql: String,
     row_estimate: Cell<Option<u64>>,
@@ -234,6 +251,7 @@ pub fn table_from_ast(ct: &CreateTable, name: &str, root: u32, sql: &str) -> Res
         storage_order: Vec::new(),
         pk: Vec::new(),
         indexes: Vec::new(),
+        pk_index: None,
         autoincrement: ct.columns.iter().any(|c| c.autoincrement),
         sql: sql.to_string(),
         row_estimate: Cell::new(None),
@@ -394,7 +412,7 @@ impl Schema {
                     let idx = match parse_one(sql) {
                         Ok(Stmt::CreateIndex(ci)) => {
                             let mut cols = Vec::new();
-                            let mut usable = !ci.partial && !table.without_rowid;
+                            let mut usable = !ci.partial;
                             for c in &ci.columns {
                                 let col = c.name.as_ref().and_then(|n| table.column_index(n));
                                 let coll = c.collation.as_ref().map(|n| Collation::from_name(n));
@@ -420,6 +438,8 @@ impl Schema {
                                 unique: ci.unique,
                                 usable,
                                 sql: Some(sql.clone()),
+                                extra: Vec::new(),
+                                primary: false,
                             }
                         }
                         _ => Index {
@@ -430,6 +450,8 @@ impl Schema {
                             unique: false,
                             usable: false,
                             sql: Some(sql.clone()),
+                            extra: Vec::new(),
+                            primary: false,
                         },
                     };
                     table.indexes.push(Rc::new(idx));
@@ -451,12 +473,50 @@ impl Schema {
                     root: r.root,
                     cols: if matched { keys[i].clone() } else { Vec::new() },
                     unique: true,
-                    usable: matched && !table.without_rowid,
+                    usable: matched,
                     sql: None,
+                    extra: Vec::new(),
+                    primary: false,
                 }));
             }
         }
-        for (k, (t, _)) in tables {
+        for (k, (mut t, _)) in tables {
+            if t.without_rowid {
+                let pk_cols: Vec<usize> = t.pk.iter().map(|c| c.col).collect();
+                t.indexes = t
+                    .indexes
+                    .iter()
+                    .map(|ix| {
+                        let extra = pk_cols
+                            .iter()
+                            .copied()
+                            .filter(|c| !ix.cols.iter().any(|ic| ic.col == *c))
+                            .collect();
+                        Rc::new(Index {
+                            name: ix.name.clone(),
+                            table: ix.table.clone(),
+                            root: ix.root,
+                            cols: ix.cols.clone(),
+                            unique: ix.unique,
+                            usable: ix.usable,
+                            sql: ix.sql.clone(),
+                            extra,
+                            primary: false,
+                        })
+                    })
+                    .collect();
+                t.pk_index = Some(Rc::new(Index {
+                    name: "PRIMARY KEY".into(),
+                    table: t.name.clone(),
+                    root: t.root,
+                    cols: t.pk.clone(),
+                    unique: true,
+                    usable: true,
+                    sql: None,
+                    extra: t.storage_order[t.pk.len()..].to_vec(),
+                    primary: true,
+                }));
+            }
             self.tables.insert(k, Rc::new(t));
         }
         for r in rows.iter().filter(|r| r.kind == "view") {

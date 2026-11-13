@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::func::{lookup_agg, lookup_scalar};
 use crate::pager::Pager;
 use crate::plan::*;
-use crate::schema::{Schema, Table};
+use crate::schema::{Index, Schema, Table};
 use crate::sql::ast::{
     self, BinaryOp, FromItem, JoinKind, LikeOp, ResultColumn, SelectBody, TableSource,
 };
@@ -79,6 +79,7 @@ struct Item {
     kind: ItemKind,
     left_join: bool,
     ncols: usize,
+    indexed: ast::Indexed,
 }
 
 struct Conj {
@@ -93,9 +94,19 @@ struct Conj {
 struct Constraint {
     col: usize,
     op: BinaryOp,
-    rhs: Expr,
+    /// For `op == Eq` the value(s) to look up; for ranges always `One`.
+    rhs: KeyExpr,
     aff: Affinity,
     coll: Collation,
+}
+
+impl Constraint {
+    fn one(&self) -> Option<&Expr> {
+        match &self.rhs {
+            KeyExpr::One(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 pub struct Binder<'a> {
@@ -112,6 +123,8 @@ pub struct Binder<'a> {
     view_depth: usize,
     /// Nesting depth of SELECTs being bound.
     query_depth: usize,
+    /// INDEXED BY / NOT INDEXED, by cursor.
+    indexed: HashMap<usize, ast::Indexed>,
     work_tables: Vec<WorkDef>,
     next_work: usize,
 }
@@ -157,6 +170,7 @@ impl<'a> Binder<'a> {
             aggs: Vec::new(),
             view_depth: 0,
             query_depth: 0,
+            indexed: HashMap::new(),
             work_tables: Vec::new(),
             next_work: 0,
         }
@@ -437,6 +451,7 @@ impl<'a> Binder<'a> {
                 kind: ItemKind::Table(table.clone()),
                 left_join: false,
                 ncols,
+                indexed: ast::Indexed::Any,
             },
             src,
         )
@@ -489,6 +504,7 @@ impl<'a> Binder<'a> {
             },
             left_join: false,
             ncols,
+            indexed: ast::Indexed::Any,
         };
         Ok((item, src))
     }
@@ -587,7 +603,15 @@ impl<'a> Binder<'a> {
                 }
                 if let Some(t) = self.schema.table(name) {
                     let t = t.clone();
-                    return Ok(self.table_source(&t, alias));
+                    if let ast::Indexed::By(ix) = &fi.indexed {
+                        if !t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(ix)) {
+                            return Err(Error::Sql(format!("no such index: {ix}")));
+                        }
+                    }
+                    let (mut item, src) = self.table_source(&t, alias);
+                    item.indexed = fi.indexed.clone();
+                    self.indexed.insert(item.cursor, fi.indexed.clone());
+                    return Ok((item, src));
                 }
                 if let Some(v) = self.schema.view(name) {
                     let v = v.clone();
@@ -996,6 +1020,7 @@ impl<'a> Binder<'a> {
             Some(Agg {
                 slot,
                 group_by,
+                sorted: false,
                 calls,
                 having,
             })
@@ -1003,7 +1028,40 @@ impl<'a> Binder<'a> {
             None
         };
 
-        let (sources, const_filters) = self.plan_joins(items, bound)?;
+        let (mut sources, const_filters) = self.plan_joins(items, bound)?;
+        // Group without a hash table when the outermost loop delivers rows
+        // in GROUP BY order.
+        let mut agg = agg;
+        if let Some(a) = agg.as_mut().filter(|a| !a.group_by.is_empty()) {
+            let gkeys: Vec<OrderKey> = a
+                .group_by
+                .iter()
+                .map(|(_, coll)| OrderKey {
+                    src: KeySrc::Result(0),
+                    desc: false,
+                    nulls_first: true,
+                    coll: *coll,
+                })
+                .collect();
+            let exprs: Vec<Expr> = a.group_by.iter().map(|(e, _)| e.clone()).collect();
+            if self.deliver_order(&mut sources, &gkeys, &exprs, false) {
+                a.sorted = true;
+            }
+        }
+        // Skip the sort when the outermost loop already delivers rows in
+        // ORDER BY order (an index or rowid scan, possibly backwards).
+        if agg.is_none() && !keys.is_empty() {
+            let exprs: Vec<Expr> = keys
+                .iter()
+                .map(|k| match &k.src {
+                    KeySrc::Result(i) => results[*i].clone(),
+                    KeySrc::Expr(e) => e.clone(),
+                })
+                .collect();
+            if self.deliver_order(&mut sources, &keys, &exprs, true) {
+                keys.clear();
+            }
+        }
         Ok(Query {
             body: Body::Core(Box::new(Core {
                 sources,
@@ -1089,7 +1147,7 @@ impl<'a> Binder<'a> {
         }))
     }
 
-    fn bind_subquery(&mut self, sel: &ast::Select) -> Result<Rc<Subquery>> {
+    fn bind_subquery(&mut self, sel: &ast::Select, list: bool) -> Result<Rc<Subquery>> {
         let mark = self.refs.len();
         let first_cursor = self.used.len();
         let query = self.bind_query(sel)?;
@@ -1106,6 +1164,7 @@ impl<'a> Binder<'a> {
             id,
             query,
             outer_refs,
+            list,
         }))
     }
 
@@ -1213,6 +1272,7 @@ impl<'a> Binder<'a> {
                             alias: None,
                             on: None,
                             using: Vec::new(),
+                            indexed: ast::Indexed::Any,
                         }],
                         where_: None,
                         group_by: Vec::new(),
@@ -1291,7 +1351,7 @@ impl<'a> Binder<'a> {
                 Expr::Collate(Box::new(self.bind_expr(expr)?), parse_collation(collation)?)
             }
             ast::Expr::Subquery(sel) => {
-                let sub = self.bind_subquery(sel)?;
+                let sub = self.bind_subquery(sel, false)?;
                 if sub.query.cols.len() != 1 {
                     return Err(Error::Sql(format!(
                         "sub-select returns {} columns - expected 1",
@@ -1300,7 +1360,7 @@ impl<'a> Binder<'a> {
                 }
                 Expr::Subquery(sub)
             }
-            ast::Expr::Exists(sel) => Expr::Exists(self.bind_subquery(sel)?),
+            ast::Expr::Exists(sel) => Expr::Exists(self.bind_subquery(sel, false)?),
             ast::Expr::Function {
                 name,
                 args,
@@ -1319,7 +1379,7 @@ impl<'a> Binder<'a> {
         negated: bool,
     ) -> Result<Expr> {
         let e = self.bind_expr(expr)?;
-        let sub = self.bind_subquery(select)?;
+        let sub = self.bind_subquery(select, true)?;
         if sub.query.cols.len() != 1 {
             return Err(Error::Sql(format!(
                 "sub-select returns {} columns - expected 1",
@@ -1439,7 +1499,7 @@ impl<'a> Binder<'a> {
                         out.push(Constraint {
                             col: *col,
                             op: *op,
-                            rhs: (**r).clone(),
+                            rhs: KeyExpr::One((**r).clone()),
                             aff: *aff,
                             coll: *coll,
                         });
@@ -1457,7 +1517,7 @@ impl<'a> Binder<'a> {
                         out.push(Constraint {
                             col: *col,
                             op: flipped,
-                            rhs: (**l).clone(),
+                            rhs: KeyExpr::One((**l).clone()),
                             aff: *aff,
                             coll: *coll,
                         });
@@ -1478,7 +1538,7 @@ impl<'a> Binder<'a> {
                             out.push(Constraint {
                                 col: *col,
                                 op: BinaryOp::Ge,
-                                rhs: (**lo).clone(),
+                                rhs: KeyExpr::One((**lo).clone()),
                                 aff: lo_cmp.0,
                                 coll: lo_cmp.1,
                             });
@@ -1487,11 +1547,53 @@ impl<'a> Binder<'a> {
                             out.push(Constraint {
                                 col: *col,
                                 op: BinaryOp::Le,
-                                rhs: (**hi).clone(),
+                                rhs: KeyExpr::One((**hi).clone()),
                                 aff: hi_cmp.0,
                                 coll: hi_cmp.1,
                             });
                         }
+                    }
+                }
+            }
+            Expr::InList {
+                e,
+                list,
+                negated: false,
+                aff,
+                coll,
+            } if !list.is_empty() => {
+                if let Expr::Col { cur, col, .. } = e.as_ref() {
+                    if *cur == cursor && !list.iter().any(reads) {
+                        out.push(Constraint {
+                            col: *col,
+                            op: BinaryOp::Eq,
+                            rhs: if list.len() == 1 {
+                                KeyExpr::One(list[0].clone())
+                            } else {
+                                KeyExpr::List(list.clone())
+                            },
+                            aff: *aff,
+                            coll: *coll,
+                        });
+                    }
+                }
+            }
+            Expr::InSub {
+                e,
+                sub,
+                negated: false,
+                aff,
+                coll,
+            } if sub.query.cols.len() == 1 => {
+                if let Expr::Col { cur, col, .. } = e.as_ref() {
+                    if *cur == cursor && !sub.outer_refs.contains(&cursor) {
+                        out.push(Constraint {
+                            col: *col,
+                            op: BinaryOp::Eq,
+                            rhs: KeyExpr::Sub(sub.clone()),
+                            aff: *aff,
+                            coll: *coll,
+                        });
                     }
                 }
             }
@@ -1538,9 +1640,10 @@ impl<'a> Binder<'a> {
                 cmps: Vec::new(),
             };
             for c in cons {
-                if c.op == BinaryOp::Eq && ok(c.col) && varies(&c.rhs) && !h.cols.contains(&c.col) {
+                let Some(rhs) = c.one() else { continue };
+                if c.op == BinaryOp::Eq && ok(c.col) && varies(rhs) && !h.cols.contains(&c.col) {
                     h.cols.push(c.col);
-                    h.probes.push(c.rhs.clone());
+                    h.probes.push(rhs.clone());
                     h.cmps.push((c.aff, c.coll));
                 }
             }
@@ -1549,6 +1652,12 @@ impl<'a> Binder<'a> {
             } else {
                 Some(h)
             }
+        };
+        // How many lookups an equality key costs.
+        let fanout = |k: &KeyExpr| match k {
+            KeyExpr::One(_) => 1.0,
+            KeyExpr::List(l) => l.len() as f64,
+            KeyExpr::Sub(_) => 10.0,
         };
         let table = match &item.kind {
             ItemKind::Sub { .. } => {
@@ -1562,28 +1671,41 @@ impl<'a> Binder<'a> {
         };
         let n = (table.row_estimate(self.pager) as f64).max(1.0);
         let mut best: (f64, Access) = (if filtered { (n / 4.0).max(1.0) } else { n }, Access::Scan);
-        if table.without_rowid {
-            if let Some(h) = hash_probe(&cons, &|_| true) {
-                let est = (n / 10.0).max(1.0) * 1.01;
-                if est < best.0 {
-                    best = (est, Access::Hash(h));
-                }
-            }
-            return (best.0, Some(best.1), None);
-        }
         let rowid_slot = table.columns.len();
-        let is_rowid = |col: usize| col == rowid_slot || Some(col) == table.ipk;
+        let is_rowid =
+            |col: usize| !table.without_rowid && (col == rowid_slot || Some(col) == table.ipk);
         let rowid_ok = |c: &Constraint| is_rowid(c.col) && c.aff != Affinity::Text;
-        // rowid = ?
-        if let Some(c) = cons.iter().find(|c| c.op == BinaryOp::Eq && rowid_ok(c)) {
-            return (1.0, Some(Access::Rowid(c.rhs.clone())), None);
-        }
-        // Indexes.
-        for index in table
-            .indexes
+        // rowid = ? / rowid IN (...)
+        if let Some(c) = cons
             .iter()
-            .filter(|i| i.usable && !i.cols.is_empty())
+            .filter(|c| c.op == BinaryOp::Eq && rowid_ok(c))
+            .min_by(|a, b| fanout(&a.rhs).total_cmp(&fanout(&b.rhs)))
         {
+            let est = fanout(&c.rhs);
+            if c.rhs.is_one() {
+                return (1.0, Some(Access::Rowid(c.rhs.clone())), None);
+            }
+            best = (est, Access::Rowid(c.rhs.clone()));
+        }
+        let used = &self.used[item.cursor];
+        let covers = |index: &Index| {
+            used.iter()
+                .enumerate()
+                .all(|(col, u)| !u || is_rowid(col) || index.holds(col))
+        };
+        // Indexes, including a WITHOUT ROWID table's primary key.
+        let allowed = |i: &Index| match &item.indexed {
+            ast::Indexed::Any => true,
+            ast::Indexed::No => false,
+            ast::Indexed::By(name) => i.name.eq_ignore_ascii_case(name),
+        };
+        let candidates = table
+            .pk_index
+            .iter()
+            .filter(|_| item.indexed != ast::Indexed::No)
+            .chain(table.indexes.iter().filter(|i| allowed(i)))
+            .filter(|i| i.usable && !i.cols.is_empty());
+        for index in candidates {
             let fits = |c: &Constraint, k: usize| {
                 let ic = &index.cols[k];
                 let col_aff = table.columns[ic.col].affinity;
@@ -1594,10 +1716,18 @@ impl<'a> Binder<'a> {
                 };
                 c.col == ic.col && c.coll == ic.collation && aff_ok
             };
-            let mut eq = Vec::new();
+            let mut eq: Vec<(KeyExpr, Affinity)> = Vec::new();
+            let mut lookups = 1.0;
             for k in 0..index.cols.len() {
-                match cons.iter().find(|c| c.op == BinaryOp::Eq && fits(c, k)) {
-                    Some(c) => eq.push((c.rhs.clone(), c.aff)),
+                let found = cons
+                    .iter()
+                    .filter(|c| c.op == BinaryOp::Eq && fits(c, k))
+                    .min_by(|a, b| fanout(&a.rhs).total_cmp(&fanout(&b.rhs)));
+                match found {
+                    Some(c) => {
+                        lookups *= fanout(&c.rhs);
+                        eq.push((c.rhs.clone(), c.aff));
+                    }
                     None => break,
                 }
             }
@@ -1605,12 +1735,13 @@ impl<'a> Binder<'a> {
             if eq.len() < index.cols.len() {
                 let k = eq.len();
                 for c in cons.iter().filter(|c| fits(c, k)) {
+                    let Some(rhs) = c.one() else { continue };
                     match c.op {
                         BinaryOp::Gt | BinaryOp::Ge if lo.is_none() => {
-                            lo = Some((c.rhs.clone(), c.aff, c.op == BinaryOp::Ge))
+                            lo = Some((rhs.clone(), c.aff, c.op == BinaryOp::Ge))
                         }
                         BinaryOp::Lt | BinaryOp::Le if hi.is_none() => {
-                            hi = Some((c.rhs.clone(), c.aff, c.op == BinaryOp::Le))
+                            hi = Some((rhs.clone(), c.aff, c.op == BinaryOp::Le))
                         }
                         _ => {}
                     }
@@ -1619,25 +1750,32 @@ impl<'a> Binder<'a> {
             if eq.is_empty() && lo.is_none() && hi.is_none() {
                 continue;
             }
+            // Without statistics, SQLite assumes an equality on the first
+            // index column leaves about 10 rows, each further equality
+            // halves that, and each range bound keeps a quarter. We use
+            // the same rules so plans agree with SQLite's.
             let est = if index.unique && eq.len() == index.cols.len() {
-                1.0
+                lookups
             } else {
-                let mut e = n / 10f64.powi(eq.len() as i32);
-                if lo.is_some() || hi.is_some() {
-                    e /= 3.0;
+                let mut e = if eq.is_empty() {
+                    n
+                } else {
+                    (10.0 / 2f64.powi(eq.len() as i32 - 1)).min(n)
+                };
+                if lo.is_some() {
+                    e /= 4.0;
                 }
-                if lo.is_some() && hi.is_some() {
-                    e /= 2.0;
+                if hi.is_some() {
+                    e /= 4.0;
                 }
-                e.max(1.0)
+                (e * lookups).max(1.0)
             };
-            if est < best.0 || (est == best.0 && matches!(best.1, Access::Scan) && n > 1.0) {
-                let covering = self.used[item.cursor]
-                    .iter()
-                    .enumerate()
-                    .all(|(col, used)| {
-                        !used || is_rowid(col) || index.cols.iter().any(|ic| ic.col == col)
-                    });
+            let covering = index.primary || covers(index);
+            // A lookup through a non-covering index also reads the table.
+            let est = if covering { est } else { est * 1.01 };
+            let better =
+                est < best.0 || (est == best.0 && matches!(best.1, Access::Scan) && n > 1.0);
+            if better {
                 best = (
                     est,
                     Access::Index(IndexAccess {
@@ -1653,20 +1791,20 @@ impl<'a> Binder<'a> {
         // rowid range
         let lo = cons
             .iter()
-            .find(|c| matches!(c.op, BinaryOp::Gt | BinaryOp::Ge) && rowid_ok(c))
-            .map(|c| (c.rhs.clone(), c.op == BinaryOp::Ge));
+            .filter(|c| matches!(c.op, BinaryOp::Gt | BinaryOp::Ge) && rowid_ok(c))
+            .find_map(|c| c.one().map(|e| (e.clone(), c.op == BinaryOp::Ge)));
         let hi = cons
             .iter()
-            .find(|c| matches!(c.op, BinaryOp::Lt | BinaryOp::Le) && rowid_ok(c))
-            .map(|c| (c.rhs.clone(), c.op == BinaryOp::Le));
+            .filter(|c| matches!(c.op, BinaryOp::Lt | BinaryOp::Le) && rowid_ok(c))
+            .find_map(|c| c.one().map(|e| (e.clone(), c.op == BinaryOp::Le)));
         if lo.is_some() || hi.is_some() {
             let est = (n / if lo.is_some() && hi.is_some() {
-                6.0
+                16.0
             } else {
-                3.0
+                4.0
             })
             .max(1.0);
-            if est < best.0 {
+            if est <= best.0 {
                 best = (est, Access::RowidRange { lo, hi });
             }
         }
@@ -1677,7 +1815,201 @@ impl<'a> Binder<'a> {
                 best = (est, Access::Hash(h));
             }
         }
+        // A full scan reads fewer pages through a covering index, which is
+        // narrower than the table (SQLite does the same).
+        if matches!(best.1, Access::Scan) && !table.without_rowid {
+            let narrowest = table
+                .indexes
+                .iter()
+                .filter(|i| allowed(i) && i.usable && !i.cols.is_empty() && covers(i))
+                .min_by_key(|i| (i.cols.len(), std::cmp::Reverse(i.root)));
+            if let Some(index) = narrowest {
+                best.1 = Access::Index(IndexAccess {
+                    index: index.clone(),
+                    eq: Vec::new(),
+                    lo: None,
+                    hi: None,
+                    covering: true,
+                });
+            }
+        }
+        // INDEXED BY: that index, whatever it costs.
+        if let ast::Indexed::By(name) = &item.indexed {
+            let pinned =
+                matches!(&best.1, Access::Index(ix) if ix.index.name.eq_ignore_ascii_case(name));
+            if !pinned {
+                if let Some(index) = table
+                    .indexes
+                    .iter()
+                    .find(|i| i.name.eq_ignore_ascii_case(name))
+                {
+                    best.1 = Access::Index(IndexAccess {
+                        index: index.clone(),
+                        eq: Vec::new(),
+                        lo: None,
+                        hi: None,
+                        covering: covers(index),
+                    });
+                }
+            }
+        }
         (best.0, Some(best.1), None)
+    }
+
+    /// Can the first source produce rows already sorted by `keys`? If so,
+    /// set it up to (choosing an index scan or a backwards scan) and
+    /// return true. Only the outermost loop matters: inner loops run once
+    /// per outer row, so they never reorder it.
+    fn deliver_order(
+        &self,
+        sources: &mut [Source],
+        keys: &[OrderKey],
+        exprs: &[Expr],
+        allow_reverse: bool,
+    ) -> bool {
+        let Some(first) = sources.first_mut() else {
+            return false;
+        };
+        let cursor = first.cursor;
+        let SourceKind::Table { table, access } = &mut first.kind else {
+            return false;
+        };
+        let table = table.clone();
+        let rowid_slot = table.columns.len();
+        let norm = |col: usize| {
+            if !table.without_rowid && Some(col) == table.ipk {
+                rowid_slot
+            } else {
+                col
+            }
+        };
+        // Columns fixed to a single value by WHERE (col = constant).
+        let mut cons = Vec::new();
+        for f in &first.filters {
+            self.constraints(f, cursor, &mut cons);
+        }
+        let fixed: Vec<usize> = cons
+            .iter()
+            .filter(|c| c.op == BinaryOp::Eq && c.rhs.is_one())
+            .map(|c| norm(c.col))
+            .collect();
+        // The keys that still need ordering, as (column, desc, collation).
+        let mut want = Vec::new();
+        for (k, e) in keys.iter().zip(exprs) {
+            let Expr::Col { cur, col, .. } = e else {
+                return false;
+            };
+            if *cur != cursor || k.nulls_first == k.desc {
+                return false;
+            }
+            let col = norm(*col);
+            if fixed.contains(&col) {
+                continue;
+            }
+            want.push((col, k.desc, k.coll));
+        }
+        let rowid_order = || {
+            if table.without_rowid {
+                None
+            } else {
+                Some(vec![(rowid_slot, false, Collation::Binary)])
+            }
+        };
+        let index_order = |ix: &Index, from: usize| -> Vec<(usize, bool, Collation)> {
+            let mut v: Vec<(usize, bool, Collation)> = ix.cols[from..]
+                .iter()
+                .map(|c| (norm(c.col), c.desc, c.collation))
+                .collect();
+            if table.without_rowid {
+                let pk = table.pk_index.as_ref().unwrap();
+                for c in &ix.extra {
+                    if let Some(p) = pk.cols.iter().find(|p| p.col == *c) {
+                        v.push((*c, p.desc, p.collation));
+                    }
+                }
+            } else {
+                v.push((rowid_slot, false, Collation::Binary));
+            }
+            v
+        };
+        // Does `have` (the order a scan delivers) satisfy `want`, and
+        // backwards or forwards?
+        let matches = |have: &[(usize, bool, Collation)]| -> Option<bool> {
+            let mut rev = None;
+            let mut h = have.iter().filter(|(c, _, _)| !fixed.contains(c));
+            for (col, desc, coll) in &want {
+                let (hc, hdesc, hcoll) = h.next()?;
+                let numeric = *col == rowid_slot;
+                if hc != col || (!numeric && hcoll != coll) {
+                    return None;
+                }
+                let r = desc != hdesc;
+                if *rev.get_or_insert(r) != r {
+                    return None;
+                }
+            }
+            let rev = rev.unwrap_or(false);
+            if rev && !allow_reverse {
+                return None;
+            }
+            Some(rev)
+        };
+        if want.is_empty() {
+            return true;
+        }
+        let have = match access {
+            Access::Scan => {
+                if table.without_rowid {
+                    Some(index_order(table.pk_index.as_ref().unwrap(), 0))
+                } else {
+                    rowid_order()
+                }
+            }
+            Access::RowidRange { .. } => rowid_order(),
+            Access::Index(ix) => {
+                let from = ix
+                    .eq
+                    .iter()
+                    .position(|(k, _)| !k.is_one())
+                    .unwrap_or(ix.eq.len());
+                // IN lists are walked in key order (all combinations, in
+                // lexicographic order), and the columns before the first
+                // one are fixed by equality.
+                Some(index_order(&ix.index, from))
+            }
+            Access::Rowid(_) | Access::Hash(_) => None,
+        };
+        if let Some(rev) = have.as_deref().and_then(matches) {
+            first.reverse = rev;
+            return true;
+        }
+        // A full scan can switch to walking an index in order.
+        let free = matches!(self.indexed.get(&cursor), None | Some(ast::Indexed::Any));
+        if matches!(access, Access::Scan) && free {
+            let used = &self.used[cursor];
+            for ix in table
+                .indexes
+                .iter()
+                .filter(|i| i.usable && !i.cols.is_empty())
+            {
+                if let Some(rev) = matches(&index_order(ix, 0)) {
+                    let covering = used
+                        .iter()
+                        .enumerate()
+                        .all(|(c, u)| !u || norm(c) == rowid_slot || ix.holds(c));
+                    *access = Access::Index(IndexAccess {
+                        index: ix.clone(),
+                        eq: Vec::new(),
+                        lo: None,
+                        hi: None,
+                        covering,
+                    });
+                    first.reverse = rev;
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn plan_joins(
@@ -1770,6 +2102,7 @@ impl<'a> Binder<'a> {
                 name: item.name,
                 kind,
                 left_join: item.left_join,
+                reverse: false,
                 on_filters: std::mem::take(&mut on_filters[pos]),
                 filters: std::mem::take(&mut filters[pos]),
                 ncols: item.ncols,

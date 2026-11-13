@@ -292,6 +292,15 @@ fn compare_entry(
     Ok(Ordering::Equal)
 }
 
+/// An index stores REAL column values that are whole numbers as integers;
+/// give them back their declared type.
+fn real_affinity(table: &Table, col: usize, v: Value) -> Value {
+    match v {
+        Value::Int(n) if table.columns[col].affinity == Affinity::Real => Value::Real(n as f64),
+        v => v,
+    }
+}
+
 /// Decode one table row into the executor's layout: one value per column
 /// followed by the rowid.
 pub fn decode_table_row(
@@ -693,6 +702,9 @@ impl<'a> Exec<'a> {
                 .map(|c| AggState::new(c.func, c.distinct, c.coll))
                 .collect()
         };
+        if agg.sorted {
+            return self.run_sorted_agg(core, agg, const_ok, &mut project);
+        }
         let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut groups: Vec<Group> = Vec::new();
         if const_ok {
@@ -780,6 +792,108 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
+    /// GROUP BY over rows that arrive in group order: keep one group at a
+    /// time and finish it when the key changes.
+    fn run_sorted_agg(
+        &mut self,
+        core: &Core,
+        agg: &Agg,
+        const_ok: bool,
+        project: &mut dyn FnMut(&mut Exec<'a>) -> Result<bool>,
+    ) -> Result<()> {
+        let cursors: Vec<usize> = core.sources.iter().map(|s| s.cursor).collect();
+        let minmax_only =
+            agg.calls.len() == 1 && matches!(agg.calls[0].func, AggFunc::Min | AggFunc::Max);
+        let new_states = || -> Vec<AggState> {
+            agg.calls
+                .iter()
+                .map(|c| AggState::new(c.func, c.distinct, c.coll))
+                .collect()
+        };
+        // Finish a group: compute its aggregates, restore its bare-column
+        // rows, check HAVING and emit. Returns false to stop.
+        let finish = |me: &mut Exec<'a>,
+                      g: Group,
+                      project: &mut dyn FnMut(&mut Exec<'a>) -> Result<bool>|
+         -> Result<bool> {
+            let mut vals = Vec::with_capacity(g.states.len());
+            for st in &g.states {
+                vals.push(st.finish()?);
+            }
+            me.aggs[agg.slot] = vals;
+            let saved: Vec<Row> = cursors.iter().map(|c| me.rows[*c].clone()).collect();
+            for (c, row) in cursors.iter().zip(g.rows) {
+                me.rows[*c] = row;
+            }
+            let keep = match &agg.having {
+                Some(h) => me.eval(h)?.truth() == Some(true),
+                None => true,
+            };
+            let go = if keep { project(me)? } else { true };
+            for (c, row) in cursors.iter().zip(saved) {
+                me.rows[*c] = row;
+            }
+            Ok(go)
+        };
+        let mut current: Option<(Vec<u8>, Group)> = None;
+        let mut stopped = false;
+        if const_ok {
+            self.loop_level(core, 0, &mut |me| {
+                let mut key_vals = Vec::with_capacity(agg.group_by.len());
+                let mut key = Vec::new();
+                for (e, coll) in &agg.group_by {
+                    let v = me.eval(e)?;
+                    hash_key(&v, *coll, &mut key);
+                    key_vals.push(v);
+                }
+                if current.as_ref().is_some_and(|(k, _)| *k != key) {
+                    let (_, g) = current.take().unwrap();
+                    if !finish(me, g, project)? {
+                        stopped = true;
+                        return Ok(false);
+                    }
+                }
+                let (_, g) = current.get_or_insert_with(|| {
+                    (
+                        key,
+                        Group {
+                            key: key_vals,
+                            states: new_states(),
+                            rows: Vec::new(),
+                        },
+                    )
+                });
+                // Over sorted input SQLite reads bare columns from the group's
+                // first row (unless a lone min()/max() picks the row).
+                let mut snapshot = g.rows.is_empty();
+                let mut args = Vec::new();
+                for (ci, call) in agg.calls.iter().enumerate() {
+                    if let Some(f) = &call.filter {
+                        if me.eval(f)?.truth() != Some(true) {
+                            continue;
+                        }
+                    }
+                    args.clear();
+                    for a in &call.args {
+                        args.push(me.eval(a)?);
+                    }
+                    if g.states[ci].step(&args) && minmax_only {
+                        snapshot = true;
+                    }
+                }
+                if snapshot {
+                    g.rows.clear();
+                    g.rows.extend(cursors.iter().map(|c| me.rows[*c].clone()));
+                }
+                Ok(true)
+            })?;
+        }
+        if let (false, Some((_, g))) = (stopped, current) {
+            finish(self, g, project)?;
+        }
+        Ok(())
+    }
+
     /// Run the nested loops from `level` inwards, calling `body` for every
     /// joined row. Returns `Ok(false)` if the query asked to stop.
     fn loop_level(
@@ -857,7 +971,9 @@ impl<'a> Exec<'a> {
         let cur = src.cursor;
         self.stats[cur].loops += 1;
         match &src.kind {
-            SourceKind::Table { table, access } => self.scan_table(cur, table, access, f),
+            SourceKind::Table { table, access } => {
+                self.scan_table(cur, table, access, src.reverse, f)
+            }
             SourceKind::Subquery {
                 query,
                 correlated,
@@ -915,6 +1031,7 @@ impl<'a> Exec<'a> {
         cur: usize,
         table: &Rc<Table>,
         access: &Access,
+        reverse: bool,
         f: &mut dyn FnMut(&mut Exec<'a>, Row) -> Result<bool>,
     ) -> Result<bool> {
         let mask = self.used.get(cur).map(|m| m.as_slice());
@@ -922,7 +1039,11 @@ impl<'a> Exec<'a> {
         match access {
             Access::Scan => {
                 let mut c = Cursor::new(self.pager.clone(), table.root);
-                c.first()?;
+                if reverse {
+                    c.last()?;
+                } else {
+                    c.first()?;
+                }
                 while c.valid() {
                     let rowid = if table.without_rowid { 0 } else { c.rowid()? };
                     let row = decode_table_row(table, c.payload()?.as_slice(), rowid, enc, mask)?;
@@ -930,22 +1051,41 @@ impl<'a> Exec<'a> {
                     if !f(self, row)? {
                         return Ok(false);
                     }
-                    c.next()?;
+                    if reverse {
+                        c.prev()?;
+                    } else {
+                        c.next()?;
+                    }
                 }
                 Ok(true)
             }
-            Access::Rowid(e) => {
-                let target = match self.eval(e)?.apply_numeric_for_compare() {
-                    Value::Int(i) => i,
-                    Value::Real(r) if r == r.trunc() && r.abs() < 9.2e18 => r as i64,
-                    _ => return Ok(true),
-                };
+            Access::Rowid(k) => {
+                let mut targets: Vec<i64> = Vec::new();
+                for v in self.key_exprs(k)? {
+                    match v.apply_numeric_for_compare() {
+                        Value::Int(i) => targets.push(i),
+                        Value::Real(r) if r == r.trunc() && r.abs() < 9.2e18 => {
+                            targets.push(r as i64)
+                        }
+                        _ => {}
+                    }
+                }
+                targets.sort_unstable();
+                targets.dedup();
+                if reverse {
+                    targets.reverse();
+                }
                 let mut c = Cursor::new(self.pager.clone(), table.root);
-                c.seek_rowid(target)?;
-                if c.valid() && c.rowid()? == target {
-                    let row = decode_table_row(table, c.payload()?.as_slice(), target, enc, mask)?;
-                    self.tick(cur)?;
-                    return f(self, row);
+                for target in targets {
+                    c.seek_rowid(target)?;
+                    if c.valid() && c.rowid()? == target {
+                        let row =
+                            decode_table_row(table, c.payload()?.as_slice(), target, enc, mask)?;
+                        self.tick(cur)?;
+                        if !f(self, row)? {
+                            return Ok(false);
+                        }
+                    }
                 }
                 Ok(true)
             }
@@ -1003,11 +1143,23 @@ impl<'a> Exec<'a> {
                         _ => {}
                     }
                 }
+                if start > end {
+                    return Ok(true);
+                }
                 let mut c = Cursor::new(self.pager.clone(), table.root);
-                c.seek_rowid(start)?;
+                if reverse {
+                    c.seek_rowid(end)?;
+                    if !c.valid() {
+                        c.last()?;
+                    } else if c.rowid()? > end {
+                        c.prev()?;
+                    }
+                } else {
+                    c.seek_rowid(start)?;
+                }
                 while c.valid() {
                     let rowid = c.rowid()?;
-                    if rowid > end {
+                    if (!reverse && rowid > end) || (reverse && rowid < start) {
                         break;
                     }
                     let row = decode_table_row(table, c.payload()?.as_slice(), rowid, enc, mask)?;
@@ -1015,11 +1167,15 @@ impl<'a> Exec<'a> {
                     if !f(self, row)? {
                         return Ok(false);
                     }
-                    c.next()?;
+                    if reverse {
+                        c.prev()?;
+                    } else {
+                        c.next()?;
+                    }
                 }
                 Ok(true)
             }
-            Access::Index(ix) => self.scan_index(cur, table, ix, f),
+            Access::Index(ix) => self.scan_index(cur, table, ix, reverse, f),
             Access::Hash(h) => {
                 let Some(key) = self.probe_key(h)? else {
                     return Ok(true);
@@ -1059,23 +1215,65 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// The values an equality key stands for, before affinity.
+    fn key_exprs(&mut self, k: &KeyExpr) -> Result<Vec<Value>> {
+        Ok(match k {
+            KeyExpr::One(e) => vec![self.eval(e)?],
+            KeyExpr::List(list) => {
+                let mut out = Vec::with_capacity(list.len());
+                for e in list {
+                    out.push(self.eval(e)?);
+                }
+                out
+            }
+            KeyExpr::Sub(sub) => self
+                .collect(&sub.query)?
+                .into_iter()
+                .filter_map(|r| r.into_iter().next())
+                .collect(),
+        })
+    }
+
+    /// The distinct non-NULL key values for one index column, in the order
+    /// the scan visits them.
+    fn key_set(
+        &mut self,
+        k: &KeyExpr,
+        aff: Affinity,
+        coll: Collation,
+        descending: bool,
+    ) -> Result<Vec<Value>> {
+        let mut vals: Vec<Value> = self
+            .key_exprs(k)?
+            .into_iter()
+            .map(|v| apply_cmp_aff(v, aff))
+            .filter(|v| !v.is_null())
+            .collect();
+        vals.sort_by(|a, b| a.compare(b, coll));
+        vals.dedup_by(|a, b| a.compare(b, coll) == Ordering::Equal);
+        if descending {
+            vals.reverse();
+        }
+        Ok(vals)
+    }
+
     fn scan_index(
         &mut self,
         cur: usize,
         table: &Rc<Table>,
         ix: &IndexAccess,
+        reverse: bool,
         f: &mut dyn FnMut(&mut Exec<'a>, Row) -> Result<bool>,
     ) -> Result<bool> {
         let index = &ix.index;
-        let enc = self.enc;
-        let mask = self.used.get(cur).map(|m| m.as_slice());
-        let mut key = Vec::with_capacity(ix.eq.len() + 1);
-        for (e, aff) in &ix.eq {
-            let v = self.key_value(e, *aff)?;
-            if v.is_null() {
+        let mut sets: Vec<Vec<Value>> = Vec::with_capacity(ix.eq.len());
+        for (i, (k, aff)) in ix.eq.iter().enumerate() {
+            let ic = &index.cols[i];
+            let vals = self.key_set(k, *aff, ic.collation, ic.desc != reverse)?;
+            if vals.is_empty() {
                 return Ok(true);
             }
-            key.push(v);
+            sets.push(vals);
         }
         let bound = |me: &mut Exec<'a>,
                      b: &Option<(Expr, Affinity, bool)>|
@@ -1095,76 +1293,219 @@ impl<'a> Exec<'a> {
         let Some(hi) = bound(self, &ix.hi)? else {
             return Ok(true);
         };
+        // Visit every combination of key values in lexicographic order.
+        let mut pos = vec![0usize; sets.len()];
+        loop {
+            let key: Vec<Value> = sets.iter().zip(&pos).map(|(s, i)| s[*i].clone()).collect();
+            if !self.scan_index_range(cur, table, ix, &key, &lo, &hi, reverse, f)? {
+                return Ok(false);
+            }
+            let mut p = sets.len();
+            loop {
+                if p == 0 {
+                    return Ok(true);
+                }
+                p -= 1;
+                pos[p] += 1;
+                if pos[p] < sets[p].len() {
+                    break;
+                }
+                pos[p] = 0;
+            }
+        }
+    }
+
+    /// Visit the index entries that start with `key` and whose next column
+    /// lies between `lo` and `hi` (bounds are a narrowing only: the WHERE
+    /// clause is checked again on every row).
+    #[allow(clippy::too_many_arguments)]
+    fn scan_index_range(
+        &mut self,
+        cur: usize,
+        table: &Rc<Table>,
+        ix: &IndexAccess,
+        key: &[Value],
+        lo: &Option<Value>,
+        hi: &Option<Value>,
+        reverse: bool,
+        f: &mut dyn FnMut(&mut Exec<'a>, Row) -> Result<bool>,
+    ) -> Result<bool> {
+        let index = &ix.index;
+        let enc = self.enc;
+        let mask = self.used.get(cur).map(|m| m.as_slice());
         let m = key.len();
         let range_col = index.cols.get(m);
         let desc = range_col.is_some_and(|c| c.desc);
         // In index order a DESC column runs from high values to low.
-        let (start, end) = if desc { (hi, lo) } else { (lo, hi) };
-        let mut seek_key = key.clone();
+        let (first, last) = if desc { (hi, lo) } else { (lo, hi) };
+        let (start, end) = if reverse {
+            (last, first)
+        } else {
+            (first, last)
+        };
+        let mut seek_key = key.to_vec();
         if let Some(v) = start {
-            seek_key.push(v);
+            seek_key.push(v.clone());
         }
         let mut icur = Cursor::new(self.pager.clone(), index.root);
-        if seek_key.is_empty() {
+        if reverse {
+            if seek_key.is_empty() {
+                icur.last()?;
+            } else {
+                // Land on the first entry after everything <= seek_key,
+                // then step back.
+                icur.seek(&mut |payload| {
+                    Ok(match compare_entry(payload, &seek_key, index, enc)? {
+                        Ordering::Greater => Ordering::Greater,
+                        _ => Ordering::Less,
+                    })
+                })?;
+                if icur.valid() {
+                    icur.prev()?;
+                } else {
+                    icur.last()?;
+                }
+            }
+        } else if seek_key.is_empty() {
             icur.first()?;
         } else {
             icur.seek(&mut |payload| compare_entry(payload, &seek_key, index, enc))?;
         }
+        let pk = table.pk_index.clone();
         let mut tcur = Cursor::new(self.pager.clone(), table.root);
         let ncols = table.columns.len();
+        let nkey = index.cols.len();
         while icur.valid() {
             let payload = icur.payload()?;
-            let vals = decode_all(payload.as_slice(), enc)?;
-            if vals.len() < index.cols.len() + 1 {
-                return corrupt(format!("index {} entry has too few fields", index.name));
-            }
-            for (i, k) in key.iter().enumerate() {
-                if vals[i].compare(k, index.cols[i].collation) != Ordering::Equal {
+            let row = if index.primary {
+                let vals = decode_all(payload.as_slice(), enc)?;
+                if !self.entry_in_range(&vals, key, end, index, reverse) {
                     return Ok(true);
                 }
-            }
-            if let (Some(end), Some(rc)) = (&end, range_col) {
-                let o = vals[m].compare(end, rc.collation);
-                if (if desc { o.reverse() } else { o }) == Ordering::Greater {
-                    return Ok(true);
-                }
-            }
-            let Value::Int(rowid) = vals[vals.len() - 1] else {
-                return corrupt(format!("index {} entry has no rowid", index.name));
-            };
-            let row = if ix.covering {
-                let mut out = vec![Value::Null; ncols + 1];
-                for (i, ic) in index.cols.iter().enumerate() {
-                    let mut v = vals[i].clone();
-                    if table.columns[ic.col].affinity == Affinity::Real {
-                        if let Value::Int(n) = v {
-                            v = Value::Real(n as f64);
-                        }
-                    }
-                    out[ic.col] = v;
-                }
-                if let Some(ipk) = table.ipk {
-                    out[ipk] = Value::Int(rowid);
-                }
-                out[ncols] = Value::Int(rowid);
-                Rc::from(out)
+                decode_table_row(table, payload.as_slice(), 0, enc, mask)?
             } else {
-                tcur.seek_rowid(rowid)?;
-                if !tcur.valid() || tcur.rowid()? != rowid {
-                    return corrupt(format!(
-                        "index {} points at missing row {rowid}",
-                        index.name
-                    ));
+                let vals = decode_all(payload.as_slice(), enc)?;
+                let want = nkey
+                    + if table.without_rowid {
+                        index.extra.len()
+                    } else {
+                        1
+                    };
+                if vals.len() < want {
+                    return corrupt(format!("index {} entry has too few fields", index.name));
                 }
-                decode_table_row(table, tcur.payload()?.as_slice(), rowid, enc, mask)?
+                if !self.entry_in_range(&vals, key, end, index, reverse) {
+                    return Ok(true);
+                }
+                if table.without_rowid {
+                    let value_of = |col: usize| -> Value {
+                        match index.cols.iter().position(|c| c.col == col) {
+                            Some(i) => vals[i].clone(),
+                            None => index
+                                .extra
+                                .iter()
+                                .position(|c| *c == col)
+                                .map(|j| vals[nkey + j].clone())
+                                .unwrap_or(Value::Null),
+                        }
+                    };
+                    if ix.covering {
+                        let mut out = vec![Value::Null; ncols + 1];
+                        for (col, slot) in out.iter_mut().enumerate().take(ncols) {
+                            if index.holds(col) {
+                                *slot = real_affinity(table, col, value_of(col));
+                            }
+                        }
+                        Rc::from(out)
+                    } else {
+                        let pk = pk.as_ref().unwrap();
+                        let pk_key: Vec<Value> = pk.cols.iter().map(|c| value_of(c.col)).collect();
+                        tcur.seek(&mut |p| compare_entry(p, &pk_key, pk, enc))?;
+                        let found = tcur.valid()
+                            && compare_entry(tcur.payload()?.as_slice(), &pk_key, pk, enc)?
+                                == Ordering::Equal;
+                        if !found {
+                            return corrupt(format!(
+                                "index {} points at a missing row",
+                                index.name
+                            ));
+                        }
+                        decode_table_row(table, tcur.payload()?.as_slice(), 0, enc, mask)?
+                    }
+                } else {
+                    let Value::Int(rowid) = vals[vals.len() - 1] else {
+                        return corrupt(format!("index {} entry has no rowid", index.name));
+                    };
+                    if ix.covering {
+                        let mut out = vec![Value::Null; ncols + 1];
+                        for (i, ic) in index.cols.iter().enumerate() {
+                            out[ic.col] = real_affinity(table, ic.col, vals[i].clone());
+                        }
+                        if let Some(ipk) = table.ipk {
+                            out[ipk] = Value::Int(rowid);
+                        }
+                        out[ncols] = Value::Int(rowid);
+                        Rc::from(out)
+                    } else {
+                        tcur.seek_rowid(rowid)?;
+                        if !tcur.valid() || tcur.rowid()? != rowid {
+                            return corrupt(format!(
+                                "index {} points at missing row {rowid}",
+                                index.name
+                            ));
+                        }
+                        decode_table_row(table, tcur.payload()?.as_slice(), rowid, enc, mask)?
+                    }
+                }
             };
             self.tick(cur)?;
             if !f(self, row)? {
                 return Ok(false);
             }
-            icur.next()?;
+            if reverse {
+                icur.prev()?;
+            } else {
+                icur.next()?;
+            }
         }
         Ok(true)
+    }
+
+    /// Is an index entry still inside the scanned range: same key prefix,
+    /// and not past the end bound on the next column?
+    fn entry_in_range(
+        &self,
+        vals: &[Value],
+        key: &[Value],
+        end: &Option<Value>,
+        index: &Index,
+        reverse: bool,
+    ) -> bool {
+        for (i, k) in key.iter().enumerate() {
+            match vals.get(i) {
+                Some(v) if v.compare(k, index.cols[i].collation) == Ordering::Equal => {}
+                _ => return false,
+            }
+        }
+        if let (Some(end), Some(rc)) = (end, index.cols.get(key.len())) {
+            let Some(v) = vals.get(key.len()) else {
+                return false;
+            };
+            let mut o = v.compare(end, rc.collation);
+            if rc.desc {
+                o = o.reverse();
+            }
+            // Forward scans stop past the end; backward scans before it.
+            let past = if reverse {
+                o == Ordering::Less
+            } else {
+                o == Ordering::Greater
+            };
+            if past {
+                return false;
+            }
+        }
+        true
     }
 
     // ------------------------------------------------------------ expressions
