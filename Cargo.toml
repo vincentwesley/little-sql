@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/littlesql", "crates/littlesql-cli", "crates/slt"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/vincentwesley/little-sql"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = "thin"
+panic = "unwind"
+
+[profile.dev]
+opt-level = 1

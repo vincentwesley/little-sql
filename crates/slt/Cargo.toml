@@ -1,0 +1,11 @@
+[package]
+name = "slt"
+description = "sqllogictest and differential test runner for Little SQL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+littlesql = { path = "../littlesql" }

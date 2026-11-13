@@ -1,0 +1,6 @@
+/target
+/results
+/corpus
+*.db-wal
+*.db-shm
+*.db-journal
