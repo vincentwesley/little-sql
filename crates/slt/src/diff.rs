@@ -210,7 +210,7 @@ pub fn run_file(path: &Path, scratch: &Path) -> FileResult {
                 let mut got: Vec<Vec<String>> = rs
                     .rows
                     .iter()
-                    .map(|r| r.iter().map(|v| cli_text(v)).collect())
+                    .map(|r| r.iter().map(cli_text).collect())
                     .collect();
                 if !ordered {
                     want.sort();
