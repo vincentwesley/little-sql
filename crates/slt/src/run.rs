@@ -58,6 +58,12 @@ impl Tally {
             self.pass as f64 * 100.0 / self.scored() as f64
         }
     }
+
+    /// The rate rounded down to two decimals, so a run with any failure
+    /// never shows as 100.00 %.
+    pub fn rate_floor(&self) -> f64 {
+        (self.rate() * 100.0).floor() / 100.0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +102,32 @@ fn is_query_sql(sql: &str) -> bool {
 }
 
 /// Render a value the way the reference harness (`slt_sqlite.c`) does.
+/// `%.3f` as SQLite's own printf renders it: at most 16 significant
+/// digits, with zeros after that (so -2^63 prints as
+/// -9223372036854776000.000, not -9223372036854775808.000).
+pub fn sqlite_fixed3(x: f64) -> String {
+    if !x.is_finite() || x == 0.0 {
+        return format!("{x:.3}");
+    }
+    let sci = format!("{:.15e}", x.abs());
+    let (mant, exp) = sci.split_once('e').unwrap();
+    let exp: i32 = exp.parse().unwrap();
+    if exp + 1 + 3 <= 16 {
+        return format!("{x:.3}");
+    }
+    let digits: Vec<u8> = mant.bytes().filter(|b| b.is_ascii_digit()).collect();
+    let int_len = (exp + 1) as usize;
+    let digit = |i: usize| digits.get(i).map_or('0', |d| *d as char);
+    let mut out = String::new();
+    if x < 0.0 {
+        out.push('-');
+    }
+    out.extend((0..int_len).map(digit));
+    out.push('.');
+    out.extend((int_len..int_len + 3).map(digit));
+    out
+}
+
 pub fn format_value(v: &Value, ty: char) -> String {
     if v.is_null() {
         return "NULL".into();
@@ -109,7 +141,7 @@ pub fn format_value(v: &Value, ty: char) -> String {
             // sqlite3_column_int truncates to 32 bits.
             (i as i32).to_string()
         }
-        'R' => format!("{:.3}", v.to_real()),
+        'R' => sqlite_fixed3(v.to_real()),
         _ => {
             let bytes: Vec<u8> = match v {
                 Value::Blob(b) => b.to_vec(),
@@ -383,6 +415,17 @@ pub fn run_file(path: &Path, rel: &Path, opts: &Options, worker: usize) -> FileR
                 Ok(()) => res.tally.pass += 1,
                 Err(why) => fail(&mut res, rec, format!("wrong result: {why}")),
             },
+            // The reference runner records a query that SQLite aborts at
+            // run time (for example sum() overflow) as returning no rows.
+            // Only a run-time error counts here; parse errors and
+            // unsupported features never do.
+            (
+                Kind::Query {
+                    expected: Expected::Values(v),
+                    ..
+                },
+                Err(e),
+            ) if v.is_empty() && e == "integer overflow" => res.tally.pass += 1,
             (Kind::Query { .. }, Err(e)) => fail(&mut res, rec, format!("error: {e}")),
             _ => {}
         }
@@ -397,6 +440,22 @@ pub fn run_file(path: &Path, rel: &Path, opts: &Options, worker: usize) -> FileR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed3_matches_sqlite_printf() {
+        assert_eq!(sqlite_fixed3(1.5), "1.500");
+        assert_eq!(sqlite_fixed3(-0.0004), "-0.000");
+        assert_eq!(
+            sqlite_fixed3(-9223372036854775808.0),
+            "-9223372036854776000.000"
+        );
+        assert_eq!(
+            sqlite_fixed3(-18446744073709551616.0),
+            "-18446744073709550000.000"
+        );
+        assert_eq!(sqlite_fixed3(123456789012.3456), "123456789012.346");
+        assert_eq!(sqlite_fixed3(1234567890123.4567), "1234567890123.457");
+    }
 
     #[test]
     fn formats_like_the_reference_harness() {

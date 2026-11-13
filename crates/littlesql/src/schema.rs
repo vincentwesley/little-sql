@@ -144,7 +144,7 @@ fn const_default(e: &ast::Expr) -> Value {
 /// backs with an automatic index, in the order SQLite numbers them.
 fn auto_index_keys(ct: &CreateTable, table: &Table) -> Result<Vec<Vec<IndexCol>>> {
     let mut keys: Vec<Vec<IndexCol>> = Vec::new();
-    let mut add = |cols: Vec<IndexCol>, keys: &mut Vec<Vec<IndexCol>>| {
+    let add = |cols: Vec<IndexCol>, keys: &mut Vec<Vec<IndexCol>>| {
         let dup = keys.iter().any(|k| {
             k.len() == cols.len()
                 && k.iter()

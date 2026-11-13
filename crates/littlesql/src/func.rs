@@ -39,6 +39,10 @@ pub fn lookup_scalar(name: &str, nargs: usize) -> Result<Option<ScalarFn>> {
         ("max", 2, N, f_max),
         ("random", 0, 0, f_random),
         ("zeroblob", 1, 1, f_zeroblob),
+        ("randomblob", 1, 1, f_randomblob),
+        ("changes", 0, 0, f_changes),
+        ("total_changes", 0, 0, f_total_changes),
+        ("last_insert_rowid", 0, 0, f_last_insert_rowid),
         ("char", 0, N, f_char),
         ("unicode", 1, 1, f_unicode),
         ("like", 2, 3, f_like),
@@ -302,7 +306,160 @@ fn f_round(a: &[Value]) -> Result<Value> {
             (r + if r < 0.0 { -0.5 } else { 0.5 }) as i64 as f64,
         ));
     }
-    Ok(Value::Real(format!("{r:.n$}").parse().unwrap_or(r)))
+    // SQLite prints with "%!.*f" and parses the text back.
+    let text = fmt_float(r.abs(), 'f', n, true, false);
+    let v: f64 = text.parse().unwrap_or(r);
+    Ok(Value::Real(if r < 0.0 { -v } else { v }))
+}
+
+/// The decimal digits of a finite, non-negative `x` and its decimal
+/// exponent: x = 0.d1d2d3... * 10^(exp+1). Exact to 40 digits.
+fn decimal_digits(x: f64) -> (Vec<u8>, i32) {
+    if x == 0.0 {
+        return (vec![0], 0);
+    }
+    let s = format!("{x:.39e}");
+    let (m, e) = s.split_once('e').unwrap();
+    let digits = m
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(|b| b - b'0')
+        .collect();
+    (digits, e.parse().unwrap())
+}
+
+/// Keep `n` significant digits, rounding half up as SQLite's printf does.
+/// Returns the digits and the (possibly bumped) exponent.
+fn round_digits(mut d: Vec<u8>, mut exp: i32, n: i64) -> (Vec<u8>, i32) {
+    if n < 0 {
+        return (vec![0], exp + 1);
+    }
+    let n = n as usize;
+    if n >= d.len() {
+        d.resize(n.max(1), 0);
+        return (d, exp);
+    }
+    let up = d[n] >= 5;
+    d.truncate(n);
+    if up {
+        let mut i = n;
+        loop {
+            if i == 0 {
+                d.insert(0, 1);
+                d.truncate(n.max(1));
+                exp += 1;
+                break;
+            }
+            i -= 1;
+            if d[i] == 9 {
+                d[i] = 0;
+            } else {
+                d[i] += 1;
+                break;
+            }
+        }
+    }
+    if d.is_empty() {
+        d.push(0);
+    }
+    (d, exp)
+}
+
+/// Format a finite, non-negative number like SQLite's printf conversions
+/// `%f`, `%e` and `%g`. SQLite keeps at most 16 significant digits (26 with
+/// the `!` flag) and fills the rest with zeros.
+pub(crate) fn fmt_float(x: f64, conv: char, prec: usize, bang: bool, alt: bool) -> String {
+    if x.is_infinite() {
+        return "Inf".into();
+    }
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    let cap: i64 = if bang { 26 } else { 16 };
+    let (d0, e0) = decimal_digits(x);
+    let digit = |d: &[u8], i: i64| -> char {
+        if i >= 0 && (i as usize) < d.len() {
+            (b'0' + d[i as usize]) as char
+        } else {
+            '0'
+        }
+    };
+    let fixed = |d: &[u8], exp: i32, prec: usize| -> String {
+        let mut out = String::new();
+        if exp < 0 {
+            out.push('0');
+        } else {
+            for i in 0..=exp as i64 {
+                out.push(digit(d, i));
+            }
+        }
+        if prec > 0 || alt {
+            out.push('.');
+        }
+        for k in 0..prec as i64 {
+            out.push(digit(d, exp as i64 + 1 + k));
+        }
+        out
+    };
+    let exp_form = |d: &[u8], exp: i32, frac: usize| -> String {
+        let mut out = String::new();
+        out.push(digit(d, 0));
+        if frac > 0 || alt {
+            out.push('.');
+        }
+        for k in 1..=frac as i64 {
+            out.push(digit(d, k));
+        }
+        out.push('e');
+        out.push(if exp < 0 { '-' } else { '+' });
+        out.push_str(&format!("{:02}", exp.abs()));
+        out
+    };
+    match conv {
+        'f' => {
+            let n = (e0 as i64 + 1 + prec as i64).min(cap);
+            let (d, exp) = round_digits(d0, e0, n);
+            fixed(&d, exp, prec)
+        }
+        'e' | 'E' => {
+            let n = (prec as i64 + 1).min(cap);
+            let (d, exp) = round_digits(d0, e0, n);
+            let s = exp_form(&d, exp, prec);
+            if conv == 'E' {
+                s.to_uppercase()
+            } else {
+                s
+            }
+        }
+        _ => {
+            let p = if prec == 0 { 1 } else { prec };
+            let n = (p as i64).min(cap);
+            let (d, exp) = round_digits(d0, e0, n);
+            let mut s = if exp < -4 || exp >= p as i32 {
+                exp_form(&d, exp, p - 1)
+            } else {
+                fixed(&d, exp, (p as i32 - 1 - exp).max(0) as usize)
+            };
+            if !alt {
+                // Drop trailing zeros of the fraction, and a bare point.
+                let (mant, tail) = match s.find('e') {
+                    Some(i) => (s[..i].to_string(), s[i..].to_string()),
+                    None => (s.clone(), String::new()),
+                };
+                let mant = if mant.contains('.') {
+                    mant.trim_end_matches('0').trim_end_matches('.').to_string()
+                } else {
+                    mant
+                };
+                s = mant + &tail;
+            }
+            if conv == 'G' {
+                s.to_uppercase()
+            } else {
+                s
+            }
+        }
+    }
 }
 
 fn f_typeof(a: &[Value]) -> Result<Value> {
@@ -312,7 +469,7 @@ fn f_typeof(a: &[Value]) -> Result<Value> {
 fn f_hex(a: &[Value]) -> Result<Value> {
     let bytes: Vec<u8> = match &a[0] {
         Value::Blob(b) => b.to_vec(),
-        v => v.to_text().into_bytes(),
+        v => crate::value::text_bytes(&v.to_text()),
     };
     Ok(Value::text(
         bytes.iter().map(|b| format!("{b:02X}")).collect::<String>(),
@@ -366,6 +523,53 @@ fn f_random(_: &[Value]) -> Result<Value> {
         s.set(x);
         x as i64
     })))
+}
+
+fn f_randomblob(a: &[Value]) -> Result<Value> {
+    let n = a[0].to_int().clamp(1, 1_000_000_000) as usize;
+    let mut out = Vec::with_capacity(n + 8);
+    while out.len() < n {
+        if let Value::Int(x) = f_random(&[])? {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    out.truncate(n);
+    Ok(Value::blob(out))
+}
+
+/// Per-connection counters behind changes(), total_changes() and
+/// last_insert_rowid(). The database sets them as statements run.
+#[derive(Clone, Copy, Default)]
+pub struct ConnCounters {
+    pub changes: i64,
+    pub total_changes: i64,
+    pub last_insert_rowid: i64,
+}
+
+thread_local! {
+    static COUNTERS: Cell<ConnCounters> = const {
+        Cell::new(ConnCounters { changes: 0, total_changes: 0, last_insert_rowid: 0 })
+    };
+}
+
+pub fn set_counters(c: ConnCounters) {
+    COUNTERS.with(|x| x.set(c));
+}
+
+pub fn counters() -> ConnCounters {
+    COUNTERS.with(|x| x.get())
+}
+
+fn f_changes(_: &[Value]) -> Result<Value> {
+    Ok(Value::Int(counters().changes))
+}
+
+fn f_total_changes(_: &[Value]) -> Result<Value> {
+    Ok(Value::Int(counters().total_changes))
+}
+
+fn f_last_insert_rowid(_: &[Value]) -> Result<Value> {
+    Ok(Value::Int(counters().last_insert_rowid))
 }
 
 fn f_zeroblob(a: &[Value]) -> Result<Value> {
@@ -603,12 +807,15 @@ fn f_printf(a: &[Value]) -> Result<Value> {
         }
         i += 1;
         let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+        let (mut alt, mut bang) = (false, false);
         while i < fmt.len() && "-0+ #,!".contains(fmt[i]) {
             match fmt[i] {
                 '-' => left = true,
                 '0' => zero = true,
                 '+' => plus = true,
                 ' ' => space = true,
+                '#' => alt = true,
+                '!' => bang = true,
                 _ => {}
             }
             i += 1;
@@ -655,24 +862,11 @@ fn f_printf(a: &[Value]) -> Result<Value> {
                 let n = v.to_int();
                 format!("{}{}", sign(n < 0), n.unsigned_abs())
             }
-            'f' => {
+            'f' | 'e' | 'E' | 'g' | 'G' => {
                 let r = v.to_real();
-                format!("{}{:.*}", sign(r < 0.0), prec.unwrap_or(6), r.abs())
+                let body = fmt_float(r.abs(), conv, prec.unwrap_or(6), bang, alt);
+                format!("{}{}", sign(r < 0.0), body)
             }
-            'e' | 'E' => {
-                let r = v.to_real();
-                let s = format!("{:.*e}", prec.unwrap_or(6), r.abs());
-                let (m, e) = s.split_once('e').unwrap();
-                let e: i32 = e.parse().unwrap_or(0);
-                format!(
-                    "{}{}e{}{:02}",
-                    sign(r < 0.0),
-                    m,
-                    if e < 0 { '-' } else { '+' },
-                    e.abs()
-                )
-            }
-            'g' | 'G' => fmt_real(v.to_real()),
             'x' => format!("{:x}", v.to_int()),
             'X' => format!("{:X}", v.to_int()),
             'o' => format!("{:o}", v.to_int()),
@@ -1128,10 +1322,31 @@ mod tests {
                 Value::text("%05d|%-4s|%.2f|%x"),
                 Value::Int(42),
                 Value::text("ab"),
-                Value::Real(3.14159),
+                Value::Real(2.5),
                 Value::Int(255)
             ]),
-            "00042|ab  |3.14|ff"
+            "00042|ab  |2.50|ff"
         );
+    }
+
+    #[test]
+    fn float_formatting_matches_sqlite() {
+        let f = |x: f64, c: char, p: usize| fmt_float(x, c, p, false, false);
+        assert_eq!(f(2.25, 'f', 1), "2.3");
+        assert_eq!(f(1.005, 'f', 2), "1.00");
+        assert_eq!(f(0.06, 'f', 1), "0.1");
+        assert_eq!(f(0.04, 'f', 0), "0");
+        assert_eq!(f(9.9999, 'f', 2), "10.00");
+        assert_eq!(f(9223372036854775808.0, 'f', 1), "9223372036854776000.0");
+        assert_eq!(f(12345.678, 'e', 6), "1.234568e+04");
+        assert_eq!(f(1e20, 'g', 6), "1e+20");
+        assert_eq!(f(0.0001, 'g', 6), "0.0001");
+        assert_eq!(f(0.00001234, 'g', 6), "1.234e-05");
+        assert_eq!(f(123456.0, 'g', 6), "123456");
+        assert_eq!(f(1234567.0, 'g', 6), "1.23457e+06");
+        let r = |x: f64, n: i64| f_round(&[Value::Real(x), Value::Int(n)]).unwrap();
+        assert_eq!(r(-2.25, 1), Value::Real(-2.3));
+        assert_eq!(r(2.675, 2), Value::Real(2.67));
+        assert_eq!(r(0.125, 2), Value::Real(0.13));
     }
 }

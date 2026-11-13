@@ -88,7 +88,7 @@ pub fn serial_type_len(t: u64) -> usize {
     }
 }
 
-fn decode_text(bytes: &[u8], enc: TextEncoding) -> Value {
+pub(crate) fn decode_text(bytes: &[u8], enc: TextEncoding) -> Value {
     match enc {
         TextEncoding::Utf8 => match std::str::from_utf8(bytes) {
             Ok(s) => Value::Text(Rc::from(s)),
@@ -107,6 +107,15 @@ fn decode_text(bytes: &[u8], enc: TextEncoding) -> Value {
                 .collect();
             Value::Text(Rc::from(String::from_utf16_lossy(&units).as_str()))
         }
+    }
+}
+
+/// Text as the bytes the database stores for it.
+pub fn encode_text(s: &str, enc: TextEncoding) -> Vec<u8> {
+    match enc {
+        TextEncoding::Utf8 => s.as_bytes().to_vec(),
+        TextEncoding::Utf16Le => s.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        TextEncoding::Utf16Be => s.encode_utf16().flat_map(u16::to_be_bytes).collect(),
     }
 }
 

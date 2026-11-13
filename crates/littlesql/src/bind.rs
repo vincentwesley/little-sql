@@ -50,6 +50,16 @@ struct CteDef {
     /// How many CTEs and scopes were visible where this one was defined.
     ctes_len: usize,
     scopes_len: usize,
+    recursive: bool,
+}
+
+/// A recursive CTE whose step is being bound: inside it, the CTE's name
+/// means the current row (the work table).
+struct WorkDef {
+    name: String,
+    id: usize,
+    cols: Vec<ColInfo>,
+    depth: usize,
 }
 
 struct AggFrame {
@@ -100,6 +110,10 @@ pub struct Binder<'a> {
     ctes: Vec<CteDef>,
     aggs: Vec<AggFrame>,
     view_depth: usize,
+    /// Nesting depth of SELECTs being bound.
+    query_depth: usize,
+    work_tables: Vec<WorkDef>,
+    next_work: usize,
 }
 
 fn lower(s: &str) -> String {
@@ -142,6 +156,9 @@ impl<'a> Binder<'a> {
             ctes: Vec::new(),
             aggs: Vec::new(),
             view_depth: 0,
+            query_depth: 0,
+            work_tables: Vec::new(),
+            next_work: 0,
         }
     }
 
@@ -164,22 +181,106 @@ impl<'a> Binder<'a> {
     pub fn bind_query(&mut self, sel: &ast::Select) -> Result<Query> {
         let ctes_mark = self.ctes.len();
         for cte in &sel.with {
-            if cte.recursive && select_mentions(&cte.select, &cte.name) {
-                self.ctes.truncate(ctes_mark);
-                return Err(Error::Unsupported(
-                    "recursive common table expressions".into(),
-                ));
-            }
             self.ctes.push(CteDef {
                 name: lower(&cte.name),
                 columns: cte.columns.clone(),
                 select: Rc::new(cte.select.clone()),
                 ctes_len: self.ctes.len(),
                 scopes_len: self.scopes.len(),
+                recursive: cte.recursive && select_mentions(&cte.select, &cte.name),
             });
         }
+        self.query_depth += 1;
         let result = self.bind_query_inner(sel);
+        self.query_depth -= 1;
         self.ctes.truncate(ctes_mark);
+        result
+    }
+
+    /// Bind the body of a recursive CTE: `init UNION [ALL] step`, where only
+    /// `step` names the CTE itself.
+    fn bind_recursive(
+        &mut self,
+        sel: &ast::Select,
+        name: &str,
+        rename: &[String],
+    ) -> Result<Query> {
+        let unsupported = |what: &str| Err(Error::Unsupported(what.into()));
+        if !sel.with.is_empty() {
+            return unsupported("a WITH clause inside a recursive common table expression");
+        }
+        if !sel.order_by.is_empty() {
+            return unsupported("ORDER BY in a recursive common table expression");
+        }
+        let SelectBody::Compound { op, left, right } = &sel.body else {
+            return Err(Error::Sql(format!("circular reference: {name}")));
+        };
+        let union_all = match op {
+            ast::CompoundOp::UnionAll => true,
+            ast::CompoundOp::Union => false,
+            _ => return unsupported("a recursive common table expression that is not a UNION"),
+        };
+        let probe = |b: &SelectBody| {
+            select_mentions(
+                &ast::Select {
+                    with: Vec::new(),
+                    body: b.clone(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                },
+                name,
+            )
+        };
+        if probe(left) {
+            return unsupported("a recursive common table expression with several recursive steps");
+        }
+        self.query_depth += 1;
+        let result = (|| {
+            let init = self.bind_body(left)?;
+            if !rename.is_empty() && rename.len() != init.cols.len() {
+                return Err(Error::Sql(format!(
+                    "table {name} has {} values for {} columns",
+                    init.cols.len(),
+                    rename.len()
+                )));
+            }
+            let mut work_cols = init.cols.clone();
+            for (c, n) in work_cols.iter_mut().zip(rename) {
+                c.name = n.clone();
+            }
+            let id = self.next_work;
+            self.next_work += 1;
+            self.work_tables.push(WorkDef {
+                name: lower(name),
+                id,
+                cols: work_cols,
+                depth: self.query_depth,
+            });
+            let step = self.bind_body(right);
+            self.work_tables.pop();
+            let step = step?;
+            if step.cols.len() != init.cols.len() {
+                return Err(Error::Sql(format!(
+                    "SELECTs to the left and right of {} do not have the same number of result columns",
+                    if union_all { "UNION ALL" } else { "UNION" }
+                )));
+            }
+            let cols = init.cols.clone();
+            Ok(Query {
+                body: Body::Recursive {
+                    init: Box::new(init),
+                    step: Box::new(step),
+                    union_all,
+                    work: id,
+                },
+                order_by: Vec::new(),
+                limit: self.bind_opt_const(&sel.limit)?,
+                offset: self.bind_opt_const(&sel.offset)?,
+                cols,
+            })
+        })();
+        self.query_depth -= 1;
         result
     }
 
@@ -400,6 +501,15 @@ impl<'a> Binder<'a> {
         keep_scopes: usize,
         keep_ctes: usize,
     ) -> Result<(Query, bool)> {
+        self.isolated(keep_scopes, keep_ctes, |b| b.bind_query(sel))
+    }
+
+    fn isolated(
+        &mut self,
+        keep_scopes: usize,
+        keep_ctes: usize,
+        f: impl FnOnce(&mut Self) -> Result<Query>,
+    ) -> Result<(Query, bool)> {
         self.view_depth += 1;
         if self.view_depth > 50 {
             self.view_depth -= 1;
@@ -412,7 +522,7 @@ impl<'a> Binder<'a> {
         let saved_aggs = std::mem::take(&mut self.aggs);
         let mark = self.refs.len();
         let first_cursor = self.used.len();
-        let result = self.bind_query(sel);
+        let result = f(self);
         self.scopes.extend(saved_scopes);
         self.ctes.extend(saved_ctes);
         self.aggs = saved_aggs;
@@ -431,17 +541,47 @@ impl<'a> Binder<'a> {
             TableSource::Table { schema, name } => {
                 let alias = fi.alias.as_deref();
                 if schema.is_none() {
+                    if let Some(w) = self
+                        .work_tables
+                        .iter()
+                        .rev()
+                        .find(|w| w.name == lower(name))
+                    {
+                        if w.depth != self.query_depth {
+                            return Err(Error::Sql(format!(
+                                "recursive reference in a subquery: {name}"
+                            )));
+                        }
+                        let q = Query {
+                            body: Body::WorkTable(w.id),
+                            order_by: Vec::new(),
+                            limit: None,
+                            offset: None,
+                            cols: w.cols.clone(),
+                        };
+                        // Correlated, so it is read afresh on every step.
+                        return self.query_source(q, true, alias.unwrap_or(name), &[]);
+                    }
                     if let Some(pos) = self.ctes.iter().rposition(|c| c.name == lower(name)) {
-                        let (sel, cols, ctes_len, scopes_len) = {
+                        let (sel, cols, ctes_len, scopes_len, recursive) = {
                             let c = &self.ctes[pos];
                             (
                                 c.select.clone(),
                                 c.columns.clone(),
                                 c.ctes_len,
                                 c.scopes_len,
+                                c.recursive,
                             )
                         };
-                        let (q, correlated) = self.bind_isolated(&sel, scopes_len, ctes_len)?;
+                        let (q, correlated) = if recursive {
+                            let cte_name = name.clone();
+                            let rename = cols.clone();
+                            self.isolated(scopes_len, ctes_len, |b| {
+                                b.bind_recursive(&sel, &cte_name, &rename)
+                            })?
+                        } else {
+                            self.bind_isolated(&sel, scopes_len, ctes_len)?
+                        };
                         return self.query_source(q, correlated, alias.unwrap_or(name), &cols);
                     }
                 }
@@ -1217,10 +1357,7 @@ impl<'a> Binder<'a> {
             }
             self.aggs.last_mut().unwrap().allowed = false;
             let bound: Result<Vec<Expr>> = args.iter().map(|a| self.bind_expr(a)).collect();
-            let filter = match filter {
-                Some(f) => Some(self.bind_expr(f)),
-                None => None,
-            };
+            let filter = filter.map(|f| self.bind_expr(f));
             self.aggs.last_mut().unwrap().allowed = true;
             let bound = bound?;
             let filter = filter.transpose()?;

@@ -163,7 +163,7 @@ fn main() {
                     .unwrap_or(30_000),
                 max_failures_per_file: 25,
             });
-            let quiet = args.flags.get("quiet").is_some();
+            let quiet = args.flags.contains_key("quiet");
             let mut handles = Vec::new();
             for worker in 0..jobs.max(1) {
                 let (queue, done, opts) = (queue.clone(), done.clone(), opts.clone());

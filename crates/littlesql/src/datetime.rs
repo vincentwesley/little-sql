@@ -227,6 +227,40 @@ fn apply_modifier(m: &mut Moment, raw_numeric: Option<f64>, text: &str) -> Optio
         m.jd += delta * DAY_MS;
         return Some(());
     }
+    // "+YYYY-MM-DD[ HH:MM[:SS]]" and "+HH:MM[:SS]": add a whole span.
+    if let Some(sign) = t
+        .strip_prefix('+')
+        .map(|_| 1)
+        .or(t.strip_prefix('-').map(|_| -1))
+    {
+        let body = &t.as_bytes()[1..];
+        let is_date = body.len() >= 10 && body[4] == b'-' && body[7] == b'-';
+        let is_time = body.len() >= 5 && body[2] == b':';
+        if is_date {
+            let y = digits(&body[0..4], 4)?;
+            let mo = digits(&body[5..7], 2)?;
+            let d = digits(&body[8..10], 2)?;
+            if mo > 11 || d > 30 {
+                return None;
+            }
+            let rest = std::str::from_utf8(&body[10..]).ok()?.trim();
+            let tod = if rest.is_empty() {
+                0
+            } else {
+                parse_time(rest.as_bytes())?
+            };
+            let (cy, cm, cd) = jd_ms_to_ymd(m.jd);
+            let keep = ms_of_day(m.jd);
+            let total = cy * 12 + (cm - 1) + sign * (y * 12 + mo);
+            m.jd = ymd_to_jd_ms(total.div_euclid(12), total.rem_euclid(12) + 1, cd) + keep;
+            m.jd += sign * (d * DAY_MS + tod);
+            return Some(());
+        }
+        if is_time {
+            m.jd += sign * parse_time(body)?;
+            return Some(());
+        }
+    }
     // "+N unit" / "-N unit"
     let (num, unit) = t.split_once(' ')?;
     let n: f64 = num.strip_prefix('+').unwrap_or(num).parse().ok()?;
@@ -278,8 +312,9 @@ fn moment(args: &[Value]) -> Option<Moment> {
         }
         apply_modifier(&mut m, raw, &a.to_text())?;
     }
-    // Valid range: years 0000 to 9999.
-    if m.jd < 148_699_540_800_000 - 366 * DAY_MS || m.jd > 464_269_060_799_999 {
+    // SQLite accepts Julian day numbers from 0 (4714 BC) to the end of
+    // the year 9999.
+    if m.jd < 0 || m.jd > 464_269_060_799_999 {
         return None;
     }
     Some(m)
@@ -287,7 +322,8 @@ fn moment(args: &[Value]) -> Option<Moment> {
 
 fn fmt_date(jd: i64) -> String {
     let (y, m, d) = jd_ms_to_ymd(jd);
-    format!("{y:04}-{m:02}-{d:02}")
+    let sign = if y < 0 { "-" } else { "" };
+    format!("{sign}{:04}-{m:02}-{d:02}", y.abs())
 }
 
 fn fmt_time(jd: i64, subsec: bool) -> String {

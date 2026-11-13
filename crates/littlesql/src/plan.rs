@@ -129,6 +129,17 @@ pub enum Body {
         left: Box<Query>,
         right: Box<Query>,
     },
+    /// `WITH RECURSIVE name AS (init UNION [ALL] step)`: rows of `init`
+    /// seed a queue; each row taken from the queue is returned and becomes
+    /// the whole of work table `work` while `step` runs once.
+    Recursive {
+        init: Box<Query>,
+        step: Box<Query>,
+        union_all: bool,
+        work: usize,
+    },
+    /// The current row of a recursive CTE, read inside its step.
+    WorkTable(usize),
 }
 
 pub enum KeySrc {
@@ -448,11 +459,8 @@ fn op_text(inclusive: bool, lower: bool) -> &'static str {
 fn describe_source(s: &Source) -> String {
     let mut out = match &s.kind {
         SourceKind::Table { table, access } => {
-            let named = if s.name.eq_ignore_ascii_case(&table.name) {
-                table.name.clone()
-            } else {
-                format!("{} AS {}", table.name, s.name)
-            };
+            // Like SQLite 3.36+, an aliased table is shown by its alias.
+            let named = s.name.clone();
             match access {
                 Access::Scan => format!("SCAN {named}"),
                 Access::Rowid(_) => format!("SEARCH {named} USING INTEGER PRIMARY KEY (rowid=?)"),
@@ -628,6 +636,26 @@ pub fn explain_query(q: &Query, depth: usize, out: &mut Vec<PlanLine>) {
             });
             explain_query(right, depth + 2, out);
         }
+        Body::Recursive {
+            init,
+            step,
+            union_all,
+            ..
+        } => {
+            out.push(PlanLine {
+                depth,
+                text: "SETUP".into(),
+                cursor: None,
+            });
+            explain_query(init, depth + 1, out);
+            out.push(PlanLine {
+                depth,
+                text: format!("RECURSIVE STEP{}", if *union_all { "" } else { " (UNION)" }),
+                cursor: None,
+            });
+            explain_query(step, depth + 1, out);
+        }
+        Body::WorkTable(_) => {}
     }
     if !q.order_by.is_empty() {
         out.push(PlanLine {

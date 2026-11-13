@@ -54,6 +54,8 @@ pub struct Exec<'a> {
     sub_cache: HashMap<usize, SubCache>,
     mat_cache: HashMap<usize, Rc<Vec<Row>>>,
     hash_cache: HashMap<usize, Rc<HashTable>>,
+    /// Current contents of each recursive CTE's work table.
+    work: HashMap<usize, Vec<Value>>,
     empty_row: Row,
     pub stats: Vec<CursorStats>,
     steps: u64,
@@ -218,7 +220,7 @@ pub fn cast(v: Value, aff: Affinity) -> Value {
         },
         Affinity::Blob => match v {
             Value::Blob(_) => v,
-            other => Value::blob(other.to_text().as_bytes()),
+            other => Value::blob(crate::value::text_bytes(&other.to_text())),
         },
     }
 }
@@ -348,6 +350,7 @@ impl<'a> Exec<'a> {
     pub fn new(pager: Rc<Pager>, plan: &'a Plan) -> Exec<'a> {
         let n = plan.used.len();
         let empty_row: Row = Rc::from(Vec::new());
+        crate::value::set_text_encoding(pager.encoding());
         Exec {
             enc: pager.encoding(),
             pager,
@@ -357,6 +360,7 @@ impl<'a> Exec<'a> {
             sub_cache: HashMap::new(),
             mat_cache: HashMap::new(),
             hash_cache: HashMap::new(),
+            work: HashMap::new(),
             empty_row,
             stats: vec![CursorStats::default(); n],
             steps: 0,
@@ -384,6 +388,11 @@ impl<'a> Exec<'a> {
     #[inline]
     fn tick(&mut self, cur: usize) -> Result<()> {
         self.stats[cur].rows += 1;
+        self.tick_free()
+    }
+
+    /// Count one unit of work against the limits, without a cursor.
+    fn tick_free(&mut self) -> Result<()> {
         self.steps += 1;
         if self.limits.max_steps > 0 && self.steps > self.limits.max_steps {
             return Err(Error::Runtime(
@@ -391,7 +400,7 @@ impl<'a> Exec<'a> {
             ));
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if self.steps % 1024 == 0 {
+        if self.steps.is_multiple_of(1024) {
             if let Some(d) = self.deadline {
                 if std::time::Instant::now() > d {
                     return Err(Error::Runtime(
@@ -490,6 +499,64 @@ impl<'a> Exec<'a> {
                 }
                 Ok(())
             }
+            Body::WorkTable(id) => match self.work.get(id).cloned() {
+                Some(row) => {
+                    let keys = result_keys(&row);
+                    emit(row, keys).map(|_| ())
+                }
+                None => Ok(()),
+            },
+            Body::Recursive {
+                init,
+                step,
+                union_all,
+                work,
+            } => {
+                let colls: Vec<Collation> = q.cols.iter().map(|c| c.coll).collect();
+                let mut seen: HashSet<Vec<u8>> = HashSet::new();
+                let mut queue: std::collections::VecDeque<Vec<Value>> = Default::default();
+                for row in self.collect(init)? {
+                    if *union_all || seen.insert(row_key(&row, &colls)) {
+                        queue.push_back(row);
+                    }
+                }
+                let saved = self.work.remove(work);
+                let mut result = Ok(());
+                while let Some(row) = queue.pop_front() {
+                    if let Err(e) = self.tick_free() {
+                        result = Err(e);
+                        break;
+                    }
+                    let keys = result_keys(&row);
+                    match emit(row.clone(), keys) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                    self.work.insert(*work, row);
+                    match self.collect(step) {
+                        Ok(rows) => {
+                            for r in rows {
+                                if *union_all || seen.insert(row_key(&r, &colls)) {
+                                    queue.push_back(r);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                }
+                self.work.remove(work);
+                if let Some(s) = saved {
+                    self.work.insert(*work, s);
+                }
+                result
+            }
             Body::Compound { op, left, right } => {
                 let colls: Vec<Collation> = q.cols.iter().map(|c| c.coll).collect();
                 if *op == CompoundOp::UnionAll {
@@ -509,14 +576,24 @@ impl<'a> Exec<'a> {
                 }
                 let l = self.collect(left)?;
                 let r = self.collect(right)?;
-                let mut seen: HashSet<Vec<u8>> = HashSet::new();
+                // SQLite builds these in a temporary index where inserting a
+                // key that compares equal replaces the earlier row, so of
+                // two equal rows (1 and 1.0, or 'a' and 'A' under NOCASE)
+                // the later one is the one returned.
+                let mut slot: HashMap<Vec<u8>, usize> = HashMap::new();
                 let mut out: Vec<Vec<Value>> = Vec::new();
+                let mut add = |row: Vec<Value>, key: Vec<u8>| match slot.get(&key) {
+                    Some(&i) => out[i] = row,
+                    None => {
+                        slot.insert(key, out.len());
+                        out.push(row);
+                    }
+                };
                 match op {
                     CompoundOp::Union => {
                         for row in l.into_iter().chain(r) {
-                            if seen.insert(row_key(&row, &colls)) {
-                                out.push(row);
-                            }
+                            let key = row_key(&row, &colls);
+                            add(row, key);
                         }
                     }
                     _ => {
@@ -525,8 +602,8 @@ impl<'a> Exec<'a> {
                         let keep = *op == CompoundOp::Intersect;
                         for row in l {
                             let key = row_key(&row, &colls);
-                            if right_keys.contains(&key) == keep && seen.insert(key) {
-                                out.push(row);
+                            if right_keys.contains(&key) == keep {
+                                add(row, key);
                             }
                         }
                     }

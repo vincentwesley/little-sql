@@ -182,7 +182,7 @@ impl Value {
             Value::Null => Value::Null,
             Value::Int(_) | Value::Real(_) => self.clone(),
             Value::Text(s) => numeric_prefix(s).0,
-            Value::Blob(b) => numeric_prefix(&String::from_utf8_lossy(b)).0,
+            Value::Blob(b) => numeric_prefix(&blob_text(b)).0,
         }
     }
 
@@ -203,7 +203,7 @@ impl Value {
             Value::Int(i) => *i,
             Value::Real(r) => real_to_int(*r),
             Value::Text(s) => integer_prefix(s),
-            Value::Blob(b) => integer_prefix(&String::from_utf8_lossy(b)),
+            Value::Blob(b) => integer_prefix(&blob_text(b)),
         }
     }
 
@@ -215,7 +215,7 @@ impl Value {
             Value::Int(i) => i.to_string(),
             Value::Real(r) => fmt_real(*r),
             Value::Text(s) => s.to_string(),
-            Value::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+            Value::Blob(b) => blob_text(b),
         }
     }
 
@@ -546,4 +546,33 @@ mod tests {
             Value::Real(_)
         ));
     }
+}
+
+thread_local! {
+    static TEXT_ENCODING: std::cell::Cell<crate::record::TextEncoding> =
+        const { std::cell::Cell::new(crate::record::TextEncoding::Utf8) };
+}
+
+/// Set the text encoding of the database whose statement is running. SQLite
+/// reinterprets blobs as text (and text as blobs) in that encoding, so
+/// `hex('a')` is `6100` in a UTF-16LE database.
+pub fn set_text_encoding(enc: crate::record::TextEncoding) {
+    TEXT_ENCODING.with(|e| e.set(enc));
+}
+
+pub fn text_encoding() -> crate::record::TextEncoding {
+    TEXT_ENCODING.with(|e| e.get())
+}
+
+/// A blob's bytes read as text in the current database encoding.
+pub fn blob_text(b: &[u8]) -> String {
+    match crate::record::decode_text(b, text_encoding()) {
+        Value::Text(t) => t.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Text as bytes in the current database encoding.
+pub fn text_bytes(s: &str) -> Vec<u8> {
+    crate::record::encode_text(s, text_encoding())
 }

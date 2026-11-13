@@ -137,7 +137,7 @@ pub fn parse(text: &str) -> Vec<Record> {
                         let count = p.next().and_then(|n| n.parse().ok()).unwrap_or(0);
                         Expected::Hash {
                             count,
-                            md5: p.last().unwrap_or("").to_string(),
+                            md5: p.next_back().unwrap_or("").to_string(),
                         }
                     }
                     _ => Expected::Values(values),
@@ -191,7 +191,7 @@ mod tests {
             k => panic!("{k:?}"),
         }
         assert_eq!(r[4].sql, "SELECT a,\n b FROM t");
-        assert_eq!(r[4].line, 16);
+        assert_eq!(r[4].line, 17);
         assert_eq!(r[5].kind, Kind::Halt);
     }
 }

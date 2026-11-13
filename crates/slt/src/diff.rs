@@ -70,8 +70,13 @@ pub fn parse(text: &str) -> TestFile {
 }
 
 fn parse_ascii(raw: &str) -> Vec<Vec<String>> {
-    raw.split('\x1e')
-        .filter(|r| !r.is_empty())
+    let mut records: Vec<&str> = raw.split('\x1e').collect();
+    // Every record ends with the separator, so the last piece is what
+    // follows the final row: nothing. A row holding one empty string is a
+    // real, empty record and must be kept.
+    records.pop();
+    records
+        .into_iter()
         .map(|r| {
             r.trim_start_matches('\n')
                 .split('\x1f')
@@ -79,6 +84,19 @@ fn parse_ascii(raw: &str) -> Vec<Vec<String>> {
                 .collect()
         })
         .collect()
+}
+
+/// A value as the sqlite3 shell prints it: NULL as the `.nullvalue`
+/// marker, everything else as a C string, so text and blobs stop at the
+/// first NUL byte.
+fn cli_text(v: &littlesql::Value) -> String {
+    let bytes: Vec<u8> = match v {
+        littlesql::Value::Null => return "NULL".into(),
+        littlesql::Value::Blob(b) => b.to_vec(),
+        other => other.to_text().into_bytes(),
+    };
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// Run one differential test file.
@@ -98,7 +116,7 @@ pub fn run_file(path: &Path, scratch: &Path) -> FileResult {
         failures: Vec::new(),
         millis: 0,
     };
-    let mut broken = |res: &mut FileResult, why: String, n: u64| {
+    let broken = |res: &mut FileResult, why: String, n: u64| {
         res.tally.fail += n.max(1);
         res.failures.push(Failure {
             file: name.clone(),
@@ -192,17 +210,7 @@ pub fn run_file(path: &Path, scratch: &Path) -> FileResult {
                 let mut got: Vec<Vec<String>> = rs
                     .rows
                     .iter()
-                    .map(|r| {
-                        r.iter()
-                            .map(|v| {
-                                if v.is_null() {
-                                    "NULL".to_string()
-                                } else {
-                                    v.to_text()
-                                }
-                            })
-                            .collect()
-                    })
+                    .map(|r| r.iter().map(|v| cli_text(v)).collect())
                     .collect();
                 if !ordered {
                     want.sort();

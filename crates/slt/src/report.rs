@@ -66,7 +66,7 @@ fn tally_json(t: &Tally) -> String {
         t.pass,
         t.fail,
         t.scored(),
-        t.rate(),
+        t.rate_floor(),
         t.not_applicable,
         t.setup
     )
@@ -125,7 +125,7 @@ impl Summary {
                 files,
                 t.pass,
                 t.fail,
-                t.rate(),
+                t.rate_floor(),
                 t.not_applicable,
                 t.setup
             );
@@ -138,7 +138,7 @@ impl Summary {
             self.files,
             t.pass,
             t.fail,
-            t.rate(),
+            t.rate_floor(),
             t.not_applicable,
             t.setup
         );

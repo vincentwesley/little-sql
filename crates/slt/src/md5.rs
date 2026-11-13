@@ -36,6 +36,7 @@ impl Md5 {
             *w = u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
         }
         let [mut a, mut b, mut c, mut d] = self.state;
+        #[allow(clippy::needless_range_loop)]
         for i in 0..64 {
             let (f, g) = match i / 16 {
                 0 => ((b & c) | (!b & d), i),

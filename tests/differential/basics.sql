@@ -1,0 +1,31 @@
+-- fixture: shop
+-- Single-table SELECT: projection, WHERE, ORDER BY, LIMIT/OFFSET, DISTINCT.
+SELECT * FROM customers WHERE id <= 5;
+SELECT id, name FROM customers WHERE city = 'Bedok' ORDER BY id;
+SELECT id FROM customers WHERE city IS NULL ORDER BY id LIMIT 10;
+SELECT id, credit FROM customers WHERE credit > 100 AND credit < 120 ORDER BY credit, id;
+SELECT DISTINCT city FROM customers;
+SELECT DISTINCT city FROM customers ORDER BY city;
+SELECT DISTINCT city FROM customers ORDER BY city DESC NULLS FIRST;
+SELECT id FROM customers ORDER BY credit DESC, id LIMIT 5 OFFSET 3;
+SELECT id FROM customers ORDER BY credit NULLS LAST, id LIMIT 12;
+SELECT name AS n, id * 2 AS double FROM customers WHERE id BETWEEN 10 AND 14 ORDER BY n;
+SELECT count(*) FROM customers;
+SELECT * FROM products WHERE title = 'APPLE 4';
+SELECT sku, title FROM products WHERE title < 'b' ORDER BY title;
+SELECT sku FROM products WHERE price = 10 ORDER BY sku;
+SELECT sku, weight FROM products WHERE weight > 5 ORDER BY sku;
+SELECT sku, typeof(weight) FROM products ORDER BY sku LIMIT 8;
+SELECT id FROM orders WHERE status IN ('pending', 'cancelled') AND id < 30 ORDER BY id;
+SELECT id FROM orders WHERE customer_id NOT IN (1, 2, 3) AND id < 20 ORDER BY 1;
+SELECT id FROM orders WHERE customer_id IS NULL ORDER BY id;
+SELECT * FROM lines WHERE order_id = 7;
+SELECT * FROM lines WHERE order_id BETWEEN 100 AND 103 ORDER BY order_id, sku;
+SELECT 1 FROM customers WHERE 0;
+SELECT id FROM customers LIMIT 0;
+SELECT id FROM customers ORDER BY id LIMIT -1 OFFSET 295;
+SELECT id FROM customers WHERE rowid = 42;
+SELECT _rowid_, oid FROM customers WHERE id IN (7, 8);
+SELECT email FROM customers WHERE email LIKE 'c1%5@%' ORDER BY email;
+SELECT email FROM customers WHERE email GLOB 'c2[0-3]?@*' ORDER BY email;
+SELECT * FROM order_totals WHERE order_id < 5;

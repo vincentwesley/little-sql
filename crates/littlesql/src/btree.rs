@@ -379,6 +379,7 @@ impl Cursor {
     }
 
     /// Step to the next entry in key order.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<()> {
         let Some(top) = self.stack.last_mut() else {
             return Ok(());

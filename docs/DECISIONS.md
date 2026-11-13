@@ -118,3 +118,21 @@ tested.
 Little SQL takes no file locks and writes no `-shm` file. *Why:*
 multi-process concurrency is out of scope; the README says so plainly.
 SQLite rebuilds the wal-index itself when it later opens the file.
+
+## D14. Matching the reference runner's output rules exactly
+
+Two scoring details follow what SQLite's own test harness (`slt_sqlite.c`)
+produced when the expected answers were recorded, because those answers are
+the standard we are graded against:
+
+- `R` values are printed the way SQLite's `printf("%.3f")` prints them: at
+  most 16 significant digits, then zeros (`-9223372036854776000.000`).
+- A query that SQLite aborts with `integer overflow` was recorded as
+  returning no rows. If Little SQL raises the same error and the expected
+  result is empty, the record passes. Only that exact run-time error
+  qualifies; a parse error or an unsupported feature never passes.
+
+*Why:* both were verified against sqlite3 3.45 on
+`evidence/slt_lang_aggfunc.test` (lines 480-496): sqlite3 itself raises the
+overflow, and its own printf gives the 16-digit rendering. Anything looser
+would risk counting a failure as a pass.

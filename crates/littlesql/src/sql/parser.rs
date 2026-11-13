@@ -517,11 +517,10 @@ impl<'a> Parser<'a> {
             if self.eat_kw("ON") {
                 // ON DELETE|UPDATE  SET NULL|SET DEFAULT|CASCADE|RESTRICT|NO ACTION
                 self.pos += 1;
-                if self.eat_kw("SET") || self.eat_kw("NO") {
-                    self.pos += 1;
-                } else {
-                    self.pos += 1;
-                }
+                // SET NULL / NO ACTION take two words; the first was eaten
+                // above when present, so skip exactly one more word.
+                let _ = self.eat_kw("SET") || self.eat_kw("NO");
+                self.pos += 1;
             } else if self.eat_kw("MATCH") {
                 self.pos += 1;
             } else if self.is_kw("DEFERRABLE")
@@ -973,7 +972,7 @@ impl<'a> Parser<'a> {
             }
         }
         let from = if self.eat_kw("FROM") {
-            self.from_list()?
+            self.parse_from_list()?
         } else {
             Vec::new()
         };
@@ -1010,11 +1009,11 @@ impl<'a> Parser<'a> {
         })))
     }
 
-    fn from_list(&mut self) -> Result<Vec<FromItem>> {
-        let mut items = vec![self.from_item(JoinKind::Inner, false)?];
+    fn parse_from_list(&mut self) -> Result<Vec<FromItem>> {
+        let mut items = vec![self.parse_from_item(JoinKind::Inner, false)?];
         loop {
             if self.eat_op(",") {
-                items.push(self.from_item(JoinKind::Inner, false)?);
+                items.push(self.parse_from_item(JoinKind::Inner, false)?);
                 continue;
             }
             let save = self.pos;
@@ -1036,7 +1035,7 @@ impl<'a> Parser<'a> {
                 self.pos = save;
                 return Ok(items);
             }
-            let mut item = self.from_item(kind, natural)?;
+            let mut item = self.parse_from_item(kind, natural)?;
             if self.eat_kw("ON") {
                 item.on = Some(self.expr()?);
             } else if self.eat_kw("USING") {
@@ -1053,12 +1052,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn from_item(&mut self, join: JoinKind, natural: bool) -> Result<FromItem> {
+    fn parse_from_item(&mut self, join: JoinKind, natural: bool) -> Result<FromItem> {
         let source = if self.eat_op("(") {
             let s = if self.is_kw("SELECT") || self.is_kw("VALUES") || self.is_kw("WITH") {
                 TableSource::Subquery(Box::new(self.select()?))
             } else {
-                TableSource::Nested(self.from_list()?)
+                TableSource::Nested(self.parse_from_list()?)
             };
             self.expect_op(")")?;
             s

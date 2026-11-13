@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Run the full sqllogictest corpus (about 5.7 million queries)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, lint, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install sqlite3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      - name: Build (release)
+        run: cargo build --release --workspace
+
+  score:
+    name: sqllogictest sample and differential tests
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install sqlite3 and node
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 nodejs
+      - name: Cache the corpus sample
+        uses: actions/cache@v4
+        with:
+          path: corpus
+          key: slt-${{ hashFiles('tests/slt/SAMPLE', 'scripts/fetch-sqllogictest.sh') }}-${{ inputs.full && 'full' || 'sample' }}
+      - name: Fetch sqllogictest
+        run: scripts/fetch-sqllogictest.sh ${{ inputs.full && '--full' || '' }}
+      - name: Acceptance checks
+        run: scripts/acceptance.sh
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: results/

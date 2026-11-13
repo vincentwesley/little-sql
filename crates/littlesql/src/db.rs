@@ -27,6 +27,9 @@ pub struct ResultSet {
     pub page_reads: u64,
     /// Rows inserted, updated or deleted.
     pub changes: u64,
+    /// True for EXPLAIN / EXPLAIN QUERY PLAN results, whose `plan` a shell
+    /// should draw as a tree.
+    pub is_explain: bool,
 }
 
 impl ResultSet {
@@ -40,6 +43,7 @@ pub struct Database {
     pub(crate) pager: Rc<Pager>,
     pub(crate) schema: RefCell<Rc<Schema>>,
     /// True between BEGIN and COMMIT/ROLLBACK.
+    #[allow(dead_code)] // TODO(M7): used by the write path
     pub(crate) explicit_txn: RefCell<bool>,
     pub(crate) limits: std::cell::Cell<Limits>,
     wal_path: Option<PathBuf>,
@@ -140,6 +144,7 @@ impl Database {
         &self.pager
     }
 
+    #[allow(dead_code)] // TODO(M7): used by the write path
     pub(crate) fn reload_schema(&self) -> Result<()> {
         *self.schema.borrow_mut() = Rc::new(Schema::load(&self.pager)?);
         Ok(())
@@ -227,6 +232,7 @@ impl Database {
                     stats: inner.stats,
                     page_reads: inner.page_reads,
                     changes: 0,
+                    is_explain: true,
                 })
             }
             Stmt::Pragma { name, value } => self.pragma(name, value.as_deref()),
@@ -248,7 +254,14 @@ impl Database {
                 "page_count",
                 Value::Int(self.pager.page_count() as i64),
             )),
-            "encoding" => Ok(one("encoding", Value::text("UTF-8"))),
+            "encoding" => Ok(one(
+                "encoding",
+                Value::text(match self.pager.encoding() {
+                    crate::record::TextEncoding::Utf8 => "UTF-8",
+                    crate::record::TextEncoding::Utf16Le => "UTF-16le",
+                    crate::record::TextEncoding::Utf16Be => "UTF-16be",
+                }),
+            )),
             "journal_mode" => Ok(one(
                 "journal_mode",
                 Value::text(if self.pager.has_wal() {

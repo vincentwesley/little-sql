@@ -37,3 +37,19 @@ pub use exec::Limits;
 pub use value::Value;
 pub mod check;
 pub mod write;
+
+/// True when `sql` ends with a complete statement: its last token is a `;`
+/// outside any string, identifier or comment. Shells use this to decide
+/// whether to read another line.
+pub fn sql_is_complete(sql: &str) -> bool {
+    match sql::lexer::tokenize(sql) {
+        Ok(toks) => toks
+            .iter()
+            .rev()
+            .find(|t| t.tok != sql::lexer::Tok::Eof)
+            .is_some_and(|t| t.tok == sql::lexer::Tok::Op(";")),
+        // An unterminated string needs more input; any other lexing error
+        // is complete enough to report.
+        Err(e) => !e.to_string().contains("unterminated"),
+    }
+}
