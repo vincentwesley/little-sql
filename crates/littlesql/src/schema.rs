@@ -83,6 +83,8 @@ pub struct Table {
     /// table's own b-tree.
     pub pk_index: Option<Rc<Index>>,
     pub autoincrement: bool,
+    /// CHECK constraints: (text used in the error message, expression).
+    pub checks: Vec<(String, ast::Expr)>,
     pub sql: String,
     row_estimate: Cell<Option<u64>>,
 }
@@ -113,6 +115,14 @@ pub struct View {
     pub sql: String,
 }
 
+/// A trigger, parsed from its CREATE TRIGGER text.
+#[derive(Debug)]
+pub struct Trigger {
+    pub name: String,
+    pub table: String,
+    pub def: ast::CreateTrigger,
+}
+
 /// One row of `sqlite_schema`.
 #[derive(Debug, Clone)]
 pub struct SchemaRow {
@@ -133,6 +143,7 @@ pub struct Schema {
     /// Objects whose SQL this engine cannot handle, with the reason.
     pub broken: HashMap<String, String>,
     pub rows: Vec<SchemaRow>,
+    pub triggers: Vec<Rc<Trigger>>,
 }
 
 fn lower(s: &str) -> String {
@@ -159,7 +170,7 @@ fn const_default(e: &ast::Expr) -> Value {
 
 /// The key columns of every UNIQUE / PRIMARY KEY constraint that SQLite
 /// backs with an automatic index, in the order SQLite numbers them.
-fn auto_index_keys(ct: &CreateTable, table: &Table) -> Result<Vec<Vec<IndexCol>>> {
+pub(crate) fn auto_index_keys(ct: &CreateTable, table: &Table) -> Result<Vec<Vec<IndexCol>>> {
     let mut keys: Vec<Vec<IndexCol>> = Vec::new();
     let add = |cols: Vec<IndexCol>, keys: &mut Vec<Vec<IndexCol>>| {
         let dup = keys.iter().any(|k| {
@@ -219,7 +230,7 @@ fn auto_index_keys(ct: &CreateTable, table: &Table) -> Result<Vec<Vec<IndexCol>>
                 }
             }
             TableConstraint::Unique(cols) => add(resolve(cols)?, &mut keys),
-            TableConstraint::Other => {}
+            TableConstraint::Check(_) | TableConstraint::Other => {}
         }
     }
     Ok(keys)
@@ -252,6 +263,21 @@ pub fn table_from_ast(ct: &CreateTable, name: &str, root: u32, sql: &str) -> Res
         pk: Vec::new(),
         indexes: Vec::new(),
         pk_index: None,
+        checks: ct
+            .columns
+            .iter()
+            .flat_map(|c| c.checks.iter())
+            .chain(ct.constraints.iter().filter_map(|c| match c {
+                TableConstraint::Check(k) => Some(k),
+                _ => None,
+            }))
+            .map(|k| {
+                (
+                    k.name.clone().unwrap_or_else(|| k.text.clone()),
+                    k.expr.clone(),
+                )
+            })
+            .collect(),
         autoincrement: ct.columns.iter().any(|c| c.autoincrement),
         sql: sql.to_string(),
         row_estimate: Cell::new(None),
@@ -542,6 +568,41 @@ impl Schema {
                 }
             }
         }
+        for r in rows.iter().filter(|r| r.kind == "trigger") {
+            let Some(sql) = &r.sql else { continue };
+            if let Ok(Stmt::CreateTrigger(def)) = parse_one(sql) {
+                self.triggers.push(Rc::new(Trigger {
+                    name: r.name.clone(),
+                    table: r.tbl_name.clone(),
+                    def,
+                }));
+            }
+        }
+    }
+
+    /// Add a view that lives only in this connection (CREATE TEMP VIEW).
+    pub fn add_temp_view(&mut self, sql: &str) -> Result<()> {
+        match parse_one(sql)? {
+            Stmt::CreateView(cv) => {
+                self.views.insert(
+                    lower(&cv.name),
+                    Rc::new(View {
+                        name: cv.name.clone(),
+                        columns: cv.columns,
+                        select: cv.select,
+                        sql: sql.to_string(),
+                    }),
+                );
+                Ok(())
+            }
+            _ => Err(Error::Sql("not a view definition".into())),
+        }
+    }
+
+    pub fn trigger(&self, name: &str) -> Option<&Rc<Trigger>> {
+        self.triggers
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(name))
     }
 
     pub fn table(&self, name: &str) -> Option<&Rc<Table>> {

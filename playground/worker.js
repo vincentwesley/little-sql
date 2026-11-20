@@ -19,6 +19,9 @@ self.onmessage = async (ev) => {
       lastBytes = ev.data.bytes;
       engine.open(lastBytes);
       self.postMessage({ id, ok: true });
+    } else if (op === "export") {
+      const bytes = engine.export();
+      self.postMessage({ id, ok: !!bytes, bytes, error: bytes ? null : "nothing to export" });
     } else if (op === "exec") {
       const t0 = performance.now();
       const report = engine.exec(ev.data.sql, { maxRows: 1000, maxSteps: ev.data.maxSteps });

@@ -103,6 +103,12 @@ pub struct Pager {
     pub stats: PagerStats,
 }
 
+/// Uncommitted changes at a point in time (see [`Pager::savepoint`]).
+pub struct Savepoint {
+    dirty: BTreeMap<u32, Page>,
+    n_pages: u32,
+}
+
 /// Page size used for databases this engine creates.
 pub const DEFAULT_PAGE_SIZE: u32 = 4096;
 
@@ -286,6 +292,51 @@ impl Pager {
     pub fn truncate_pages(&self, n: u32) {
         self.n_pages.set(n);
         self.dirty.borrow_mut().retain(|&p, _| p <= n);
+    }
+
+    /// The uncommitted state, to return to if a statement inside a
+    /// transaction fails.
+    pub fn savepoint(&self) -> Savepoint {
+        Savepoint {
+            dirty: self.dirty.borrow().clone(),
+            n_pages: self.n_pages.get(),
+        }
+    }
+
+    pub fn restore(&self, sp: Savepoint) {
+        *self.dirty.borrow_mut() = sp.dirty;
+        self.n_pages.set(sp.n_pages);
+    }
+
+    /// Write page 1 straight to the database file, outside any
+    /// transaction. Used once, to mark a database as being in WAL mode
+    /// before the first frame is written (as SQLite does), so that no
+    /// reader can ever ignore the WAL.
+    pub fn write_header_direct(&self, page1: &[u8]) -> Result<()> {
+        self.require_writable()?;
+        let mut db = self.db.borrow_mut();
+        db.write_at(0, page1)?;
+        db.sync()?;
+        self.cache.borrow_mut().insert(1, Rc::from(page1.to_vec()));
+        Ok(())
+    }
+
+    /// Give an empty database its first page, written straight to storage
+    /// so the file is a valid (empty) database from then on.
+    pub fn init_direct(&self, page1: &[u8]) -> Result<()> {
+        self.require_writable()?;
+        if self.n_pages.get() != 0 {
+            return Err(Error::Runtime("database is not empty".into()));
+        }
+        {
+            let mut db = self.db.borrow_mut();
+            db.write_at(0, page1)?;
+            db.sync()?;
+        }
+        self.n_pages.set(1);
+        self.committed_pages.set(1);
+        self.cache.borrow_mut().insert(1, Rc::from(page1.to_vec()));
+        Ok(())
     }
 
     /// Discard every change made since the last commit.

@@ -20,3 +20,4 @@ SELECT upper('ß'), lower('ÀÉ'), length(CAST(x'00410042' AS TEXT)), instr('abc
 SELECT concat('a', NULL, 1, 2.5), concat_ws('-', 'a', NULL, 'b'), 'x' || 1 || 2.0;
 SELECT abs(-9223372036854775807), abs(NULL), abs('-3'), abs('x');
 SELECT total_changes() >= 0, changes() >= 0, last_insert_rowid() >= 0;
+SELECT printf('%.*c', 5, 'x'), printf('%*d|%-*d|', 5, 42, 4, 7), printf('%.*f', 2, 3.14159), printf('%*s|', -6, 'ab'), printf('%5.1c|', 'q');

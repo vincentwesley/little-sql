@@ -75,7 +75,7 @@ const RESERVED: &[&str] = &[
     "WINDOW",
 ];
 
-fn is_reserved(word: &str) -> bool {
+pub fn is_reserved(word: &str) -> bool {
     RESERVED.iter().any(|k| word.eq_ignore_ascii_case(k))
 }
 
@@ -279,6 +279,26 @@ impl<'a> Parser<'a> {
                 stmt: Box::new(self.statement()?),
             });
         }
+        if self.is_kw("WITH") {
+            // A WITH clause may also lead an INSERT.
+            let save = self.pos;
+            let with = self.with_clause()?;
+            if self.is_kw("INSERT") || self.is_kw("REPLACE") {
+                let mut stmt = self.insert()?;
+                if let Stmt::Insert(ins) = &mut stmt {
+                    if let InsertSource::Select(sel) = &mut ins.source {
+                        let mut all = with;
+                        all.append(&mut sel.with);
+                        sel.with = all;
+                    }
+                }
+                return Ok(stmt);
+            }
+            if self.is_kw("UPDATE") || self.is_kw("DELETE") {
+                return self.unsupported("WITH before UPDATE or DELETE");
+            }
+            self.pos = save;
+        }
         if self.is_kw("SELECT") || self.is_kw("VALUES") || self.is_kw("WITH") {
             return Ok(Stmt::Select(self.select()?));
         }
@@ -292,8 +312,8 @@ impl<'a> Parser<'a> {
                 DropKind::Index
             } else if self.eat_kw("VIEW") {
                 DropKind::View
-            } else if self.is_kw("TRIGGER") {
-                return self.unsupported("triggers");
+            } else if self.eat_kw("TRIGGER") {
+                DropKind::Trigger
             } else {
                 return Err(self.unexpected());
             };
@@ -354,11 +374,15 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::Pragma { name, value });
         }
-        for (kw, name) in [
-            ("ANALYZE", "ANALYZE"),
-            ("REINDEX", "REINDEX"),
-            ("VACUUM", "VACUUM"),
-        ] {
+        if self.eat_kw("REINDEX") {
+            let name = if self.at_eof() || self.is_op(";") {
+                None
+            } else {
+                Some(self.qualified_name()?)
+            };
+            return Ok(Stmt::Reindex(name));
+        }
+        for (kw, name) in [("ANALYZE", "ANALYZE"), ("VACUUM", "VACUUM")] {
             if self.eat_kw(kw) {
                 while !self.at_eof() && !self.is_op(";") {
                     self.pos += 1;
@@ -455,13 +479,110 @@ impl<'a> Parser<'a> {
                 partial,
             }));
         }
-        if self.is_kw("TRIGGER") {
-            return self.unsupported("triggers");
+        if self.eat_kw("TRIGGER") {
+            return self.create_trigger(temp);
         }
         if self.is_kw("VIRTUAL") {
             return self.unsupported("virtual tables");
         }
         Err(self.unexpected())
+    }
+
+    /// `( expr )` after CHECK, keeping the expression's text.
+    fn check_body(&mut self, name: Option<String>) -> Result<Check> {
+        self.expect_op("(")?;
+        let start = self.toks[self.pos].start;
+        let expr = self.expr()?;
+        let end = self.toks[self.pos - 1].end;
+        self.expect_op(")")?;
+        Ok(Check {
+            name,
+            expr,
+            text: self.sql[start..end].to_string(),
+        })
+    }
+
+    fn create_trigger(&mut self, temp: bool) -> Result<Stmt> {
+        let if_not_exists = self.if_not_exists()?;
+        let name = self.qualified_name()?;
+        let timing = if self.eat_kw("BEFORE") {
+            TriggerTiming::Before
+        } else if self.eat_kw("AFTER") {
+            TriggerTiming::After
+        } else if self.eat_kw("INSTEAD") {
+            self.expect_kw("OF")?;
+            TriggerTiming::InsteadOf
+        } else {
+            TriggerTiming::Before
+        };
+        let event = if self.eat_kw("INSERT") {
+            TriggerEvent::Insert
+        } else if self.eat_kw("DELETE") {
+            TriggerEvent::Delete
+        } else if self.eat_kw("UPDATE") {
+            let mut cols = Vec::new();
+            if self.eat_kw("OF") {
+                loop {
+                    cols.push(self.ident()?);
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+            }
+            TriggerEvent::Update(cols)
+        } else {
+            return Err(self.unexpected());
+        };
+        self.expect_kw("ON")?;
+        let table = self.qualified_name()?;
+        if self.eat_kw("FOR") {
+            self.expect_kw("EACH")?;
+            self.expect_kw("ROW")?;
+        }
+        let when = if self.eat_kw("WHEN") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        self.expect_kw("BEGIN")?;
+        let mut body = Vec::new();
+        loop {
+            while self.eat_op(";") {}
+            if self.eat_kw("END") {
+                break;
+            }
+            if self.at_eof() {
+                return Err(Error::Parse("incomplete trigger: missing END".into()));
+            }
+            let stmt = self.statement()?;
+            match stmt {
+                Stmt::Select(_) | Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {}
+                _ => {
+                    return Err(Error::Parse(
+                        "only SELECT, INSERT, UPDATE and DELETE may appear in a trigger".into(),
+                    ))
+                }
+            }
+            body.push(stmt);
+            if !self.is_kw("END") {
+                self.expect_op(";")?;
+            }
+        }
+        if body.is_empty() {
+            return Err(Error::Parse(
+                "a trigger needs at least one statement".into(),
+            ));
+        }
+        Ok(Stmt::CreateTrigger(CreateTrigger {
+            name,
+            temp,
+            if_not_exists,
+            timing,
+            event,
+            table,
+            when,
+            body,
+        }))
     }
 
     fn indexed_columns(&mut self) -> Result<Vec<IndexedColumn>> {
@@ -585,8 +706,9 @@ impl<'a> Parser<'a> {
                 || self.is_kw("CHECK")
                 || self.is_kw("FOREIGN");
             if table_constraint && !ct.columns.is_empty() {
+                let mut cname = None;
                 if self.eat_kw("CONSTRAINT") {
-                    self.ident()?;
+                    cname = Some(self.ident()?);
                 }
                 if self.eat_kw("PRIMARY") {
                     self.expect_kw("KEY")?;
@@ -603,11 +725,9 @@ impl<'a> Parser<'a> {
                     self.conflict_clause()?;
                     ct.constraints.push(TableConstraint::Unique(cols));
                 } else if self.eat_kw("CHECK") {
-                    self.expect_op("(")?;
-                    self.expr()?;
-                    self.expect_op(")")?;
+                    let check = self.check_body(cname)?;
                     self.conflict_clause()?;
-                    ct.constraints.push(TableConstraint::Other);
+                    ct.constraints.push(TableConstraint::Check(check));
                 } else if self.eat_kw("FOREIGN") {
                     self.expect_kw("KEY")?;
                     self.expect_op("(")?;
@@ -661,10 +781,12 @@ impl<'a> Parser<'a> {
             default: None,
             collation: None,
             generated: false,
+            checks: Vec::new(),
         };
         loop {
+            let mut cname = None;
             if self.eat_kw("CONSTRAINT") {
-                self.ident()?;
+                cname = Some(self.ident()?);
             }
             if self.eat_kw("PRIMARY") {
                 self.expect_kw("KEY")?;
@@ -686,9 +808,8 @@ impl<'a> Parser<'a> {
                 col.unique = true;
                 self.conflict_clause()?;
             } else if self.eat_kw("CHECK") {
-                self.expect_op("(")?;
-                self.expr()?;
-                self.expect_op(")")?;
+                let check = self.check_body(cname)?;
+                col.checks.push(check);
             } else if self.eat_kw("DEFAULT") {
                 col.default = Some(if self.eat_op("(") {
                     let e = self.expr()?;
@@ -808,11 +929,8 @@ impl<'a> Parser<'a> {
 
     // ---------------------------------------------------------------- SELECT
 
-    pub fn select(&mut self) -> Result<Select> {
-        self.depth += 1;
-        if self.depth > 200 {
-            return Err(Error::Parse("statement is nested too deeply".into()));
-        }
+    /// `WITH [RECURSIVE] name [(cols)] AS (select), ...`, if present.
+    fn with_clause(&mut self) -> Result<Vec<Cte>> {
         let mut with = Vec::new();
         if self.eat_kw("WITH") {
             let recursive = self.eat_kw("RECURSIVE");
@@ -848,6 +966,15 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        Ok(with)
+    }
+
+    pub fn select(&mut self) -> Result<Select> {
+        self.depth += 1;
+        if self.depth > 200 {
+            return Err(Error::Parse("statement is nested too deeply".into()));
+        }
+        let with = self.with_clause()?;
         let mut body = self.select_term()?;
         loop {
             let op = if self.eat_kw("UNION") {

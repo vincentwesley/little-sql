@@ -821,16 +821,32 @@ fn f_printf(a: &[Value]) -> Result<Value> {
             i += 1;
         }
         let mut width = 0usize;
+        if i < fmt.len() && fmt[i] == '*' {
+            // Width from the next argument; negative means left-aligned.
+            let w = a.get(arg).map_or(0, |v| v.to_int());
+            arg += 1;
+            if w < 0 {
+                left = true;
+            }
+            width = (w.unsigned_abs() as usize).min(100_000);
+            i += 1;
+        }
         while i < fmt.len() && fmt[i].is_ascii_digit() {
-            width = width * 10 + fmt[i] as usize - '0' as usize;
+            width = (width * 10 + fmt[i] as usize - '0' as usize).min(100_000);
             i += 1;
         }
         let mut prec: Option<usize> = None;
         if i < fmt.len() && fmt[i] == '.' {
             i += 1;
-            let mut p = 0;
+            let mut p = 0usize;
+            if i < fmt.len() && fmt[i] == '*' {
+                let v = a.get(arg).map_or(0, |v| v.to_int());
+                arg += 1;
+                i += 1;
+                p = v.clamp(0, 100_000) as usize;
+            }
             while i < fmt.len() && fmt[i].is_ascii_digit() {
-                p = p * 10 + fmt[i] as usize - '0' as usize;
+                p = (p * 10 + fmt[i] as usize - '0' as usize).min(100_000);
                 i += 1;
             }
             prec = Some(p);
@@ -870,10 +886,11 @@ fn f_printf(a: &[Value]) -> Result<Value> {
             'x' => format!("{:x}", v.to_int()),
             'X' => format!("{:X}", v.to_int()),
             'o' => format!("{:o}", v.to_int()),
+            // SQLite repeats the character `precision` times.
             'c' => text_arg(v)
                 .chars()
                 .next()
-                .map(String::from)
+                .map(|c| c.to_string().repeat(prec.unwrap_or(1).max(1)))
                 .unwrap_or_default(),
             's' | 'z' => {
                 let s = text_arg(v);

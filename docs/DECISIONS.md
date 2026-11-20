@@ -198,3 +198,50 @@ instance and reopens the database. Each query's result carries its plan with
 loop and row counts, shown above the rows, because seeing how a query ran
 is the point of the playground. *Why no framework or bundler:* nothing here
 needs one, and a static directory can be hosted anywhere.
+
+## D21. B-tree changes: rebuild the page, split greedily, never rebalance
+
+A changed page is decoded into a list of raw cells and laid out again from
+scratch. An overfull page is packed greedily into as many pages as needed
+(the last group keeps the original page number, so the parent's pointer
+stays valid); a root that overflows keeps its page number and becomes an
+interior page over new children. Deletes leave pages under-full and only
+act when a page becomes empty: an empty leaf is freed and unlinked, and an
+interior page left with no cells is merged with a sibling through the
+parent's divider (replacing it by its only child would leave leaves at
+different depths, which sqlite3's integrity check rightly rejects; the
+write-check found exactly that bug). *Why:* SQLite's balance algorithm
+redistributes cells across three siblings to keep pages full; that buys
+space efficiency, not correctness, and is the hardest code in SQLite.
+Greedy packing is ideal for the common append pattern (rowids increasing)
+and every file it writes passes sqlite3's `PRAGMA integrity_check`.
+
+## D22. UPDATE and DELETE select their rows with the planner first
+
+The target rows of UPDATE and DELETE are found by running an ordinary
+SELECT (`SELECT rowid, *, <new values> FROM t WHERE ...`) through the
+binder, planner and executor, collected in full before anything changes.
+*Why:* it reuses index selection for WHERE, and collecting first rules out
+the Halloween problem (an update seeing its own output) without any cursor
+invalidation logic. The cost is memory proportional to the rows changed.
+
+## D23. Triggers resolve NEW and OLD in the binder
+
+While a trigger body runs, the current row is pushed on a stack that the
+binder consults: `NEW.x` and `OLD.x` bind to that row's values as
+constants. Bodies then run as ordinary statements in the same transaction.
+BEFORE, AFTER and INSTEAD OF (on views) triggers, `UPDATE OF`, `WHEN`, and
+SQLite's default of no recursive triggers are supported; `RAISE()` is not.
+*Why:* no new execution machinery is needed, and the semantics match
+SQLite's for everything the evidence tests use.
+
+## D24. What writes do not do (yet)
+
+- TEMP tables and TEMP triggers are rejected; TEMP views are kept in the
+  connection and never written to the file.
+- Foreign keys are parsed and not enforced, which is SQLite's own default
+  (`PRAGMA foreign_keys` is off unless a program turns it on).
+- Writing to a table with an expression or partial index is refused,
+  because the index could not be kept up to date.
+- `ALTER TABLE`, savepoints, `VACUUM` and `RAISE()` are not implemented;
+  `VACUUM` and `ANALYZE` are accepted and do nothing.

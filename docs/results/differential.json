@@ -4,7 +4,7 @@
   "engine": "littlesql 0.1.0",
   "reference": "sqlite3 3.45.1",
   "files": 14,
-  "total": { "pass": 251, "fail": 6, "scored": 257, "pass_rate": 97.66, "not_applicable": 0, "setup": 0 },
+  "total": { "pass": 252, "fail": 6, "scored": 258, "pass_rate": 97.67, "not_applicable": 0, "setup": 0 },
   "categories": [
     { "name": "advanced", "files": 1, "pass": 8, "fail": 6, "scored": 14, "pass_rate": 57.14, "not_applicable": 0, "setup": 0 },
     { "name": "aggregates", "files": 1, "pass": 23, "fail": 0, "scored": 23, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
@@ -12,7 +12,7 @@
     { "name": "compound", "files": 1, "pass": 14, "fail": 0, "scored": 14, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
     { "name": "datetime", "files": 1, "pass": 13, "fail": 0, "scored": 13, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
     { "name": "expressions", "files": 1, "pass": 26, "fail": 0, "scored": 26, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
-    { "name": "functions", "files": 1, "pass": 20, "fail": 0, "scored": 20, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
+    { "name": "functions", "files": 1, "pass": 21, "fail": 0, "scored": 21, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
     { "name": "indexes", "files": 1, "pass": 24, "fail": 0, "scored": 24, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
     { "name": "joins", "files": 1, "pass": 20, "fail": 0, "scored": 20, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
     { "name": "ordering", "files": 1, "pass": 31, "fail": 0, "scored": 31, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },

@@ -229,6 +229,46 @@ fn serial_type_of(v: &Value) -> (u64, usize) {
 }
 
 /// Encode values as a record.
+/// Encode a record for a database whose text encoding is `enc` (text is
+/// stored in the database's encoding).
+pub fn encode_record_enc(values: &[Value], enc: TextEncoding) -> Vec<u8> {
+    if enc == TextEncoding::Utf8 || !values.iter().any(|v| matches!(v, Value::Text(_))) {
+        return encode_record(values);
+    }
+    let mut types = Vec::with_capacity(values.len());
+    let mut bodies: Vec<std::borrow::Cow<[u8]>> = Vec::with_capacity(values.len());
+    for v in values {
+        match v {
+            Value::Text(s) => {
+                let b = encode_text(s, enc);
+                types.push(13 + 2 * b.len() as u64);
+                bodies.push(std::borrow::Cow::Owned(b));
+            }
+            other => {
+                let one = encode_record(std::slice::from_ref(other));
+                let (hl, n) = read_varint(&one);
+                let (t, _) = read_varint(&one[n..]);
+                types.push(t);
+                bodies.push(std::borrow::Cow::Owned(one[hl as usize..].to_vec()));
+            }
+        }
+    }
+    let hdr_body: usize = types.iter().map(|t| varint_len(*t)).sum();
+    let mut hdr_len = hdr_body + 1;
+    if varint_len(hdr_len as u64) > 1 {
+        hdr_len = hdr_body + varint_len((hdr_body + 2) as u64);
+    }
+    let mut out = Vec::new();
+    write_varint(hdr_len as u64, &mut out);
+    for t in &types {
+        write_varint(*t, &mut out);
+    }
+    for b in &bodies {
+        out.extend_from_slice(b);
+    }
+    out
+}
+
 pub fn encode_record(values: &[Value]) -> Vec<u8> {
     let mut types = Vec::with_capacity(values.len());
     let mut hdr_body = 0;

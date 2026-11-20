@@ -43,8 +43,10 @@ pub struct Database {
     pub(crate) pager: Rc<Pager>,
     pub(crate) schema: RefCell<Rc<Schema>>,
     /// True between BEGIN and COMMIT/ROLLBACK.
-    #[allow(dead_code)] // TODO(M7): used by the write path
-    pub(crate) explicit_txn: RefCell<bool>,
+    pub(crate) explicit_txn: std::cell::Cell<bool>,
+    /// CREATE TEMP VIEW definitions: they belong to this connection only and
+    /// are never written to the file.
+    pub(crate) temp_views: RefCell<Vec<String>>,
     pub(crate) limits: std::cell::Cell<Limits>,
     wal_path: Option<PathBuf>,
     mem: Option<MemStorage>,
@@ -67,7 +69,8 @@ impl Database {
         Ok(Database {
             pager,
             schema: RefCell::new(schema),
-            explicit_txn: RefCell::new(false),
+            explicit_txn: std::cell::Cell::new(false),
+            temp_views: RefCell::new(Vec::new()),
             limits: Default::default(),
             wal_path,
             mem,
@@ -144,9 +147,12 @@ impl Database {
         &self.pager
     }
 
-    #[allow(dead_code)] // TODO(M7): used by the write path
     pub(crate) fn reload_schema(&self) -> Result<()> {
-        *self.schema.borrow_mut() = Rc::new(Schema::load(&self.pager)?);
+        let mut schema = Schema::load(&self.pager)?;
+        for sql in self.temp_views.borrow().iter() {
+            schema.add_temp_view(sql)?;
+        }
+        *self.schema.borrow_mut() = Rc::new(schema);
         Ok(())
     }
 
@@ -262,14 +268,16 @@ impl Database {
                     crate::record::TextEncoding::Utf16Be => "UTF-16be",
                 }),
             )),
-            "journal_mode" => Ok(one(
-                "journal_mode",
-                Value::text(if self.pager.has_wal() {
+            "journal_mode" => {
+                let mode = if self.mem.is_some() {
+                    "memory"
+                } else if self.pager.page_count() > 0 && self.pager.get(1)?[18] == 2 {
                     "wal"
                 } else {
-                    "memory"
-                }),
-            )),
+                    "delete"
+                };
+                Ok(one("journal_mode", Value::text(mode)))
+            }
             "wal_checkpoint" => {
                 let n = self.pager.checkpoint()?;
                 Ok(ResultSet {

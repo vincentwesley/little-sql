@@ -1,10 +1,12 @@
 # Little SQL
 
 A small SQL database engine written from scratch in Rust. It opens real
-SQLite database files and answers queries on them: it reads the SQLite file
-format, walks its B-trees, parses SQL, plans queries with indexes, and runs
-joins, grouping, ordering, aggregates and subqueries. It ships as a
-command-line shell and as a WebAssembly playground that runs in the browser.
+SQLite database files, answers queries on them and writes to them: it reads
+and writes the SQLite file format and its write-ahead log, walks and splits
+B-trees, parses SQL, plans queries with indexes, and runs joins, grouping,
+ordering, aggregates, subqueries, transactions and triggers. Files it writes
+pass sqlite3's own integrity check. It ships as a command-line shell and as
+a WebAssembly playground that runs in the browser.
 
 The engine has no dependencies: no SQL parser, storage or query library,
 and no third-party crates at all.
@@ -18,19 +20,21 @@ run the same queries through the `sqlite3` tool and compare the answers.
 <!-- results:start -->
 | Suite | Passed | Failed | Pass rate |
 |-------|-------:|-------:|----------:|
+| sqllogictest, full corpus (622 files), native mode | 5,939,879 | 0 | 100.00 % |
 | sqllogictest, full corpus (622 files), read mode | 5,729,099 | 0 | 100.00 % |
+| sqllogictest, CI sample (49 files), native mode | 323,361 | 0 | 100.00 % |
 | sqllogictest, CI sample (49 files), read mode | 240,267 | 0 | 100.00 % |
-| Differential tests against sqlite3 3.45.1 | 251 | 6 | 97.66 % |
+| Differential tests against sqlite3 3.45.1 | 252 | 6 | 97.67 % |
 <!-- results:end -->
 
 What the numbers mean:
 
-- **Read mode.** Each test file first builds tables with `CREATE` and
-  `INSERT` statements. Little SQL cannot write yet, so in read mode the real
-  `sqlite3` runs those setup statements into a database file, and Little SQL
-  opens the file and answers every query. Setup statements are never counted
-  as passes. A native mode, where Little SQL also runs the setup itself,
-  arrives with write support.
+- **Native mode** is the real score: Little SQL runs every statement of
+  every test file itself, the `CREATE`, `INSERT`, `UPDATE` and `DELETE`
+  statements included, and each one counts.
+- **Read mode** isolates the query side: the real `sqlite3` runs each file's
+  setup statements into a database file, and Little SQL opens that file and
+  answers every query. Setup statements are never counted as passes.
 - Records marked `skipif sqlite` or `onlyif <another engine>` do not apply to
   SQLite's dialect and are not counted (about 1.5 million in the full
   corpus).
@@ -114,8 +118,16 @@ push and keeps it as a downloadable artifact.
 
 - **File format:** every page size (512 B to 64 KiB), overflow pages, all
   record serial types, UTF-8 and UTF-16 databases, `WITHOUT ROWID` tables,
-  automatic indexes for `UNIQUE` and `PRIMARY KEY`, and reading a database
-  together with its write-ahead log.
+  automatic indexes for `UNIQUE` and `PRIMARY KEY`, the freelist, and the
+  write-ahead log (read, written, recovered and checkpointed).
+- **Writes:** `CREATE TABLE` (also `AS SELECT`), `CREATE INDEX`,
+  `CREATE VIEW` (also `TEMP`), `CREATE TRIGGER`, `DROP`, `INSERT` (values,
+  `SELECT`, `DEFAULT VALUES`, `WITH`), `UPDATE`, `DELETE`, `OR IGNORE` /
+  `OR REPLACE`, `NOT NULL`, `UNIQUE`, `PRIMARY KEY` and `CHECK` constraints,
+  `AUTOINCREMENT`, and `BEGIN` / `COMMIT` / `ROLLBACK` (a failing statement
+  inside a transaction undoes only itself). Triggers: `BEFORE`, `AFTER`,
+  `INSTEAD OF` on views, `UPDATE OF`, `WHEN`. `PRAGMA integrity_check` checks
+  the whole file structurally.
 - **Queries:** `SELECT` with joins (inner, left, cross, natural, `USING`,
   simple right joins), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` (with
   `NULLS FIRST/LAST`), `LIMIT`/`OFFSET`, `DISTINCT`, compound queries
@@ -139,12 +151,13 @@ push and keeps it as a downloadable artifact.
 
 ## Not supported (yet)
 
-- Writing: `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP` and transactions.
-  These are next on the plan.
-- Window functions, JSON functions, triggers, virtual tables, `ATTACH`,
-  bound parameters, expression and partial indexes (tables with them are
-  still readable; the planner just ignores those indexes).
+- Window functions, JSON functions, virtual tables, `ATTACH`, bound
+  parameters, `ALTER TABLE`, savepoints, `RAISE()`, TEMP tables.
+- Expression and partial indexes: tables with them are readable (the
+  planner ignores those indexes) but Little SQL refuses to write to them.
+- Foreign keys are parsed but not enforced, which is also SQLite's default.
 - Concurrent access from several processes: Little SQL takes no file locks.
+  Use one process at a time.
 
 ## How it is built
 

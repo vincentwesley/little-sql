@@ -198,3 +198,14 @@ table.rates tr.total td { font-weight: 600; }
   #sidebar { width: auto; border-right: 0; border-bottom: 1px solid var(--line); max-height: 14rem; }
   .hint { display: none; }
 }
+
+button.link {
+  background: none;
+  border: 0;
+  padding: 0;
+  margin-top: 0.4rem;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.85rem;
+  text-decoration: underline;
+}

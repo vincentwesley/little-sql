@@ -19,10 +19,10 @@ const check = process.argv.includes("--check");
 
 // In display order. `label` is the README row.
 const REPORTS = [
-  { file: "slt-read-full.json", label: (s) => `sqllogictest, full corpus (${s.files} files), read mode` },
   { file: "slt-native-full.json", label: (s) => `sqllogictest, full corpus (${s.files} files), native mode` },
-  { file: "slt-read.json", label: (s) => `sqllogictest, CI sample (${s.files} files), read mode` },
+  { file: "slt-read-full.json", label: (s) => `sqllogictest, full corpus (${s.files} files), read mode` },
   { file: "slt-native.json", label: (s) => `sqllogictest, CI sample (${s.files} files), native mode` },
+  { file: "slt-read.json", label: (s) => `sqllogictest, CI sample (${s.files} files), read mode` },
   { file: "differential.json", label: (s) => `Differential tests against ${s.reference}` },
 ];
 

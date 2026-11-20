@@ -12,6 +12,10 @@ pub enum Stmt {
     CreateTable(CreateTable),
     CreateIndex(CreateIndex),
     CreateView(CreateView),
+    CreateTrigger(CreateTrigger),
+    /// `REINDEX [name]`: nothing to rebuild (indexes are always current),
+    /// but a name must exist.
+    Reindex(Option<String>),
     Drop {
         kind: DropKind,
         if_exists: bool,
@@ -37,6 +41,34 @@ pub enum DropKind {
     Table,
     Index,
     View,
+    Trigger,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+    InsteadOf,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TriggerEvent {
+    Insert,
+    Delete,
+    /// `UPDATE [OF col, ...]`; an empty list means any column.
+    Update(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateTrigger {
+    pub name: String,
+    pub temp: bool,
+    pub if_not_exists: bool,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    pub table: String,
+    pub when: Option<Expr>,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -285,6 +317,16 @@ pub struct ColumnDef {
     pub default: Option<Expr>,
     pub collation: Option<String>,
     pub generated: bool,
+    /// Column-level CHECK constraints.
+    pub checks: Vec<Check>,
+}
+
+/// A CHECK constraint: its name (if given), expression and source text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Check {
+    pub name: Option<String>,
+    pub expr: Expr,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -299,7 +341,9 @@ pub struct IndexedColumn {
 pub enum TableConstraint {
     PrimaryKey(Vec<IndexedColumn>),
     Unique(Vec<IndexedColumn>),
-    /// CHECK and FOREIGN KEY constraints are parsed and not enforced.
+    Check(Check),
+    /// FOREIGN KEY constraints are parsed and, as in SQLite by default,
+    /// not enforced.
     Other,
 }
 

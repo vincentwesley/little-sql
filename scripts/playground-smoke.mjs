@@ -50,4 +50,15 @@ const examples = [...app.matchAll(/sql: `([^`]*)`/g)].map((m) => m[1]);
 assert.ok(examples.length >= 5);
 for (const sql of examples) one(sql);
 
+// 7. Writes work in the browser build, and the exported file reopens.
+one("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES ('hello'), ('world')");
+const bytes = engine.export();
+assert.ok(bytes && bytes.length > 0);
+const again = await Engine.load(fs.readFileSync(path.join(dist, "littlesql.wasm")));
+again.open(bytes);
+const notes = again.exec("SELECT group_concat(body) FROM notes; PRAGMA integrity_check");
+assert.equal(notes.error, null);
+assert.equal(notes.results[0].rows[0][0][1], "hello,world");
+assert.equal(notes.results[1].rows[0][0][1], "ok");
+
 console.log(`playground smoke test passed (${examples.length} examples ran)`);

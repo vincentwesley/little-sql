@@ -17,6 +17,7 @@
 
 pub mod bind;
 pub mod btree;
+pub mod btree_write;
 pub mod datetime;
 pub mod db;
 pub mod error;
@@ -43,11 +44,43 @@ pub mod write;
 /// whether to read another line.
 pub fn sql_is_complete(sql: &str) -> bool {
     match sql::lexer::tokenize(sql) {
-        Ok(toks) => toks
-            .iter()
-            .rev()
-            .find(|t| t.tok != sql::lexer::Tok::Eof)
-            .is_some_and(|t| t.tok == sql::lexer::Tok::Op(";")),
+        Ok(toks) => {
+            use sql::lexer::Tok;
+            let words: Vec<&Tok> = toks
+                .iter()
+                .map(|t| &t.tok)
+                .filter(|t| **t != Tok::Eof)
+                .collect();
+            if words.last() != Some(&&Tok::Op(";")) {
+                return false;
+            }
+            // A CREATE TRIGGER body contains semicolons; it ends at END;.
+            let is_word = |t: &Tok, w: &str| matches!(t, Tok::Word(x) if x.eq_ignore_ascii_case(w));
+            let mut in_trigger = false;
+            let mut i = 0;
+            let mut at_stmt_start = true;
+            while i < words.len() {
+                let t = words[i];
+                if at_stmt_start && is_word(t, "CREATE") {
+                    let mut j = i + 1;
+                    if j < words.len()
+                        && (is_word(words[j], "TEMP") || is_word(words[j], "TEMPORARY"))
+                    {
+                        j += 1;
+                    }
+                    if j < words.len() && is_word(words[j], "TRIGGER") {
+                        in_trigger = true;
+                    }
+                }
+                at_stmt_start = false;
+                if *t == Tok::Op(";") && (!in_trigger || (i > 0 && is_word(words[i - 1], "END"))) {
+                    in_trigger = false;
+                    at_stmt_start = true;
+                }
+                i += 1;
+            }
+            !in_trigger
+        }
         // An unterminated string needs more input; any other lexing error
         // is complete enough to report.
         Err(e) => !e.to_string().contains("unterminated"),

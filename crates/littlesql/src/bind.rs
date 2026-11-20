@@ -149,6 +149,54 @@ fn is_rowid_name(name: &str) -> bool {
         .any(|n| name.eq_ignore_ascii_case(n))
 }
 
+/// The row a trigger is running for, seen as `NEW` and `OLD`.
+#[derive(Clone, Default)]
+pub struct TriggerRow {
+    pub columns: Vec<String>,
+    pub new: Option<(i64, Vec<Value>)>,
+    pub old: Option<(i64, Vec<Value>)>,
+}
+
+thread_local! {
+    static TRIGGER_ROWS: std::cell::RefCell<Vec<TriggerRow>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with `row` visible as NEW/OLD to everything bound inside it.
+pub fn with_trigger_row<T>(row: TriggerRow, f: impl FnOnce() -> T) -> T {
+    TRIGGER_ROWS.with(|r| r.borrow_mut().push(row));
+    let out = f();
+    TRIGGER_ROWS.with(|r| r.borrow_mut().pop());
+    out
+}
+
+fn trigger_value(table: &str, name: &str) -> Option<Result<Expr>> {
+    let which_new = if table.eq_ignore_ascii_case("new") {
+        true
+    } else if table.eq_ignore_ascii_case("old") {
+        false
+    } else {
+        return None;
+    };
+    TRIGGER_ROWS.with(|r| {
+        let r = r.borrow();
+        let frame = r.last()?;
+        let row = if which_new { &frame.new } else { &frame.old };
+        let Some((rowid, vals)) = row else {
+            return Some(Err(Error::Sql(format!("no such column: {table}.{name}"))));
+        };
+        let v = match frame
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(name))
+        {
+            Some(i) => vals[i].clone(),
+            None if is_rowid_name(name) => Value::Int(*rowid),
+            None => return Some(Err(Error::Sql(format!("no such column: {table}.{name}")))),
+        };
+        Some(Ok(Expr::Lit(v)))
+    })
+}
+
 /// Bind a SELECT statement into an executable plan.
 pub fn bind_select(schema: &Schema, pager: &Pager, select: &ast::Select) -> Result<Plan> {
     let mut b = Binder::new(schema, pager);
@@ -1091,6 +1139,12 @@ impl<'a> Binder<'a> {
     // ------------------------------------------------------------ expressions
 
     fn resolve_name(&mut self, table: Option<&str>, name: &str, dq: bool) -> Result<Expr> {
+        // Inside a trigger, NEW.x and OLD.x are the row being changed.
+        if let Some(t) = table {
+            if let Some(v) = trigger_value(t, name) {
+                return v;
+            }
+        }
         let want = table.map(lower);
         for depth in (0..self.scopes.len()).rev() {
             let mut found: Option<(usize, usize)> = None;

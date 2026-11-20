@@ -2,21 +2,21 @@
 
 Updated after every milestone so a new session can continue from here.
 
-## Status (after M5, 2026-11-20)
+## Status (after M8, 2026-11-20)
 
-M0–M5 are done: `scripts/acceptance.sh` passes all 15 checks for M0–M5.
+M0–M5, M7 and M8 are done: `scripts/acceptance.sh` passes all 18 checks.
 
 | Suite | Passed | Failed | Rate |
 |-------|-------:|-------:|-----:|
+| sqllogictest full corpus, native mode | 5,939,879 | 0 | 100.00 % |
 | sqllogictest full corpus, read mode | 5,729,099 | 0 | 100.00 % |
-| sqllogictest CI sample (49 files), read mode | 240,267 | 0 | 100.00 % |
-| Differential (14 files, 5 fixtures) | 251 | 6 | 97.66 % |
+| sqllogictest CI sample, native mode | 323,361 | 0 | 100.00 % |
+| sqllogictest CI sample, read mode | 240,267 | 0 | 100.00 % |
+| Differential (14 files, 5 fixtures) | 252 | 6 | 97.67 % |
 | Planner: plans identical to sqlite3's EQP | 29 | 0 | — |
 
-The read side has stopped climbing (nothing left to fix in read mode), so
-per the brief the next work is writes. The six differential failures are
-known (window functions ×5, JSON ×1), marked `-- known-failure:` and still
-counted.
+The six differential failures are known gaps (window functions ×5,
+JSON ×1), marked `-- known-failure:` and still counted.
 
 **What exists**
 
@@ -41,21 +41,24 @@ counted.
   acceptance checks on the sample; manual dispatch input `full` for the
   whole corpus).
 
-**Stubs**: `write.rs` (all DML/DDL returns Unsupported), `check.rs`
-(integrity check returns ok without checking). `Database::explicit_txn` and
-`reload_schema` are unused until writes land.
+- Writes (M7): `btree_write.rs` (insert/split/delete/merge, overflow,
+  freelist), `write.rs` (DDL, DML, constraints incl. CHECK, triggers, TEMP
+  views, transactions with statement savepoints), `check.rs` (real
+  integrity check). Tests: `crates/littlesql/tests/writes.rs` (randomized
+  against a model), `scripts/write-check.sh` (sqlite3 validates our files,
+  `.dump` identical), `scripts/crash-check.sh` (kill -9 + torn WAL,
+  recovery identical in both engines).
+- `scripts/slt-full.sh`: the whole corpus in both modes.
 
 ## Next steps, in order
 
-1. M7 writes: B-tree insert/split/delete, freelist, CREATE/DROP/INSERT/
-   UPDATE/DELETE, real `check.rs`; `slt run --mode native`;
-   `scripts/write-check.sh`; add a `native` line to `tests/slt/FLOOR`; add
-   M7 to `IMPLEMENTED` in `scripts/acceptance.sh`; publish native results
-   (`node scripts/publish-results.mjs`).
-2. M8 transactions + WAL crash tests (`scripts/crash-check.sh`); M9
-   benchmarks (`scripts/bench.sh`); M10 fresh-clone acceptance + stranger
-   review + single PR.
-3. Read-side extras if time allows: window functions, JSON.
+1. M9 performance: `scripts/bench.sh [--quick]` (timings vs sqlite3 on the
+   demo DB and generated data), profile and fix the worst cases; add M9 to
+   `IMPLEMENTED` in `scripts/acceptance.sh`.
+2. Optional features: window functions (the 5 known differential
+   failures), JSON functions, ALTER TABLE.
+3. M10: fresh-clone acceptance run, stranger review of README / CLI /
+   playground, final HANDOVER lists, one PR for the whole project.
 
 ## Playground (M5)
 

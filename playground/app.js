@@ -87,6 +87,20 @@ GROUP BY age_band
 ORDER BY age_band;`,
   },
   {
+    title: "Writing: a table of your own (then Download)",
+    sql: `-- Changes stay in your browser; "Download this database" saves them.
+CREATE TABLE IF NOT EXISTS shortlist(
+  id INTEGER PRIMARY KEY,
+  town TEXT NOT NULL,
+  budget INT CHECK (budget > 0)
+);
+INSERT INTO shortlist(town, budget)
+SELECT town, round(avg(price)) FROM sales
+WHERE month >= '2026-01' AND flat_type = '4 ROOM'
+GROUP BY town ORDER BY 2 LIMIT 5;
+SELECT * FROM shortlist;`,
+  },
+  {
     title: "The schema itself",
     sql: `SELECT type, name, tbl_name, sql FROM sqlite_schema;`,
   },
@@ -311,6 +325,17 @@ $("#file-input").addEventListener("change", async (ev) => {
   const bytes = new Uint8Array(await f.arrayBuffer());
   await openBytes(bytes, f.name);
   ev.target.value = "";
+});
+
+$("#download").addEventListener("click", async () => {
+  const res = await call({ op: "export" });
+  if (!res.ok) return showError(res.error);
+  const url = URL.createObjectURL(new Blob([res.bytes], { type: "application/vnd.sqlite3" }));
+  const a = el("a", { href: url, download: "littlesql.db" });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
 
 // ------------------------------------------------------------ editor

@@ -33,7 +33,7 @@ impl fmt::Display for Error {
             Error::Sql(m) => write!(f, "{m}"),
             Error::Unsupported(m) => write!(f, "not supported by Little SQL: {m}"),
             Error::Runtime(m) => write!(f, "{m}"),
-            Error::Constraint(m) => write!(f, "constraint failed: {m}"),
+            Error::Constraint(m) => write!(f, "{m}"),
             Error::Io(m) => write!(f, "I/O error: {m}"),
         }
     }
