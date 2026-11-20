@@ -20,3 +20,11 @@ SELECT count(*) FROM orders o, lines l WHERE o.id = l.order_id AND o.status = 's
 SELECT c.id FROM customers c WHERE c.id < 5 AND EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id) ORDER BY 1;
 SELECT p.title, p2.title FROM products p JOIN products p2 ON p.title = p2.title COLLATE BINARY AND p.sku <> p2.sku;
 SELECT a.sku, b.sku FROM products a RIGHT JOIN products b ON a.weight = b.sku WHERE b.price < 3;
+SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.customer_id = 42 ORDER BY o.id;
+SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.customer_id = '42' ORDER BY o.id;
+SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id WHERE c.id = 42.0 ORDER BY o.id;
+SELECT l.order_id, p.sku FROM lines l JOIN products p ON p.sku = l.sku WHERE l.sku = 'SKU-003' AND l.order_id < 300 ORDER BY 1;
+SELECT p.sku, q.sku FROM products p JOIN products q ON q.title = p.title WHERE p.title = 'APPLE 4';
+SELECT c.id, o.id FROM customers c JOIN orders o ON o.customer_id = c.name WHERE c.name = 'Customer 3';
+SELECT c.id FROM customers c JOIN products p ON p.weight = c.id WHERE c.id = 12;
+SELECT c.id, p.sku FROM customers c JOIN products p ON p.price = c.credit WHERE c.credit = 10;

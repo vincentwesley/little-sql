@@ -30,3 +30,6 @@ SELECT sku FROM products INDEXED BY products_cat_price WHERE category = 'veg' OR
 SELECT c.name, count(*) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.id;
 SELECT p.sku, sum(l.qty) FROM products p LEFT JOIN lines l ON l.sku = p.sku GROUP BY p.sku;
 SELECT x.name FROM (SELECT name, credit FROM customers WHERE credit > 100) AS x WHERE x.name > 'C';
+SELECT * FROM pending_orders WHERE customer_id = 17;
+SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.customer_id = 42;
+SELECT l.sku, p.title FROM lines l JOIN products p ON p.sku = l.sku WHERE l.sku = 'SKU-003';

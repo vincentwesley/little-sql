@@ -2525,8 +2525,9 @@ impl<'a> Binder<'a> {
     fn plan_joins(
         &mut self,
         items: Vec<Item>,
-        bound: Vec<(Expr, Option<usize>)>,
+        mut bound: Vec<(Expr, Option<usize>)>,
     ) -> Result<(Vec<Source>, Vec<Expr>)> {
+        propagate_constants(&mut bound);
         let local: HashMap<usize, usize> = items
             .iter()
             .enumerate()
@@ -2629,6 +2630,102 @@ fn parse_collation(name: &str) -> Result<Collation> {
 
 /// Function names live for the whole program; map a name to the static
 /// string in the function table so plans do not own strings.
+/// WHERE-clause constant propagation, as SQLite does: from `a = 5` and
+/// `b = a` derive `b = 5`, so the planner can start a join from `b`'s
+/// table. Only when the derived term is truly implied: every comparison is
+/// an equality under BINARY collation and the same affinity, which the
+/// columns share, so equality is transitive. The derived term is an extra
+/// filter; the original terms are still checked.
+fn propagate_constants(bound: &mut Vec<(Expr, Option<usize>)>) {
+    // Columns of one class compare the same way as the comparison does.
+    let class = |a: Affinity| match a {
+        Affinity::Text => 1,
+        Affinity::Blob => 2,
+        _ => 0,
+    };
+    let col_of = |e: &Expr| match e {
+        Expr::Col { cur, col, aff, .. } => Some((*cur, *col, *aff)),
+        _ => None,
+    };
+    let mut consts: Vec<((usize, usize), Value, Affinity)> = Vec::new();
+    for (e, left_on) in bound.iter() {
+        if left_on.is_some() {
+            continue;
+        }
+        if let Expr::Cmp {
+            op: BinaryOp::Eq,
+            l,
+            r,
+            aff,
+            coll: Collation::Binary,
+        } = e
+        {
+            let pair = match (col_of(l), r.as_ref(), col_of(r), l.as_ref()) {
+                (Some(c), Expr::Lit(v), _, _) | (_, _, Some(c), Expr::Lit(v)) => Some((c, v)),
+                _ => None,
+            };
+            if let Some(((cur, col, caff), v)) = pair {
+                if class(caff) == class(*aff) && !v.is_null() {
+                    consts.push(((cur, col), v.clone(), *aff));
+                }
+            }
+        }
+    }
+    if consts.is_empty() {
+        return;
+    }
+    let mut derived = Vec::new();
+    for (e, left_on) in bound.iter() {
+        if left_on.is_some() {
+            continue;
+        }
+        let Expr::Cmp {
+            op: BinaryOp::Eq,
+            l,
+            r,
+            aff,
+            coll: Collation::Binary,
+        } = e
+        else {
+            continue;
+        };
+        let (Some(a), Some(b)) = (col_of(l), col_of(r)) else {
+            continue;
+        };
+        // Two columns of one class compare without conversion (affinity
+        // "none") or under that class; either way equality is transitive.
+        if class(a.2) != class(b.2) || (*aff != Affinity::Blob && class(*aff) != class(a.2)) {
+            continue;
+        }
+        for (key, v, caff) in &consts {
+            if class(*caff) != class(a.2) {
+                continue;
+            }
+            let target = if (a.0, a.1) == *key {
+                r
+            } else if (b.0, b.1) == *key {
+                l
+            } else {
+                continue;
+            };
+            derived.push(Expr::Cmp {
+                op: BinaryOp::Eq,
+                l: target.clone(),
+                r: Box::new(Expr::Lit(v.clone())),
+                aff: *caff,
+                coll: Collation::Binary,
+            });
+        }
+    }
+    for d in derived {
+        let Expr::Cmp { l, .. } = &d else { continue };
+        let known = col_of(l).is_some_and(|c| consts.iter().any(|(k, ..)| *k == (c.0, c.1)));
+        if !known {
+            bound.push((d, None));
+        }
+    }
+}
+
 /// Wrap a JSON builder's argument if it is itself JSON (see bind_function).
 fn json_arg(a: &ast::Expr) -> ast::Expr {
     let ast::Expr::Function { name, .. } = a else {

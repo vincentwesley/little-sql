@@ -56,10 +56,9 @@ by hand.
 
 - Join order is greedy; it can pick a worse order than SQLite's for 3+
   table joins with skewed sizes (answers are still correct).
-- No transitive constant propagation (`o.x = 17 AND c.id = o.x` does not
-  derive `c.id = 17`), and GROUP BY over a join can choose an index order
-  where SQLite sorts. Valid plans, just different from SQLite's; they are
-  left out of the plan-equality suite.
+- GROUP BY over a join can choose an index order where SQLite sorts. A
+  valid plan, just different from SQLite's; left out of the plan-equality
+  suite.
 - Page splits are greedy (appends) or even (elsewhere) rather than SQLite's
   three-sibling balance; files are valid but less densely packed after
   random inserts and deletes.
