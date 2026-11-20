@@ -68,6 +68,14 @@ struct WorkDef {
     depth: usize,
 }
 
+/// Window functions of the SELECT being bound.
+#[derive(Default)]
+struct WinScope {
+    calls: Vec<WindowCall>,
+    allowed: bool,
+    named: Vec<(String, ast::WindowSpec)>,
+}
+
 struct AggFrame {
     slot: usize,
     calls: Vec<AggCall>,
@@ -126,6 +134,7 @@ pub struct Binder<'a> {
     scopes: Vec<Scope>,
     ctes: Vec<CteDef>,
     aggs: Vec<AggFrame>,
+    wins: Vec<WinScope>,
     view_depth: usize,
     /// Nesting depth of SELECTs being bound.
     query_depth: usize,
@@ -225,6 +234,7 @@ impl<'a> Binder<'a> {
             scopes: Vec::new(),
             ctes: Vec::new(),
             aggs: Vec::new(),
+            wins: Vec::new(),
             view_depth: 0,
             query_depth: 0,
             virt_hit: None,
@@ -792,6 +802,9 @@ impl<'a> Binder<'a> {
             calls: Vec::new(),
             allowed: true,
         });
+        // A window function makes the view unflattenable (binding fails and
+        // the caller falls back to materializing it).
+        self.wins.push(WinScope::default());
         type Bound = (Vec<Expr>, Vec<String>, Vec<Vec<(usize, usize)>>);
         let result = (|| -> Result<Bound> {
             for (on, left_on) in &inner_on {
@@ -861,6 +874,7 @@ impl<'a> Binder<'a> {
             Ok((exprs, names, reads))
         })();
         let frame = self.aggs.pop().unwrap();
+        self.wins.pop();
         self.scopes.pop();
         let (exprs, mut names, reads) = result?;
         if !frame.calls.is_empty() || exprs.is_empty() {
@@ -1119,10 +1133,19 @@ impl<'a> Binder<'a> {
             calls: Vec::new(),
             allowed: true,
         });
+        self.wins.push(WinScope {
+            named: core.windows.clone(),
+            ..Default::default()
+        });
         let result = self.bind_core_clauses(core, order_by, limit, offset, items, on_asts, bound);
+        let wins = self.wins.pop().unwrap();
         self.aggs.pop();
         self.scopes.pop();
-        result
+        let mut q = result?;
+        if let Body::Core(c) = &mut q.body {
+            c.windows = wins.calls;
+        }
+        Ok(q)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1136,7 +1159,8 @@ impl<'a> Binder<'a> {
         on_asts: Vec<(ast::Expr, Option<usize>)>,
         mut bound: Vec<(Expr, Option<usize>)>,
     ) -> Result<Query> {
-        // Result columns (aggregates allowed).
+        // Result columns (aggregates and window functions allowed).
+        self.wins.last_mut().unwrap().allowed = true;
         let mut results = Vec::new();
         let mut cols = Vec::new();
         let mut col_asts: Vec<Option<ast::Expr>> = Vec::new();
@@ -1205,6 +1229,7 @@ impl<'a> Binder<'a> {
 
         // WHERE and ON terms (no aggregates).
         self.aggs.last_mut().unwrap().allowed = false;
+        self.wins.last_mut().unwrap().allowed = false;
         for (on, left_on) in &on_asts {
             let mut parts = Vec::new();
             split_and(on, &mut parts);
@@ -1251,6 +1276,7 @@ impl<'a> Binder<'a> {
             None => None,
         };
         let mut keys = Vec::new();
+        self.wins.last_mut().unwrap().allowed = true;
         for t in order_by {
             let (inner, explicit) = match &t.expr {
                 ast::Expr::Collate { expr, collation } => {
@@ -1320,6 +1346,7 @@ impl<'a> Binder<'a> {
             });
         }
         self.aggs.last_mut().unwrap().allowed = false;
+        self.wins.last_mut().unwrap().allowed = false;
         let limit = self.bind_opt_const(limit)?;
         let offset = self.bind_opt_const(offset)?;
 
@@ -1360,7 +1387,9 @@ impl<'a> Binder<'a> {
         }
         // Skip the sort when the outermost loop already delivers rows in
         // ORDER BY order (an index or rowid scan, possibly backwards).
-        if agg.is_none() && !keys.is_empty() {
+        // (Window functions reorder rows, so the sort must stay.)
+        let windowed = !self.wins.last().unwrap().calls.is_empty();
+        if agg.is_none() && !keys.is_empty() && !windowed {
             let exprs: Vec<Expr> = keys
                 .iter()
                 .map(|k| match &k.src {
@@ -1379,6 +1408,7 @@ impl<'a> Binder<'a> {
                 results,
                 distinct: core.distinct,
                 agg,
+                windows: Vec::new(),
             })),
             order_by: keys,
             limit,
@@ -1593,6 +1623,7 @@ impl<'a> Binder<'a> {
                         where_: None,
                         group_by: Vec::new(),
                         having: None,
+                        windows: Vec::new(),
                     })),
                     order_by: Vec::new(),
                     limit: None,
@@ -1683,7 +1714,15 @@ impl<'a> Binder<'a> {
                 distinct,
                 star,
                 filter,
-                ..
+                over: Some(spec),
+            } => self.bind_window(name, args, *distinct, *star, filter.as_deref(), spec)?,
+            ast::Expr::Function {
+                name,
+                args,
+                distinct,
+                star,
+                filter,
+                over: None,
             } => self.bind_function(name, args, *distinct, *star, filter.as_deref())?,
         })
     }
@@ -1713,6 +1752,144 @@ impl<'a> Binder<'a> {
         })
     }
 
+    fn bind_window(
+        &mut self,
+        name: &str,
+        args: &[ast::Expr],
+        distinct: bool,
+        star: bool,
+        filter: Option<&ast::Expr>,
+        spec: &ast::WindowSpec,
+    ) -> Result<Expr> {
+        match self.wins.last() {
+            Some(w) if w.allowed => {}
+            _ => return Err(Error::Sql(format!("misuse of window function {name}()"))),
+        }
+        // OVER w / OVER (w ORDER BY ...): build on a named window.
+        let spec = match &spec.base {
+            None => spec.clone(),
+            Some(base) => {
+                let named = self
+                    .wins
+                    .last()
+                    .unwrap()
+                    .named
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(base))
+                    .map(|(_, s)| s.clone())
+                    .ok_or_else(|| Error::Sql(format!("no such window: {base}")))?;
+                ast::WindowSpec {
+                    base: None,
+                    partition: named.partition,
+                    order: if spec.order.is_empty() {
+                        named.order
+                    } else {
+                        spec.order.clone()
+                    },
+                    frame: spec.frame.clone().or(named.frame),
+                }
+            }
+        };
+        let n = args.len();
+        let func = match (name, n) {
+            ("row_number", 0) => WinFunc::RowNumber,
+            ("rank", 0) => WinFunc::Rank,
+            ("dense_rank", 0) => WinFunc::DenseRank,
+            ("percent_rank", 0) => WinFunc::PercentRank,
+            ("cume_dist", 0) => WinFunc::CumeDist,
+            ("ntile", 1) => WinFunc::Ntile,
+            ("lag", 1..=3) => WinFunc::Lag,
+            ("lead", 1..=3) => WinFunc::Lead,
+            ("first_value", 1) => WinFunc::FirstValue,
+            ("last_value", 1) => WinFunc::LastValue,
+            ("nth_value", 2) => WinFunc::NthValue,
+            _ => match lookup_agg(name, n, star) {
+                Some(f) => WinFunc::Agg(f),
+                None if matches!(lookup_scalar(name, n), Ok(Some(_))) => {
+                    return Err(Error::Sql(format!(
+                        "{name}() may not be used as a window function"
+                    )))
+                }
+                None => return Err(Error::Sql(format!("no such function: {name}"))),
+            },
+        };
+        if distinct && !matches!(func, WinFunc::Agg(_)) {
+            return Err(Error::Sql(format!(
+                "DISTINCT is not supported for window function {name}()"
+            )));
+        }
+        // No window functions inside a window function's own parts.
+        self.wins.last_mut().unwrap().allowed = false;
+        let bound = (|| -> Result<WindowCall> {
+            let args: Vec<Expr> = args
+                .iter()
+                .map(|a| self.bind_expr(a))
+                .collect::<Result<_>>()?;
+            let filter = filter.map(|f| self.bind_expr(f)).transpose()?;
+            let mut partition = Vec::new();
+            for p in &spec.partition {
+                let e = self.bind_expr(p)?;
+                let c = collation(&e).map_or(Collation::Binary, |c| c.0);
+                partition.push((e, c));
+            }
+            let mut order = Vec::new();
+            for t in &spec.order {
+                let e = self.bind_expr(&t.expr)?;
+                let c = collation(&e).map_or(Collation::Binary, |c| c.0);
+                order.push((e, t.desc, t.nulls_first.unwrap_or(!t.desc), c));
+            }
+            let mut bound_of = |b: &ast::FrameBound| -> Result<WinBound> {
+                Ok(match b {
+                    ast::FrameBound::UnboundedPreceding => WinBound::UnboundedPreceding,
+                    ast::FrameBound::Preceding(e) => WinBound::Preceding(self.bind_expr(e)?),
+                    ast::FrameBound::CurrentRow => WinBound::CurrentRow,
+                    ast::FrameBound::Following(e) => WinBound::Following(self.bind_expr(e)?),
+                    ast::FrameBound::UnboundedFollowing => WinBound::UnboundedFollowing,
+                })
+            };
+            let frame = match &spec.frame {
+                None => WinFrame {
+                    units: WinUnits::Range,
+                    start: WinBound::UnboundedPreceding,
+                    end: WinBound::CurrentRow,
+                },
+                Some(f) => WinFrame {
+                    units: match f.units {
+                        ast::FrameUnits::Rows => WinUnits::Rows,
+                        ast::FrameUnits::Range => WinUnits::Range,
+                        ast::FrameUnits::Groups => WinUnits::Groups,
+                    },
+                    start: bound_of(&f.start)?,
+                    end: bound_of(&f.end)?,
+                },
+            };
+            if matches!(frame.start, WinBound::UnboundedFollowing)
+                || matches!(frame.end, WinBound::UnboundedPreceding)
+            {
+                return Err(Error::Sql("unsupported frame specification".into()));
+            }
+            let coll = args
+                .first()
+                .and_then(collation)
+                .map_or(Collation::Binary, |c| c.0);
+            Ok(WindowCall {
+                func,
+                args,
+                distinct,
+                filter,
+                coll,
+                partition,
+                order,
+                frame,
+            })
+        })();
+        let w = self.wins.last_mut().unwrap();
+        w.allowed = true;
+        let call = bound?;
+        w.calls.push(call);
+        Ok(Expr::Window(w.calls.len() - 1))
+    }
+
     fn bind_function(
         &mut self,
         name: &str,
@@ -1721,6 +1898,18 @@ impl<'a> Binder<'a> {
         star: bool,
         filter: Option<&ast::Expr>,
     ) -> Result<Expr> {
+        // A JSON value handed straight from one JSON function to a JSON
+        // builder nests as JSON (SQLite's JSON "subtype").
+        let wrapped: Vec<ast::Expr>;
+        let args = if matches!(
+            name,
+            "json_array" | "json_object" | "json_group_array" | "json_group_object" | "json_quote"
+        ) {
+            wrapped = args.iter().map(json_arg).collect();
+            &wrapped[..]
+        } else {
+            args
+        };
         if let Some(func) = lookup_agg(name, args.len(), star) {
             if star && name != "count" {
                 return Err(Error::Sql(format!(
@@ -2435,8 +2624,41 @@ fn parse_collation(name: &str) -> Result<Collation> {
 
 /// Function names live for the whole program; map a name to the static
 /// string in the function table so plans do not own strings.
+/// Wrap a JSON builder's argument if it is itself JSON (see bind_function).
+fn json_arg(a: &ast::Expr) -> ast::Expr {
+    let ast::Expr::Function { name, .. } = a else {
+        return a.clone();
+    };
+    let tag = match name.as_str() {
+        "json" | "json_array" | "json_object" | "json_quote" | "->" | "json_group_array"
+        | "json_group_object" => "json_sub",
+        "json_extract" => "json_sub_container",
+        _ => return a.clone(),
+    };
+    ast::Expr::Function {
+        name: tag.into(),
+        args: vec![a.clone()],
+        distinct: false,
+        star: false,
+        filter: None,
+        over: None,
+    }
+}
+
 fn intern(name: &str) -> &'static str {
     const NAMES: &[&str] = &[
+        "json",
+        "json_valid",
+        "json_type",
+        "json_extract",
+        "json_array",
+        "json_object",
+        "json_array_length",
+        "json_quote",
+        "->",
+        "->>",
+        "json_sub",
+        "json_sub_container",
         "abs",
         "coalesce",
         "ifnull",
@@ -2485,7 +2707,7 @@ fn intern(name: &str) -> &'static str {
 
 fn contains_agg(e: &Expr) -> bool {
     match e {
-        Expr::Agg { .. } => true,
+        Expr::Agg { .. } | Expr::Window(_) => true,
         Expr::Lit(_) | Expr::Col { .. } | Expr::Subquery(_) | Expr::Exists(_) => false,
         Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) | Expr::Collate(a, _) => {
             contains_agg(a)

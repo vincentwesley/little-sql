@@ -84,6 +84,9 @@ pub enum Expr {
         slot: usize,
         idx: usize,
     },
+    /// The value of window function `idx` of the current query for the
+    /// current row (see [`WindowCall`]).
+    Window(usize),
     Subquery(Rc<Subquery>),
     Exists(Rc<Subquery>),
 }
@@ -168,6 +171,62 @@ pub struct Core {
     pub results: Vec<Expr>,
     pub distinct: bool,
     pub agg: Option<Agg>,
+    /// Window functions, computed after grouping and before DISTINCT.
+    pub windows: Vec<WindowCall>,
+}
+
+/// A window function: what it computes, over which rows and in which order.
+pub struct WindowCall {
+    pub func: WinFunc,
+    pub args: Vec<Expr>,
+    pub distinct: bool,
+    pub filter: Option<Expr>,
+    pub coll: Collation,
+    pub partition: Vec<(Expr, Collation)>,
+    /// (key, descending, NULLs first, collation)
+    pub order: Vec<(Expr, bool, bool, Collation)>,
+    pub frame: WinFrame,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WinFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+    /// An ordinary aggregate (sum, count, ...) computed over the frame.
+    Agg(crate::func::AggFunc),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WinUnits {
+    Rows,
+    Range,
+    Groups,
+}
+
+/// A frame bound; offsets are constant (evaluated when the query starts).
+#[derive(Clone)]
+pub enum WinBound {
+    UnboundedPreceding,
+    Preceding(Expr),
+    CurrentRow,
+    Following(Expr),
+    UnboundedFollowing,
+}
+
+#[derive(Clone)]
+pub struct WinFrame {
+    pub units: WinUnits,
+    pub start: WinBound,
+    pub end: WinBound,
 }
 
 pub struct Agg {
@@ -343,7 +402,7 @@ pub fn cmp_affinity(a: Affinity, b: Affinity) -> Affinity {
 /// inside its subqueries.
 pub fn refs(e: &Expr, out: &mut Vec<usize>) {
     match e {
-        Expr::Lit(_) | Expr::Agg { .. } => {}
+        Expr::Lit(_) | Expr::Agg { .. } | Expr::Window(_) => {}
         Expr::Col { cur, .. } => out.push(*cur),
         Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) | Expr::Collate(a, _) => {
             refs(a, out)
@@ -400,7 +459,7 @@ pub fn refs(e: &Expr, out: &mut Vec<usize>) {
 /// Visit every subquery that appears directly inside `e`.
 pub fn subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a Rc<Subquery>>) {
     match e {
-        Expr::Lit(_) | Expr::Agg { .. } | Expr::Col { .. } => {}
+        Expr::Lit(_) | Expr::Agg { .. } | Expr::Window(_) | Expr::Col { .. } => {}
         Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) | Expr::Collate(a, _) => {
             subqueries(a, out)
         }

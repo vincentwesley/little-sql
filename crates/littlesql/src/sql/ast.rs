@@ -115,6 +115,41 @@ pub struct SelectCore {
     pub where_: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
+    /// `WINDOW name AS (...)` definitions.
+    pub windows: Vec<(String, WindowSpec)>,
+}
+
+/// `OVER (...)`: partitioning, ordering and frame of a window function.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct WindowSpec {
+    /// A named window this one builds on (`OVER w` or `OVER (w ...)`).
+    pub base: Option<String>,
+    pub partition: Vec<Expr>,
+    pub order: Vec<OrderTerm>,
+    pub frame: Option<Frame>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameUnits {
+    Rows,
+    Range,
+    Groups,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(Box<Expr>),
+    CurrentRow,
+    Following(Box<Expr>),
+    UnboundedFollowing,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Frame {
+    pub units: FrameUnits,
+    pub start: FrameBound,
+    pub end: FrameBound,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -291,7 +326,7 @@ pub enum Expr {
         distinct: bool,
         star: bool,
         filter: Option<Box<Expr>>,
-        over: bool,
+        over: Option<Box<WindowSpec>>,
     },
     Subquery(Box<Select>),
     Exists(Box<Select>),

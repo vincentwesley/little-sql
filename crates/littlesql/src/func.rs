@@ -82,6 +82,23 @@ pub fn lookup_scalar(name: &str, nargs: usize) -> Result<Option<ScalarFn>> {
         ("date", 0, N, crate::datetime::f_date),
         ("time", 0, N, crate::datetime::f_time),
         ("datetime", 0, N, crate::datetime::f_datetime),
+        ("json", 1, 1, crate::json::f_json),
+        ("json_valid", 1, 1, crate::json::f_json_valid),
+        ("json_type", 1, 2, crate::json::f_json_type),
+        ("json_extract", 2, N, crate::json::f_json_extract),
+        ("json_array", 0, N, crate::json::f_json_array),
+        ("json_object", 0, N, crate::json::f_json_object),
+        ("json_array_length", 1, 2, crate::json::f_json_array_length),
+        ("json_quote", 1, 1, crate::json::f_json_quote),
+        ("->", 2, 2, crate::json::f_arrow),
+        ("->>", 2, 2, crate::json::f_arrow2),
+        ("json_sub", 1, 1, crate::json::f_json_sub),
+        (
+            "json_sub_container",
+            1,
+            1,
+            crate::json::f_json_sub_container,
+        ),
         ("julianday", 0, N, crate::datetime::f_julianday),
         ("unixepoch", 0, N, crate::datetime::f_unixepoch),
         ("strftime", 1, N, crate::datetime::f_strftime),
@@ -1072,6 +1089,8 @@ pub enum AggFunc {
     Min,
     Max,
     GroupConcat,
+    JsonGroupArray,
+    JsonGroupObject,
 }
 
 /// Look up an aggregate function by name and argument count.
@@ -1086,6 +1105,8 @@ pub fn lookup_agg(name: &str, nargs: usize, star: bool) -> Option<AggFunc> {
         ("min", 1) => AggFunc::Min,
         ("max", 1) => AggFunc::Max,
         ("group_concat", 1 | 2) | ("string_agg", 2) => AggFunc::GroupConcat,
+        ("json_group_array", 1) => AggFunc::JsonGroupArray,
+        ("json_group_object", 2) => AggFunc::JsonGroupObject,
         _ => return None,
     })
 }
@@ -1168,6 +1189,29 @@ impl AggState {
             self.count += 1;
             return false;
         }
+        if matches!(
+            self.func,
+            AggFunc::JsonGroupArray | AggFunc::JsonGroupObject
+        ) {
+            // NULLs are kept (as JSON null); errors surface at finish.
+            let mut item = String::new();
+            if self.func == AggFunc::JsonGroupObject {
+                crate::json::write(&crate::json::J::Str(args[0].to_text()), &mut item);
+                item.push(':');
+            }
+            let last = args.last().unwrap();
+            match crate::json::from_sql(last) {
+                Ok(j) => crate::json::write(&j, &mut item),
+                Err(_) => self.overflow = true,
+            }
+            let t = self.text.get_or_insert_with(String::new);
+            if self.count > 0 {
+                t.push(',');
+            }
+            t.push_str(&item);
+            self.count += 1;
+            return false;
+        }
         let v = &args[0];
         if v.is_null() {
             return false;
@@ -1238,13 +1282,27 @@ impl AggState {
                     None => self.text = Some(v.to_text()),
                 }
             }
-            AggFunc::Count | AggFunc::CountStar => {}
+            AggFunc::Count
+            | AggFunc::CountStar
+            | AggFunc::JsonGroupArray
+            | AggFunc::JsonGroupObject => {}
         }
         false
     }
 
     pub fn finish(&self) -> Result<Value> {
         Ok(match self.func {
+            AggFunc::JsonGroupArray | AggFunc::JsonGroupObject => {
+                if self.overflow {
+                    return Err(Error::Runtime("malformed JSON".into()));
+                }
+                let body = self.text.as_deref().unwrap_or("");
+                Value::text(if self.func == AggFunc::JsonGroupArray {
+                    format!("[{body}]")
+                } else {
+                    format!("{{{body}}}")
+                })
+            }
             AggFunc::Count | AggFunc::CountStar => Value::Int(self.count),
             AggFunc::Sum => {
                 if self.count == 0 {

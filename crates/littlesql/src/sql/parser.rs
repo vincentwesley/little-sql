@@ -997,37 +997,12 @@ impl<'a> Parser<'a> {
                 right: Box::new(right),
             };
         }
-        let mut order_by = Vec::new();
-        if self.eat_kw("ORDER") {
+        let order_by = if self.eat_kw("ORDER") {
             self.expect_kw("BY")?;
-            loop {
-                let expr = self.expr()?;
-                let desc = if self.eat_kw("DESC") {
-                    true
-                } else {
-                    self.eat_kw("ASC");
-                    false
-                };
-                let nulls_first = if self.eat_kw("NULLS") {
-                    if self.eat_kw("FIRST") {
-                        Some(true)
-                    } else {
-                        self.expect_kw("LAST")?;
-                        Some(false)
-                    }
-                } else {
-                    None
-                };
-                order_by.push(OrderTerm {
-                    expr,
-                    desc,
-                    nulls_first,
-                });
-                if !self.eat_op(",") {
-                    break;
-                }
-            }
-        }
+            self.order_terms()?
+        } else {
+            Vec::new()
+        };
         let (mut limit, mut offset) = (None, None);
         if self.eat_kw("LIMIT") {
             let first = self.expr()?;
@@ -1125,8 +1100,16 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        if self.is_kw("WINDOW") {
-            return self.unsupported("window functions");
+        let mut windows = Vec::new();
+        if self.eat_kw("WINDOW") {
+            loop {
+                let name = self.ident()?;
+                self.expect_kw("AS")?;
+                windows.push((name, self.window_spec()?));
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
         }
         Ok(SelectBody::Core(Box::new(SelectCore {
             distinct,
@@ -1135,6 +1118,7 @@ impl<'a> Parser<'a> {
             where_,
             group_by,
             having,
+            windows,
         })))
     }
 
@@ -1300,7 +1284,18 @@ impl<'a> Parser<'a> {
                 "/" => BinaryOp::Div,
                 "%" => BinaryOp::Rem,
                 "||" => BinaryOp::Concat,
-                _ => return self.unsupported("JSON operators"),
+                "->" | "->>" => {
+                    let rhs = self.expr_bp(prec + 1)?;
+                    return Ok(Expr::Function {
+                        name: op.to_string(),
+                        args: vec![*lhs, rhs],
+                        distinct: false,
+                        star: false,
+                        filter: None,
+                        over: None,
+                    });
+                }
+                _ => return Err(self.unexpected()),
             };
             let rhs = self.expr_bp(prec + 1)?;
             return Ok(Expr::Binary(bop, lhs, Box::new(rhs)));
@@ -1510,7 +1505,7 @@ impl<'a> Parser<'a> {
                             distinct: false,
                             star: false,
                             filter: None,
-                            over: false,
+                            over: None,
                         });
                     }
                     _ => {}
@@ -1591,6 +1586,111 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `expr [ASC|DESC] [NULLS FIRST|LAST], ...` after ORDER BY.
+    fn order_terms(&mut self) -> Result<Vec<OrderTerm>> {
+        let mut order_by = Vec::new();
+        loop {
+            let expr = self.expr()?;
+            let desc = if self.eat_kw("DESC") {
+                true
+            } else {
+                self.eat_kw("ASC");
+                false
+            };
+            let nulls_first = if self.eat_kw("NULLS") {
+                if self.eat_kw("FIRST") {
+                    Some(true)
+                } else {
+                    self.expect_kw("LAST")?;
+                    Some(false)
+                }
+            } else {
+                None
+            };
+            order_by.push(OrderTerm {
+                expr,
+                desc,
+                nulls_first,
+            });
+            if !self.eat_op(",") {
+                return Ok(order_by);
+            }
+        }
+    }
+
+    /// The parenthesised part of `OVER (...)` or `WINDOW w AS (...)`.
+    fn window_spec(&mut self) -> Result<WindowSpec> {
+        self.expect_op("(")?;
+        let mut spec = WindowSpec::default();
+        if let Tok::Word(w) = self.peek() {
+            let w = w.to_ascii_uppercase();
+            if !matches!(
+                w.as_str(),
+                "PARTITION" | "ORDER" | "ROWS" | "RANGE" | "GROUPS"
+            ) {
+                spec.base = Some(self.ident()?);
+            }
+        }
+        if self.eat_kw("PARTITION") {
+            self.expect_kw("BY")?;
+            loop {
+                spec.partition.push(self.expr()?);
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
+        }
+        if self.eat_kw("ORDER") {
+            self.expect_kw("BY")?;
+            spec.order = self.order_terms()?;
+        }
+        let units = if self.eat_kw("ROWS") {
+            Some(FrameUnits::Rows)
+        } else if self.eat_kw("RANGE") {
+            Some(FrameUnits::Range)
+        } else if self.eat_kw("GROUPS") {
+            Some(FrameUnits::Groups)
+        } else {
+            None
+        };
+        if let Some(units) = units {
+            let (start, end) = if self.eat_kw("BETWEEN") {
+                let start = self.frame_bound()?;
+                self.expect_kw("AND")?;
+                (start, self.frame_bound()?)
+            } else {
+                (self.frame_bound()?, FrameBound::CurrentRow)
+            };
+            if self.eat_kw("EXCLUDE") {
+                return self.unsupported("EXCLUDE in a window frame");
+            }
+            spec.frame = Some(Frame { units, start, end });
+        }
+        self.expect_op(")")?;
+        Ok(spec)
+    }
+
+    fn frame_bound(&mut self) -> Result<FrameBound> {
+        if self.eat_kw("UNBOUNDED") {
+            if self.eat_kw("PRECEDING") {
+                return Ok(FrameBound::UnboundedPreceding);
+            }
+            self.expect_kw("FOLLOWING")?;
+            return Ok(FrameBound::UnboundedFollowing);
+        }
+        if self.eat_kw("CURRENT") {
+            self.expect_kw("ROW")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        let e = self.expr()?;
+        if self.eat_kw("PRECEDING") {
+            Ok(FrameBound::Preceding(Box::new(e)))
+        } else {
+            self.expect_kw("FOLLOWING")?;
+            Ok(FrameBound::Following(Box::new(e)))
+        }
+    }
+
     fn function(&mut self, name: String) -> Result<Expr> {
         self.expect_op("(")?;
         let mut args = Vec::new();
@@ -1622,10 +1722,18 @@ impl<'a> Parser<'a> {
             filter = Some(Box::new(self.expr()?));
             self.expect_op(")")?;
         }
-        let over = self.is_kw("OVER");
-        if over {
-            return self.unsupported("window functions");
-        }
+        let over = if self.eat_kw("OVER") {
+            if self.is_op("(") {
+                Some(Box::new(self.window_spec()?))
+            } else {
+                Some(Box::new(WindowSpec {
+                    base: Some(self.ident()?),
+                    ..Default::default()
+                }))
+            }
+        } else {
+            None
+        };
         Ok(Expr::Function {
             name: name.to_ascii_lowercase(),
             args,
@@ -1693,8 +1801,13 @@ mod tests {
         assert!(parse_one("SELECT 1 +").is_err());
         assert!(parse_one("SELEC 1").is_err());
         assert!(matches!(
-            parse_one("SELECT row_number() OVER () FROM t"),
+            parse_one("SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE TIES) FROM t"),
             Err(Error::Unsupported(_))
         ));
+        assert!(parse_one(
+            "SELECT rank() OVER w, sum(x) OVER (w ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING) \
+             FROM t WINDOW w AS (PARTITION BY a ORDER BY b DESC)"
+        )
+        .is_ok());
     }
 }

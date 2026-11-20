@@ -289,3 +289,37 @@ Measured with `scripts/bench.sh` and profiled with valgrind's callgrind
 
 Not done: bytecode compilation, a page cache smarter than clear-when-full,
 and SQLite's three-sibling balancing.
+
+## D27. Window functions run over captured rows
+
+A SELECT with window functions runs as usual up to HAVING, but instead of
+projecting, each surviving row is captured (every cursor's current row and
+the group's aggregate values, all reference-counted). Each window is then
+computed over the captured rows: sort by partition and ORDER BY (stable),
+find peer groups, work out each row's frame (ROWS, GROUPS, or RANGE with
+UNBOUNDED / CURRENT ROW bounds), and evaluate. Aggregates over a frame that
+starts at the partition's start are computed incrementally; other frames
+are recomputed per row. Finally rows are projected (DISTINCT, ORDER BY,
+LIMIT as usual) with each window's value available to the result
+expressions, so `rank() OVER (...) * 10` or `sum(count(*)) OVER ()` work.
+*Why:* the window step needs the full row set anyway; capturing the
+executor's own row state means result expressions are evaluated by the
+ordinary interpreter with no rewriting of the query. `RANGE` frames with a
+numeric offset and `EXCLUDE` are reported as unsupported rather than
+approximated.
+
+## D28. JSON: a small parser, SQLite's output rules, subtype by binding
+
+JSON text is parsed into a tree that keeps numbers as written, and written
+back minified, which is what SQLite's functions return. SQLite marks values
+produced by JSON functions with a hidden "subtype" so that
+`json_array(json_array(1))` nests instead of quoting; Little SQL's values
+have no subtype, so the binder wraps such arguments of the JSON builders
+(`json_array`, `json_object`, `json_quote`, the `json_group_*` aggregates)
+in an internal tagging function instead. BLOB arguments are read as JSONB,
+SQLite 3.45's binary JSON, as sqlite3 does. *Why:* the observable results
+match sqlite3 (the differential file `json.sql` covers nesting, paths,
+operators, duplicate keys, numbers, Unicode, JSONB and errors) without
+adding a field to every value. Editing functions (`json_set`, `json_insert`,
+`json_remove`, `json_patch`) and the table-valued `json_each` /
+`json_tree` are not implemented.

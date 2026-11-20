@@ -24,7 +24,7 @@ run the same queries through the `sqlite3` tool and compare the answers.
 | sqllogictest, full corpus (622 files), read mode | 5,729,099 | 0 | 100.00 % |
 | sqllogictest, CI sample (49 files), native mode | 323,361 | 0 | 100.00 % |
 | sqllogictest, CI sample (49 files), read mode | 240,267 | 0 | 100.00 % |
-| Differential tests against sqlite3 3.45.1 | 267 | 6 | 97.80 % |
+| Differential tests against sqlite3 3.45.1 | 324 | 0 | 100.00 % |
 <!-- results:end -->
 
 What the numbers mean:
@@ -41,12 +41,11 @@ What the numbers mean:
 - Any error, crash, timeout or unsupported feature on a counted record is a
   failure. Rates are rounded down, so a run with a single failure never shows
   100.00 %.
-- The six differential failures are features not implemented yet: window
-  functions (5) and JSON functions (1). They stay in the count.
 - 100 % means every applicable record passes, not that Little SQL is a
   complete SQLite. The corpus concentrates on core SELECT semantics, joins,
   indexes, views and basic DML; features it never exercises (window
-  functions, for example) show up in the differential tests and in
+  and JSON functions, for example) are covered by the differential tests,
+  and what is missing is listed under
   [Not supported](#not-supported-yet) below.
 
 Details of the scoring rules are in [docs/DECISIONS.md](docs/DECISIONS.md)
@@ -138,7 +137,14 @@ push and keeps it as a downloadable artifact.
   `NULLS FIRST/LAST`), `LIMIT`/`OFFSET`, `DISTINCT`, compound queries
   (`UNION [ALL]`, `INTERSECT`, `EXCEPT`), `VALUES`, views, scalar, `IN`,
   `EXISTS` and correlated subqueries, common table expressions including
-  `WITH RECURSIVE`.
+  `WITH RECURSIVE`, and window functions (`row_number`, `rank`,
+  `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`,
+  `first_value`, `last_value`, `nth_value` and every aggregate, with
+  `PARTITION BY`, `ORDER BY`, `ROWS` / `GROUPS` / `RANGE` frames, `FILTER`
+  and named `WINDOW`s), and JSON (`json`, `json_extract`, `->`, `->>`,
+  `json_array`, `json_object`, `json_type`, `json_valid`,
+  `json_array_length`, `json_quote`, `json_group_array`,
+  `json_group_object`; JSONB blobs are read too).
 - **Semantics:** SQLite's type affinity, comparison and collation rules
   (`BINARY`, `NOCASE`, `RTRIM`), integer overflow to real, three-valued
   logic, and its exact number formatting.
@@ -156,8 +162,10 @@ push and keeps it as a downloadable artifact.
 
 ## Not supported (yet)
 
-- Window functions, JSON functions, virtual tables, `ATTACH`, bound
-  parameters, `ALTER TABLE`, savepoints, `RAISE()`, TEMP tables.
+- JSON editing and table functions (`json_set`, `json_each`, ...),
+  virtual tables, `ATTACH`, bound parameters,
+  `ALTER TABLE`, savepoints, `RAISE()`, TEMP tables; `RANGE` window frames
+  with a numeric offset and frame `EXCLUDE`.
 - Expression and partial indexes: tables with them are readable (the
   planner ignores those indexes) but Little SQL refuses to write to them.
 - Foreign keys are parsed but not enforced, which is also SQLite's default.

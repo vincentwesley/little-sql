@@ -1312,6 +1312,7 @@ fn select_of(columns: Vec<ResultColumn>, from: Vec<FromItem>, where_: Option<AEx
             where_,
             group_by: Vec::new(),
             having: None,
+            windows: Vec::new(),
         })),
         order_by: Vec::new(),
         limit: None,

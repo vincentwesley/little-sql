@@ -66,6 +66,27 @@ WHERE (SELECT avg(price) FROM resale r WHERE r.town_id = t.id)
 ORDER BY avg_price DESC;`,
   },
   {
+    title: "Window functions: priciest flat per town, and running totals",
+    sql: `SELECT town, month, flat_type, price,
+       rank() OVER (PARTITION BY town ORDER BY price DESC) AS rank_in_town,
+       sum(price) OVER (PARTITION BY town ORDER BY month
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total
+FROM sales
+WHERE month >= '2026-10'
+ORDER BY town, rank_in_town
+LIMIT 30;`,
+  },
+  {
+    title: "JSON: each region as a document",
+    sql: `SELECT region,
+       json_group_array(json_object('town', name, 'sales', n)) AS towns
+FROM (SELECT t.region, t.name, count(*) AS n
+      FROM resale r JOIN towns t ON t.id = r.town_id
+      WHERE r.month >= '2026-01'
+      GROUP BY t.region, t.name)
+GROUP BY region;`,
+  },
+  {
     title: "Recursive CTE: monthly sales with gaps filled",
     sql: `WITH RECURSIVE months(m) AS (
   SELECT '2025-01'

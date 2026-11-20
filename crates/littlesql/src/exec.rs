@@ -56,12 +56,24 @@ pub struct Exec<'a> {
     hash_cache: HashMap<usize, Rc<HashTable>>,
     /// Current contents of each recursive CTE's work table.
     work: HashMap<usize, Vec<Value>>,
+    /// Queries with window functions collect their rows first: the query
+    /// being collected and the rows so far (innermost last).
+    win_capture: Vec<(*const Core, Vec<Snap>)>,
+    /// Window function values for the row being projected.
+    win_vals: Vec<Value>,
     empty_row: Row,
     pub stats: Vec<CursorStats>,
     steps: u64,
     limits: Limits,
     #[cfg(not(target_arch = "wasm32"))]
     deadline: Option<std::time::Instant>,
+}
+
+/// A row captured for window processing: every cursor's current row and
+/// the aggregate values of its group.
+struct Snap {
+    rows: Vec<Row>,
+    aggs: Vec<Vec<Value>>,
 }
 
 /// Guards against runaway statements.
@@ -374,6 +386,8 @@ impl<'a> Exec<'a> {
             mat_cache: HashMap::new(),
             hash_cache: HashMap::new(),
             work: HashMap::new(),
+            win_capture: Vec::new(),
+            win_vals: Vec::new(),
             empty_row,
             stats: vec![CursorStats::default(); n],
             steps: 0,
@@ -675,6 +689,10 @@ impl<'a> Exec<'a> {
         order_by: &[OrderKey],
         emit: &mut dyn FnMut(Vec<Value>, Vec<Value>) -> Result<bool>,
     ) -> Result<()> {
+        let ptr = core as *const Core;
+        if !core.windows.is_empty() && self.win_capture.last().is_none_or(|(p, _)| *p != ptr) {
+            return self.run_windowed(core, order_by, emit);
+        }
         let const_ok = self.passes(&core.const_filters)?;
         if !const_ok && core.agg.is_none() {
             return Ok(());
@@ -689,7 +707,16 @@ impl<'a> Exec<'a> {
         };
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         // Shared tail: project, compute sort keys, apply DISTINCT, emit.
+        let me_ptr = core as *const Core;
         let mut project = |me: &mut Exec<'a>| -> Result<bool> {
+            if me.win_capture.last().is_some_and(|(p, _)| *p == me_ptr) {
+                let snap = Snap {
+                    rows: me.rows.clone(),
+                    aggs: me.aggs.clone(),
+                };
+                me.win_capture.last_mut().unwrap().1.push(snap);
+                return Ok(true);
+            }
             let mut row = Vec::with_capacity(core.results.len());
             for e in &core.results {
                 row.push(me.eval(e)?);
@@ -811,6 +838,364 @@ impl<'a> Exec<'a> {
             }
         }
         Ok(())
+    }
+
+    /// A SELECT with window functions: collect its rows (after WHERE,
+    /// GROUP BY and HAVING), compute every window over them, then project.
+    fn run_windowed(
+        &mut self,
+        core: &Core,
+        order_by: &[OrderKey],
+        emit: &mut dyn FnMut(Vec<Value>, Vec<Value>) -> Result<bool>,
+    ) -> Result<()> {
+        self.win_capture.push((core as *const Core, Vec::new()));
+        let r = self.run_core(core, order_by, &mut |_, _| Ok(true));
+        let snaps = self.win_capture.pop().unwrap().1;
+        r?;
+        let saved = (
+            self.rows.clone(),
+            self.aggs.clone(),
+            std::mem::take(&mut self.win_vals),
+        );
+        let n = snaps.len();
+        let mut vals: Vec<Vec<Value>> = vec![Vec::with_capacity(core.windows.len()); n];
+        let mut out_order: Vec<usize> = (0..n).collect();
+        for w in &core.windows {
+            let (col, order) = self.compute_window(w, &snaps)?;
+            for (i, v) in col.into_iter().enumerate() {
+                vals[i].push(v);
+            }
+            // Rows come out in the order of the last window's sort.
+            out_order = order;
+        }
+        let colls: Vec<Collation> = if core.distinct {
+            core.results
+                .iter()
+                .map(|e| collation(e).map_or(Collation::Binary, |c| c.0))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for i in out_order {
+            self.rows = snaps[i].rows.clone();
+            self.aggs = snaps[i].aggs.clone();
+            self.win_vals = std::mem::take(&mut vals[i]);
+            let mut row = Vec::with_capacity(core.results.len());
+            for e in &core.results {
+                row.push(self.eval(e)?);
+            }
+            if core.distinct && !seen.insert(row_key(&row, &colls)) {
+                continue;
+            }
+            let mut keys = Vec::with_capacity(order_by.len());
+            for k in order_by {
+                keys.push(match &k.src {
+                    KeySrc::Result(j) => row[*j].clone(),
+                    KeySrc::Expr(e) => self.eval(e)?,
+                });
+            }
+            if !emit(row, keys)? {
+                break;
+            }
+        }
+        self.rows = saved.0;
+        self.aggs = saved.1;
+        self.win_vals = saved.2;
+        Ok(())
+    }
+
+    /// One window function over all rows: its value per row, and the rows
+    /// in partition-and-ORDER-BY order.
+    fn compute_window(
+        &mut self,
+        w: &WindowCall,
+        snaps: &[Snap],
+    ) -> Result<(Vec<Value>, Vec<usize>)> {
+        let n = snaps.len();
+        let mut part: Vec<Vec<Value>> = Vec::with_capacity(n);
+        let mut ord: Vec<Vec<Value>> = Vec::with_capacity(n);
+        let mut args: Vec<Vec<Value>> = Vec::with_capacity(n);
+        let mut keep: Vec<bool> = Vec::with_capacity(n);
+        for s in snaps {
+            self.rows = s.rows.clone();
+            self.aggs = s.aggs.clone();
+            part.push(
+                w.partition
+                    .iter()
+                    .map(|(e, _)| self.eval(e))
+                    .collect::<Result<_>>()?,
+            );
+            ord.push(
+                w.order
+                    .iter()
+                    .map(|(e, ..)| self.eval(e))
+                    .collect::<Result<_>>()?,
+            );
+            args.push(w.args.iter().map(|e| self.eval(e)).collect::<Result<_>>()?);
+            keep.push(match &w.filter {
+                Some(f) => self.eval(f)?.truth() == Some(true),
+                None => true,
+            });
+        }
+        let cmp_part = |a: usize, b: usize| -> Ordering {
+            for (k, (_, coll)) in w.partition.iter().enumerate() {
+                let o = part[a][k].compare(&part[b][k], *coll);
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            Ordering::Equal
+        };
+        let cmp_ord = |a: usize, b: usize| -> Ordering {
+            for (k, (_, desc, nulls_first, coll)) in w.order.iter().enumerate() {
+                let (x, y) = (&ord[a][k], &ord[b][k]);
+                let o = match (x.is_null(), y.is_null()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => {
+                        if *nulls_first {
+                            Ordering::Less
+                        } else {
+                            Ordering::Greater
+                        }
+                    }
+                    (false, true) => {
+                        if *nulls_first {
+                            Ordering::Greater
+                        } else {
+                            Ordering::Less
+                        }
+                    }
+                    _ => {
+                        let o = x.compare(y, *coll);
+                        if *desc {
+                            o.reverse()
+                        } else {
+                            o
+                        }
+                    }
+                };
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            Ordering::Equal
+        };
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|&a, &b| cmp_part(a, b).then_with(|| cmp_ord(a, b)));
+        // Constant frame offsets.
+        let offset = |me: &mut Exec<'a>, b: &WinBound| -> Result<i64> {
+            match b {
+                WinBound::Preceding(e) | WinBound::Following(e) => {
+                    let v = me.eval(e)?;
+                    match v {
+                        Value::Int(i) if i >= 0 => Ok(i),
+                        Value::Real(r) if r >= 0.0 && r == r.trunc() => Ok(r as i64),
+                        _ => Err(Error::Sql(
+                            "frame starting offset must be a non-negative integer".into(),
+                        )),
+                    }
+                }
+                _ => Ok(0),
+            }
+        };
+        let start_off = offset(self, &w.frame.start)?;
+        let end_off = offset(self, &w.frame.end)?;
+        if w.frame.units == WinUnits::Range
+            && (matches!(
+                w.frame.start,
+                WinBound::Preceding(_) | WinBound::Following(_)
+            ) || matches!(w.frame.end, WinBound::Preceding(_) | WinBound::Following(_)))
+        {
+            return Err(Error::Unsupported("RANGE frames with an offset".into()));
+        }
+        let mut out = vec![Value::Null; n];
+        let mut p0 = 0;
+        while p0 < n {
+            let mut p1 = p0 + 1;
+            while p1 < n && cmp_part(idx[p0], idx[p1]) == Ordering::Equal {
+                p1 += 1;
+            }
+            let rows = &idx[p0..p1];
+            let m = rows.len();
+            // Peer groups (rows equal on ORDER BY).
+            let mut group = vec![0usize; m];
+            let mut gstart = vec![0usize];
+            for k in 1..m {
+                if cmp_ord(rows[k - 1], rows[k]) == Ordering::Equal {
+                    group[k] = group[k - 1];
+                } else {
+                    group[k] = group[k - 1] + 1;
+                    gstart.push(k);
+                }
+            }
+            let ngroups = gstart.len();
+            let gend = |g: usize| {
+                if g + 1 < ngroups {
+                    gstart[g + 1] - 1
+                } else {
+                    m - 1
+                }
+            };
+            // Frame of position k as inclusive positions (empty if s > e).
+            let frame = |k: usize| -> (i64, i64) {
+                let g = group[k] as i64;
+                let (k, mm) = (k as i64, m as i64);
+                let s = match (&w.frame.units, &w.frame.start) {
+                    (_, WinBound::UnboundedPreceding) => 0,
+                    (WinUnits::Rows, WinBound::Preceding(_)) => k - start_off,
+                    (WinUnits::Rows, WinBound::CurrentRow) => k,
+                    (WinUnits::Rows, WinBound::Following(_)) => k + start_off,
+                    (WinUnits::Groups, WinBound::Preceding(_)) => {
+                        gstart[(g - start_off).max(0) as usize] as i64
+                    }
+                    (WinUnits::Groups, WinBound::Following(_)) => {
+                        let t = g + start_off;
+                        if t < ngroups as i64 {
+                            gstart[t as usize] as i64
+                        } else {
+                            mm
+                        }
+                    }
+                    (_, WinBound::CurrentRow) => gstart[g as usize] as i64,
+                    _ => mm,
+                };
+                let e = match (&w.frame.units, &w.frame.end) {
+                    (_, WinBound::UnboundedFollowing) => mm - 1,
+                    (WinUnits::Rows, WinBound::Preceding(_)) => k - end_off,
+                    (WinUnits::Rows, WinBound::CurrentRow) => k,
+                    (WinUnits::Rows, WinBound::Following(_)) => k + end_off,
+                    (WinUnits::Groups, WinBound::Preceding(_)) => {
+                        let t = g - end_off;
+                        if t >= 0 {
+                            gend(t as usize) as i64
+                        } else {
+                            -1
+                        }
+                    }
+                    (WinUnits::Groups, WinBound::Following(_)) => {
+                        gend(((g + end_off) as usize).min(ngroups - 1)) as i64
+                    }
+                    (_, WinBound::CurrentRow) => gend(g as usize) as i64,
+                    _ => -1,
+                };
+                (s.max(0), e.min(mm - 1))
+            };
+            match w.func {
+                WinFunc::Agg(f) => {
+                    let incremental = matches!(w.frame.start, WinBound::UnboundedPreceding)
+                        && matches!(
+                            w.frame.end,
+                            WinBound::CurrentRow | WinBound::UnboundedFollowing
+                        );
+                    if incremental {
+                        let mut st = AggState::new(f, w.distinct, w.coll);
+                        let mut upto: i64 = -1;
+                        for k in 0..m {
+                            let (_, e) = frame(k);
+                            while upto < e {
+                                upto += 1;
+                                let r = rows[upto as usize];
+                                if keep[r] {
+                                    st.step(&args[r]);
+                                }
+                            }
+                            out[rows[k]] = st.finish()?;
+                        }
+                    } else {
+                        for k in 0..m {
+                            let (s, e) = frame(k);
+                            let mut st = AggState::new(f, w.distinct, w.coll);
+                            let mut j = s;
+                            while j <= e {
+                                let r = rows[j as usize];
+                                if keep[r] {
+                                    st.step(&args[r]);
+                                }
+                                j += 1;
+                            }
+                            out[rows[k]] = st.finish()?;
+                        }
+                    }
+                }
+                _ => {
+                    for k in 0..m {
+                        let r = rows[k];
+                        let g = group[k];
+                        out[r] = match w.func {
+                            WinFunc::RowNumber => Value::Int(k as i64 + 1),
+                            WinFunc::Rank => Value::Int(gstart[g] as i64 + 1),
+                            WinFunc::DenseRank => Value::Int(g as i64 + 1),
+                            WinFunc::PercentRank => Value::Real(if m > 1 {
+                                gstart[g] as f64 / (m - 1) as f64
+                            } else {
+                                0.0
+                            }),
+                            WinFunc::CumeDist => Value::Real((gend(g) + 1) as f64 / m as f64),
+                            WinFunc::Ntile => {
+                                let buckets = match args[r][0].clone().apply_numeric_for_compare() {
+                                    Value::Int(b) if b > 0 => b as usize,
+                                    _ => {
+                                        return Err(Error::Sql(
+                                            "argument of ntile must be a positive integer".into(),
+                                        ))
+                                    }
+                                };
+                                let size = m / buckets;
+                                let extra = m % buckets;
+                                let big = extra * (size + 1);
+                                Value::Int(if k < big {
+                                    k / (size + 1) + 1
+                                } else {
+                                    extra + (k - big) / size.max(1) + 1
+                                } as i64)
+                            }
+                            WinFunc::Lag | WinFunc::Lead => {
+                                let off = match args[r].get(1) {
+                                    Some(v) => v.to_int(),
+                                    None => 1,
+                                };
+                                let t = if w.func == WinFunc::Lag {
+                                    k as i64 - off
+                                } else {
+                                    k as i64 + off
+                                };
+                                if t >= 0 && t < m as i64 {
+                                    args[rows[t as usize]][0].clone()
+                                } else {
+                                    args[r].get(2).cloned().unwrap_or(Value::Null)
+                                }
+                            }
+                            WinFunc::FirstValue | WinFunc::LastValue | WinFunc::NthValue => {
+                                let (s, e) = frame(k);
+                                let pos = match w.func {
+                                    WinFunc::FirstValue => s,
+                                    WinFunc::LastValue => e,
+                                    _ => {
+                                        let nth = args[r][1].to_int();
+                                        if nth <= 0 {
+                                            return Err(Error::Sql(
+                                                "second argument to nth_value must be a positive integer"
+                                                    .into(),
+                                            ));
+                                        }
+                                        s + nth - 1
+                                    }
+                                };
+                                if s <= e && pos >= s && pos <= e {
+                                    args[rows[pos as usize]][0].clone()
+                                } else {
+                                    Value::Null
+                                }
+                            }
+                            WinFunc::Agg(_) => unreachable!(),
+                        };
+                    }
+                }
+            }
+            p0 = p1;
+        }
+        Ok((out, idx))
     }
 
     /// GROUP BY over rows that arrive in group order: keep one group at a
@@ -1597,6 +1982,7 @@ impl<'a> Exec<'a> {
             Expr::Lit(v) => v.clone(),
             Expr::Col { cur, col, .. } => self.rows[*cur].get(*col).cloned().unwrap_or(Value::Null),
             Expr::Agg { slot, idx } => self.aggs[*slot].get(*idx).cloned().unwrap_or(Value::Null),
+            Expr::Window(i) => self.win_vals.get(*i).cloned().unwrap_or(Value::Null),
             Expr::Collate(inner, _) => self.eval(inner)?,
             Expr::Unary(op, a) => {
                 let v = self.eval(a)?;

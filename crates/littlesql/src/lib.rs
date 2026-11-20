@@ -23,6 +23,7 @@ pub mod db;
 pub mod error;
 pub mod exec;
 pub mod func;
+pub mod json;
 pub mod pager;
 pub mod plan;
 pub mod record;

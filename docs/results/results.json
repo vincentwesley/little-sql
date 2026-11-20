@@ -796,12 +796,12 @@
    "mode": "read",
    "engine": "littlesql 0.1.0",
    "reference": "sqlite3 3.45.1",
-   "files": 15,
+   "files": 17,
    "total": {
-    "pass": 267,
-    "fail": 6,
-    "scored": 273,
-    "pass_rate": 97.8,
+    "pass": 324,
+    "fail": 0,
+    "scored": 324,
+    "pass_rate": 100,
     "not_applicable": 0,
     "setup": 0
    },
@@ -809,10 +809,10 @@
     {
      "name": "advanced",
      "files": 1,
-     "pass": 8,
-     "fail": 6,
+     "pass": 14,
+     "fail": 0,
      "scored": 14,
-     "pass_rate": 57.14,
+     "pass_rate": 100,
      "not_applicable": 0,
      "setup": 0
     },
@@ -897,6 +897,16 @@
      "setup": 0
     },
     {
+     "name": "json",
+     "files": 1,
+     "pass": 25,
+     "fail": 0,
+     "scored": 25,
+     "pass_rate": 100,
+     "not_applicable": 0,
+     "setup": 0
+    },
+    {
      "name": "ordering",
      "files": 1,
      "pass": 31,
@@ -952,6 +962,16 @@
      "pass": 15,
      "fail": 0,
      "scored": 15,
+     "pass_rate": 100,
+     "not_applicable": 0,
+     "setup": 0
+    },
+    {
+     "name": "windows",
+     "files": 1,
+     "pass": 26,
+     "fail": 0,
+     "scored": 26,
      "pass_rate": 100,
      "not_applicable": 0,
      "setup": 0
