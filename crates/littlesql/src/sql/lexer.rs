@@ -18,9 +18,8 @@ pub enum Tok {
     Blob(Vec<u8>),
     /// Operator or punctuation.
     Op(&'static str),
-    /// A bound parameter (`?`, `?1`, `:name`, ...). Parsed so that the error
-    /// message is helpful; parameters are not supported.
-    Param,
+    /// A bound parameter as written: `?`, `?1`, `:name`, `@name`, `$name`.
+    Param(String),
     Eof,
 }
 
@@ -109,7 +108,7 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                 i += 1;
             }
-            Tok::Param
+            Tok::Param(sql[start..i].to_string())
         } else {
             let rest = &sql[i..];
             match OPS.iter().find(|op| rest.starts_with(**op)) {

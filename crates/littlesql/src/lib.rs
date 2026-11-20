@@ -34,7 +34,7 @@ pub mod storage;
 pub mod value;
 pub mod wal;
 
-pub use db::{Database, ResultSet};
+pub use db::{Database, Params, ResultSet};
 pub use error::{Error, Result};
 pub use exec::Limits;
 pub use value::Value;

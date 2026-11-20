@@ -259,6 +259,14 @@ fn execute(db: &Database, stmt: &Stmt, text: &str) -> Result<ResultSet> {
 /// `TEMP` and keyword spacing are dropped).
 fn stored_sql(text: &str, kind: &str) -> Result<String> {
     let toks = tokenize(text)?;
+    // A stored definition cannot depend on a statement's parameters.
+    if toks.iter().any(|t| matches!(t.tok, Tok::Param(_))) {
+        return Err(Error::Sql(match kind {
+            "VIEW" => "parameters are not allowed in views".to_string(),
+            "TRIGGER" => "trigger cannot use variables".to_string(),
+            _ => format!("parameters are not allowed in CREATE {kind}"),
+        }));
+    }
     let mut i = 0;
     let word =
         |i: usize, w: &str| matches!(&toks[i].tok, Tok::Word(x) if x.eq_ignore_ascii_case(w));

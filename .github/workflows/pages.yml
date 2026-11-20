@@ -1,0 +1,43 @@
+name: Publish the playground
+
+# Run by hand (Actions tab -> "Publish the playground" -> Run workflow)
+# once GitHub Pages is enabled with "Source: GitHub Actions" in the
+# repository settings. It builds playground/dist/ and deploys it.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install sqlite3 (builds the demo database)
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - name: Build the playground
+        run: scripts/build-playground.sh
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: playground/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

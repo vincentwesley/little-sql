@@ -84,6 +84,11 @@ pub struct Parser<'a> {
     toks: Vec<Token>,
     pos: usize,
     depth: usize,
+    /// Parameter numbering for the current statement, as SQLite does it:
+    /// `?` takes the next number, `?N` is N, a name keeps the number it got
+    /// the first time.
+    param_max: usize,
+    param_names: Vec<(String, usize)>,
 }
 
 /// Parse every statement in `sql`. Each statement is returned with its
@@ -94,6 +99,8 @@ pub fn parse_statements(sql: &str) -> Result<Vec<(Stmt, String)>> {
         toks: tokenize(sql)?,
         pos: 0,
         depth: 0,
+        param_max: 0,
+        param_names: Vec::new(),
     };
     let mut out = Vec::new();
     loop {
@@ -102,6 +109,8 @@ pub fn parse_statements(sql: &str) -> Result<Vec<(Stmt, String)>> {
             return Ok(out);
         }
         let start = p.toks[p.pos].start;
+        p.param_max = 0;
+        p.param_names.clear();
         let stmt = p.statement()?;
         let end = p.toks[p.pos - 1].end;
         if !p.at_eof() && !p.eat_op(";") {
@@ -128,6 +137,8 @@ pub fn parse_expr(sql: &str) -> Result<Expr> {
         toks: tokenize(sql)?,
         pos: 0,
         depth: 0,
+        param_max: 0,
+        param_names: Vec::new(),
     };
     let e = p.expr()?;
     if !p.at_eof() {
@@ -1471,7 +1482,29 @@ impl<'a> Parser<'a> {
             Tok::Num(n) => Ok(Expr::Literal(Self::number(&n))),
             Tok::Str(s) => Ok(Expr::Literal(Value::text(s))),
             Tok::Blob(b) => Ok(Expr::Literal(Value::blob(b))),
-            Tok::Param => Ok(Expr::Param),
+            Tok::Param(text) => {
+                let (index, name) = if text == "?" {
+                    self.param_max += 1;
+                    (self.param_max, None)
+                } else if let Some(n) = text.strip_prefix('?') {
+                    let n: usize = n
+                        .parse()
+                        .ok()
+                        .filter(|n| (1..=32766).contains(n))
+                        .ok_or_else(|| {
+                            Error::Parse("variable number must be between ?1 and ?32766".into())
+                        })?;
+                    self.param_max = self.param_max.max(n);
+                    (n, None)
+                } else if let Some((_, n)) = self.param_names.iter().find(|(t, _)| *t == text) {
+                    (*n, Some(text))
+                } else {
+                    self.param_max += 1;
+                    self.param_names.push((text.clone(), self.param_max));
+                    (self.param_max, Some(text))
+                };
+                Ok(Expr::Param { index, name })
+            }
             Tok::Op("(") => {
                 if self.is_kw("SELECT") || self.is_kw("VALUES") || self.is_kw("WITH") {
                     let s = self.select()?;

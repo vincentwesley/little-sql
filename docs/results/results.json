@@ -798,9 +798,9 @@
    "reference": "sqlite3 3.45.1",
    "files": 17,
    "total": {
-    "pass": 324,
+    "pass": 332,
     "fail": 0,
-    "scored": 324,
+    "scored": 332,
     "pass_rate": 100,
     "not_applicable": 0,
     "setup": 0
@@ -889,9 +889,9 @@
     {
      "name": "joins",
      "files": 1,
-     "pass": 20,
+     "pass": 28,
      "fail": 0,
-     "scored": 20,
+     "scored": 28,
      "pass_rate": 100,
      "not_applicable": 0,
      "setup": 0

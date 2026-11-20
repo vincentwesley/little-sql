@@ -9,12 +9,13 @@ on hosting it. To put it online with GitHub Pages (free, no keys):
 
 1. Merge the pull request into `main`.
 2. In the repository's **Settings → Pages**, set **Source** to
-   **GitHub Actions**.
-3. Add a workflow that runs `scripts/build-playground.sh` and uploads
-   `playground/dist/` with `actions/upload-pages-artifact`, then
-   `actions/deploy-pages` (the CI job already builds the site; the deploy
-   step needs the Pages permission that only the repository owner can
-   grant).
+   **GitHub Actions** (only the repository owner can do this).
+3. In the **Actions** tab, choose **Publish the playground** and press
+   **Run workflow**. It builds `playground/dist/` and deploys it; the page
+   address appears in the run's summary.
+
+The workflow (`.github/workflows/pages.yml`) only runs when started by
+hand, so it cannot fail on its own before Pages is enabled.
 
 Any other static host works the same way: serve the contents of
 `playground/dist/` (largest file: the 18 MB demo database).

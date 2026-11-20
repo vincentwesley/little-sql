@@ -337,7 +337,12 @@ pub enum Expr {
     },
     Subquery(Box<Select>),
     Exists(Box<Select>),
-    Param,
+    /// A bound parameter: its 1-based number in the statement, and its
+    /// name (with the leading `:`, `@` or `$`) when it has one.
+    Param {
+        index: usize,
+        name: Option<String>,
+    },
 }
 
 impl PartialEq for Value {

@@ -24,7 +24,7 @@ run the same queries through the `sqlite3` tool and compare the answers.
 | sqllogictest, full corpus (622 files), read mode | 5,729,099 | 0 | 100.00 % |
 | sqllogictest, CI sample (49 files), native mode | 323,361 | 0 | 100.00 % |
 | sqllogictest, CI sample (49 files), read mode | 240,267 | 0 | 100.00 % |
-| Differential tests against sqlite3 3.45.1 | 324 | 0 | 100.00 % |
+| Differential tests against sqlite3 3.45.1 | 332 | 0 | 100.00 % |
 <!-- results:end -->
 
 What the numbers mean:
@@ -95,6 +95,10 @@ QUERY PLAN
 `--SEARCH resale USING INDEX resale_town_month (town_id=? AND month>=?)
 ```
 
+Statements can use parameters (`?`, `?N`, `:name`, `@name`, `$name`):
+`.parameter set :town 'BEDOK'` in the shell, or `Database::query_with` from
+Rust.
+
 `EXPLAIN` (without `QUERY PLAN`) runs the query and shows the same tree with
 how many times each loop ran and how many rows it visited. `.eqp on` prints
 that tree after every query; `.stats on` prints pages read. `.help` lists
@@ -128,9 +132,13 @@ push and keeps it as a downloadable artifact.
   `CREATE VIEW` (also `TEMP`), `CREATE TRIGGER`, `DROP`, `INSERT` (values,
   `SELECT`, `DEFAULT VALUES`, `WITH`), `UPDATE`, `DELETE`, `OR IGNORE` /
   `OR REPLACE`, `NOT NULL`, `UNIQUE`, `PRIMARY KEY` and `CHECK` constraints,
-  `AUTOINCREMENT`, and `BEGIN` / `COMMIT` / `ROLLBACK` (a failing statement
-  inside a transaction undoes only itself). Triggers: `BEFORE`, `AFTER`,
-  `INSTEAD OF` on views, `UPDATE OF`, `WHEN`. `PRAGMA integrity_check` checks
+  `AUTOINCREMENT`, `BEGIN` / `COMMIT` / `ROLLBACK` (a failing statement
+  inside a transaction undoes only itself), savepoints (`SAVEPOINT`,
+  `RELEASE`, `ROLLBACK TO`), and `ALTER TABLE` (`RENAME TO`,
+  `RENAME COLUMN`, `ADD COLUMN`, `DROP COLUMN`, with indexes, triggers and
+  views that refer to the table rewritten as SQLite does). Triggers:
+  `BEFORE`, `AFTER`, `INSTEAD OF` on views, `UPDATE OF`, `WHEN`, and
+  `RAISE(IGNORE | ABORT | FAIL | ROLLBACK, ...)`. `PRAGMA integrity_check` checks
   the whole file structurally.
 - **Queries:** `SELECT` with joins (inner, left, cross, natural, `USING`,
   simple right joins), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` (with
@@ -152,7 +160,7 @@ push and keeps it as a downloadable artifact.
   `like`/`glob`, math), the aggregates (`count`, `sum`, `total`, `avg`, `min`,
   `max`, `group_concat`, with `DISTINCT` and `FILTER`), and the date and time
   functions.
-- **Planner:** rowid lookups and ranges, index searches on an equality prefix
+- **Planner:** WHERE-clause constant propagation, rowid lookups and ranges, index searches on an equality prefix
   plus one range, `IN` lists and subqueries through an index, covering
   indexes, index order used instead of sorting (forwards or backwards),
   streaming `GROUP BY` over sorted input, automatic hash indexes for joins
@@ -163,9 +171,8 @@ push and keeps it as a downloadable artifact.
 ## Not supported (yet)
 
 - JSON editing and table functions (`json_set`, `json_each`, ...),
-  virtual tables, `ATTACH`, bound parameters,
-  `ALTER TABLE`, savepoints, `RAISE()`, TEMP tables; `RANGE` window frames
-  with a numeric offset and frame `EXCLUDE`.
+  virtual tables, `ATTACH`, TEMP tables; `RANGE` window frames with a
+  numeric offset and frame `EXCLUDE`.
 - Expression and partial indexes: tables with them are readable (the
   planner ignores those indexes) but Little SQL refuses to write to them.
 - Foreign keys are parsed but not enforced, which is also SQLite's default.

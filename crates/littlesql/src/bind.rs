@@ -179,6 +179,42 @@ thread_local! {
     static TRIGGER_ROWS: std::cell::RefCell<Vec<TriggerRow>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    static PARAMS: std::cell::RefCell<Vec<crate::db::Params>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with `params` bound to the statements' parameters.
+pub fn with_params<T>(params: &crate::db::Params, f: impl FnOnce() -> T) -> T {
+    PARAMS.with(|p| p.borrow_mut().push(params.clone()));
+    let out = f();
+    PARAMS.with(|p| p.borrow_mut().pop());
+    out
+}
+
+/// A parameter's value: by name if bound by name, else by number; NULL if
+/// unbound (as in SQLite).
+fn param_value(index: usize, name: Option<&str>) -> Value {
+    PARAMS.with(|p| {
+        let p = p.borrow();
+        let Some(params) = p.last() else {
+            return Value::Null;
+        };
+        if let Some(n) = name {
+            if let Some((_, v)) = params.named.iter().find(|(k, _)| k == n) {
+                return v.clone();
+            }
+            if params.names_only {
+                return Value::Null;
+            }
+        }
+        params
+            .positional
+            .get(index.wrapping_sub(1))
+            .cloned()
+            .unwrap_or(Value::Null)
+    })
+}
+
 /// Run `f` with `row` visible as NEW/OLD to everything bound inside it.
 pub fn with_trigger_row<T>(row: TriggerRow, f: impl FnOnce() -> T) -> T {
     TRIGGER_ROWS.with(|r| r.borrow_mut().push(row));
@@ -1529,7 +1565,7 @@ impl<'a> Binder<'a> {
     pub fn bind_expr(&mut self, e: &ast::Expr) -> Result<Expr> {
         Ok(match e {
             ast::Expr::Literal(v) => Expr::Lit(v.clone()),
-            ast::Expr::Param => return Err(Error::Unsupported("bound parameters".into())),
+            ast::Expr::Param { index, name } => Expr::Lit(param_value(*index, name.as_deref())),
             ast::Expr::Name { table, name, dq } => {
                 self.resolve_name(table.as_deref(), name, *dq)?
             }

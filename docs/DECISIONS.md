@@ -323,3 +323,48 @@ operators, duplicate keys, numbers, Unicode, JSONB and errors) without
 adding a field to every value. Editing functions (`json_set`, `json_insert`,
 `json_remove`, `json_patch`) and the table-valued `json_each` /
 `json_tree` are not implemented.
+
+## D29. ALTER TABLE rewrites stored SQL with token rules, then re-checks
+
+SQLite (3.26+) renames a table or column everywhere it is referenced,
+including inside views and triggers, by re-parsing them. Little SQL keeps
+no parse positions in its AST, so it rewrites the stored SQL on tokens: a
+name denotes the table after FROM, JOIN, INTO, UPDATE, TABLE, REFERENCES,
+the `ON` of an index or trigger, in a FROM list, or before a `.`; a column
+name is renamed where it can only mean that column (its definition,
+constraints and index lists, `UPDATE OF` lists, qualified references to
+the table or its aliases, and unqualified references in statements where
+no other table has a column of that name). After the rewrite the schema
+is reloaded and every view is bound; if anything fails, the statement is
+rolled back with an error naming the object. *Why:* the observable result
+matches sqlite3 on the write-check workload (identical `.dump`), and the
+re-check turns any case the token rules get wrong into a refused ALTER
+rather than a broken schema. DROP COLUMN refuses, in SQLite's words,
+columns that are part of a key, an index or a constraint, and rewrites
+every row.
+
+## D30. Savepoints and RAISE() reuse the statement savepoint
+
+The pager's snapshot of uncommitted pages (used to undo a failing
+statement inside a transaction) also implements SAVEPOINT / ROLLBACK TO,
+together with the connection's TEMP views. RAISE() is an internal function
+that fails with a dedicated error; the statement runner then applies
+SQLite's rules for each kind (ABORT undoes the statement, FAIL keeps what
+it already did, ROLLBACK ends the transaction, IGNORE skips the row).
+
+## D31. Parameters bind as constants
+
+`?`, `?N`, `:name`, `@name` and `$name` are numbered per statement exactly
+as SQLite numbers them and bound as literal values while the statement is
+bound (there are no prepared statements to reuse, so nothing is lost).
+Unbound parameters are NULL, as in SQLite. Views and triggers may not use
+parameters. The shell's `.parameter` binds named parameters by name only,
+like sqlite3's.
+
+## D32. Constant propagation only where it is exactly implied
+
+From `a = 5` and `b = a` the planner derives `b = 5` when all three
+comparisons are BINARY equalities in one affinity class, so equality is
+transitive under SQLite's comparison rules. The derived term is an extra
+filter (DECISIONS D4: plans only narrow; every original term is still
+checked), so a derivation can never change an answer, only the plan.

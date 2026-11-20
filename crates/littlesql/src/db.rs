@@ -39,6 +39,18 @@ impl ResultSet {
     }
 }
 
+/// Values for a statement's parameters: `?` and `?N` by number (1-based,
+/// so `positional[0]` is `?1`), `:name`, `@name` and `$name` by name (with
+/// the prefix, e.g. `":id"`), or by the number the name was given.
+#[derive(Clone, Debug, Default)]
+pub struct Params {
+    pub positional: Vec<Value>,
+    pub named: Vec<(String, Value)>,
+    /// Bind named parameters only by name, never by their number (what
+    /// the sqlite3 shell's `.parameter` does).
+    pub names_only: bool,
+}
+
 pub struct Database {
     pub(crate) pager: Rc<Pager>,
     pub(crate) schema: RefCell<Rc<Schema>>,
@@ -171,6 +183,28 @@ impl Database {
             out.push(self.run(&stmt, &text)?);
         }
         Ok(out)
+    }
+
+    /// [`Database::execute`] with parameter values.
+    ///
+    /// ```
+    /// use littlesql::{Database, Params, Value};
+    /// let db = Database::memory();
+    /// let p = Params {
+    ///     positional: vec![Value::Int(2)],
+    ///     named: vec![(":x".into(), Value::Int(40))],
+    ///     ..Default::default()
+    /// };
+    /// let rs = db.query_with("SELECT ?1 + :x", &p).unwrap();
+    /// assert_eq!(rs.rows[0][0], Value::Int(42));
+    /// ```
+    pub fn execute_with(&self, sql: &str, params: &Params) -> Result<Vec<ResultSet>> {
+        crate::bind::with_params(params, || self.execute(sql))
+    }
+
+    /// [`Database::query`] with parameter values.
+    pub fn query_with(&self, sql: &str, params: &Params) -> Result<ResultSet> {
+        crate::bind::with_params(params, || self.query(sql))
     }
 
     /// Run `sql` and return the result of its last statement.

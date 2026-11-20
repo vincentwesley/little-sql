@@ -43,6 +43,7 @@ const DOT_HELP: &str = "\
 .indexes ?TABLE?      List indexes
 .mode MODE            list, csv, tabs, line, json, column, table, box, markdown
 .nullvalue TEXT       Text shown for NULL
+.parameter set NAME VALUE  Bind ?N, :name, @name or $name (also unset/list/clear)
 .open FILE            Close this database and open FILE
 .read FILE            Run the SQL in FILE
 .schema ?PATTERN?     Show CREATE statements
@@ -97,6 +98,8 @@ struct Shell {
     timer: bool,
     bail: bool,
     limits: Limits,
+    /// `.parameter set` values: `?N`, `:name`, `@name` or `$name`.
+    param_list: Vec<(String, Value)>,
     errors: usize,
     out: Box<dyn Write>,
 }
@@ -141,7 +144,7 @@ impl Shell {
         };
         for text in stmts {
             let t0 = Instant::now();
-            match self.db.query(&text) {
+            match self.db.query_with(&text, &self.params()) {
                 Ok(rs) => {
                     self.print_result(&rs);
                     if self.stats {
@@ -369,6 +372,26 @@ impl Shell {
         }
     }
 
+    /// The `.parameter` values as statement parameters.
+    fn params(&self) -> littlesql::Params {
+        let mut p = littlesql::Params {
+            names_only: true,
+            ..Default::default()
+        };
+        for (k, v) in &self.param_list {
+            match k.strip_prefix('?').and_then(|n| n.parse::<usize>().ok()) {
+                Some(n) if n >= 1 => {
+                    if p.positional.len() < n {
+                        p.positional.resize(n, Value::Null);
+                    }
+                    p.positional[n - 1] = v.clone();
+                }
+                _ => p.named.push((k.clone(), v.clone())),
+            }
+        }
+        p
+    }
+
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Value>>, String> {
         self.db
             .query(sql)
@@ -485,6 +508,42 @@ impl Shell {
             ".bail" => self.bail = on(arg1),
             ".nullvalue" => self.null = arg1.unwrap_or("").to_string(),
             ".separator" => self.separator = arg1.unwrap_or("|").to_string(),
+            ".parameter" | ".param" => match (arg1, args.get(2)) {
+                (Some("set"), Some(name)) => {
+                    // The value is the rest of the line, an SQL expression,
+                    // as in sqlite3 (so quotes are kept).
+                    let after_set = line.find("set").map_or("", |i| &line[i + 3..]).trim_start();
+                    let value = after_set.strip_prefix(name.as_str()).unwrap_or("").trim();
+                    if value.is_empty() {
+                        self.print_error("usage: .parameter set NAME VALUE");
+                    } else {
+                        match self.db.query(&format!("SELECT {value}")) {
+                            Ok(rs) => {
+                                let v = rs.rows[0][0].clone();
+                                self.param_list.retain(|(k, _)| k != name);
+                                self.param_list.push((name.clone(), v));
+                            }
+                            Err(e) => self.print_error(&e.to_string()),
+                        }
+                    }
+                }
+                (Some("unset"), Some(name)) => self.param_list.retain(|(k, _)| k != name),
+                (Some("clear") | Some("init"), _) => self.param_list.clear(),
+                (Some("list"), _) | (None, _) => {
+                    let w = self
+                        .param_list
+                        .iter()
+                        .map(|(k, _)| k.len())
+                        .max()
+                        .unwrap_or(0);
+                    for (k, v) in &self.param_list {
+                        let _ = writeln!(self.out, "{k:<w$} {}", quote_value(v));
+                    }
+                }
+                _ => {
+                    self.print_error("usage: .parameter set NAME VALUE | unset NAME | list | clear")
+                }
+            },
             ".limit" => {
                 let n: u64 = args.get(2).and_then(|n| n.parse().ok()).unwrap_or(0);
                 match arg1 {
@@ -582,6 +641,19 @@ fn cell_bytes(v: &Value, null: &str) -> Vec<u8> {
     };
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
     bytes[..end].to_vec()
+}
+
+/// A value as an SQL literal.
+fn quote_value(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+        Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
+        other => other.to_text(),
+    }
 }
 
 fn json_string(s: &str) -> String {
@@ -724,6 +796,7 @@ fn main() {
         timer: false,
         bail,
         limits: Limits::default(),
+        param_list: Vec::new(),
         errors: 0,
         out: Box::new(std::io::BufWriter::new(std::io::stdout())),
     };
