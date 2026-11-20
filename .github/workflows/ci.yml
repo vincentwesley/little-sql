@@ -19,7 +19,7 @@ env:
 jobs:
   check:
     name: Format, lint, test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -40,7 +40,7 @@ jobs:
 
   score:
     name: sqllogictest sample and differential tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: check
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +53,10 @@ jobs:
           node-version: 22
       - name: Install sqlite3
         run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - name: Check the reference sqlite3 version
+        # Results are measured against sqlite3 3.45.1 (DECISIONS D25);
+        # another version changes some answers and the published reports.
+        run: sqlite3 --version | grep -q '^3\.45\.1 '
       - name: Cache the corpus sample
         uses: actions/cache@v4
         with:

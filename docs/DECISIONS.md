@@ -245,3 +245,13 @@ SQLite's for everything the evidence tests use.
   because the index could not be kept up to date.
 - `ALTER TABLE`, savepoints, `VACUUM` and `RAISE()` are not implemented;
   `VACUUM` and `ANALYZE` are accepted and do nothing.
+
+## D25. One reference sqlite3: 3.45.1
+
+Every comparison (read-mode setup, differential tests, planner output,
+write and crash checks) uses sqlite3 3.45.1, the version in Ubuntu 24.04.
+CI runs on `ubuntu-24.04` and fails early if the version differs. *Why:*
+SQLite's answers change between versions (3.46 added `%U`, `%V` and friends
+to `strftime`, for example; 3.45 returns NULL for them, as Little SQL does),
+and the published reports name their reference. A moving reference would
+make the score drift for reasons that have nothing to do with this engine.
