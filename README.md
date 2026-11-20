@@ -22,9 +22,9 @@ run the same queries through the `sqlite3` tool and compare the answers.
 |-------|-------:|-------:|----------:|
 | sqllogictest, full corpus (622 files), native mode | 5,939,879 | 0 | 100.00 % |
 | sqllogictest, full corpus (622 files), read mode | 5,729,099 | 0 | 100.00 % |
-| sqllogictest, CI sample (49 files), native mode | 323,361 | 0 | 100.00 % |
-| sqllogictest, CI sample (49 files), read mode | 240,267 | 0 | 100.00 % |
-| Differential tests against sqlite3 3.45.1 | 332 | 0 | 100.00 % |
+| sqllogictest, CI sample (622 files), native mode | 5,939,879 | 0 | 100.00 % |
+| sqllogictest, CI sample (622 files), read mode | 5,729,099 | 0 | 100.00 % |
+| Differential tests against sqlite3 3.45.1 | 424 | 0 | 100.00 % |
 <!-- results:end -->
 
 What the numbers mean:
@@ -152,7 +152,11 @@ push and keeps it as a downloadable artifact.
   and named `WINDOW`s), and JSON (`json`, `json_extract`, `->`, `->>`,
   `json_array`, `json_object`, `json_type`, `json_valid`,
   `json_array_length`, `json_quote`, `json_group_array`,
-  `json_group_object`; JSONB blobs are read too).
+  `json_group_object`, the editing functions `json_set`, `json_insert`,
+  `json_replace`, `json_remove` and `json_patch`, and the table-valued
+  `json_each` and `json_tree` in `FROM`, including correlated use such as
+  `FROM t, json_each(t.doc)`, plus `json_valid` with flags and
+  `json_error_position`; JSON5 input and JSONB blobs are read too).
 - **Semantics:** SQLite's type affinity, comparison and collation rules
   (`BINARY`, `NOCASE`, `RTRIM`), integer overflow to real, three-valued
   logic, and its exact number formatting.
@@ -170,8 +174,9 @@ push and keeps it as a downloadable artifact.
 
 ## Not supported (yet)
 
-- JSON editing and table functions (`json_set`, `json_each`, ...),
-  virtual tables, `ATTACH`, TEMP tables; `RANGE` window frames with a
+- The `jsonb_*` functions that return binary JSON (JSONB input is read),
+  virtual tables other than `json_each` / `json_tree`, `ATTACH`, TEMP
+  tables; `RANGE` window frames with a
   numeric offset and frame `EXCLUDE`.
 - Expression and partial indexes: tables with them are readable (the
   planner ignores those indexes) but Little SQL refuses to write to them.

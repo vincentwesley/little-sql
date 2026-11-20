@@ -102,6 +102,23 @@ struct Shell {
     param_list: Vec<(String, Value)>,
     errors: usize,
     out: Box<dyn Write>,
+    /// How SQL errors are reported, as sqlite3 does for each input kind.
+    style: ErrStyle,
+    /// Lines read so far from the current script, and the line on which
+    /// the pending statement buffer starts.
+    lineno: usize,
+    buf_line: usize,
+}
+
+/// Where SQL came from, which decides how sqlite3 words its errors.
+#[derive(Clone, Copy, PartialEq)]
+enum ErrStyle {
+    /// A command-line argument or `-cmd`: `Error: in prepare, ...`.
+    Arg,
+    /// Typed at the prompt: `Parse error: ...`.
+    Interactive,
+    /// Piped in or `.read`: `Parse error near line N: ...`.
+    Script,
 }
 
 /// What to do after a line of input.
@@ -129,20 +146,54 @@ impl Shell {
         eprintln!("Error: {msg}");
     }
 
+    /// Report an error from running SQL, worded as sqlite3 words it:
+    /// errors found while preparing a statement are parse errors, the rest
+    /// runtime errors. `line` is where the statement starts.
+    fn print_sql_error(&mut self, e: &littlesql::Error, line: usize) {
+        use littlesql::Error as E;
+        self.errors += 1;
+        let _ = self.out.flush();
+        let prepare = matches!(e, E::Parse(_) | E::Sql(_) | E::Unsupported(_));
+        // sqlite3 adds the result code when it is not plain SQLITE_ERROR.
+        let code = match e {
+            E::Constraint(_) | E::Raise(..) => " (19)",
+            E::Corrupt(_) => " (11)",
+            E::Io(_) => " (10)",
+            _ => "",
+        };
+        match (self.style, prepare) {
+            (ErrStyle::Arg, true) => eprintln!("Error: in prepare, {e}"),
+            (ErrStyle::Arg, false) => eprintln!("Error: stepping, {e}{code}"),
+            (ErrStyle::Interactive, true) => eprintln!("Parse error: {e}"),
+            (ErrStyle::Interactive, false) => eprintln!("Runtime error: {e}{code}"),
+            (ErrStyle::Script, true) => eprintln!("Parse error near line {line}: {e}"),
+            (ErrStyle::Script, false) => {
+                eprintln!("Runtime error near line {line}: {e}{code}")
+            }
+        }
+    }
+
     /// Run one or more SQL statements, printing each result.
     fn run_sql(&mut self, sql: &str) -> bool {
         self.db.set_limits(self.limits);
         let started = Instant::now();
         // Statements run one at a time so earlier results print even if a
         // later one fails.
+        let first_line = self.buf_line.max(1);
         let stmts = match littlesql::split_statements(sql) {
             Ok(s) => s,
             Err(e) => {
-                self.print_error(&e.to_string());
+                self.print_sql_error(&e, first_line);
                 return false;
             }
         };
+        let mut pos = 0;
         for text in stmts {
+            // The line the statement starts on, counted from the start of
+            // the buffer.
+            let start = sql[pos..].find(text.trim()).map_or(pos, |i| pos + i);
+            pos = start + text.trim().len();
+            let line = first_line + sql[..start].matches('\n').count();
             let t0 = Instant::now();
             match self.db.query_with(&text, &self.params()) {
                 Ok(rs) => {
@@ -160,7 +211,7 @@ impl Shell {
                     }
                 }
                 Err(e) => {
-                    self.print_error(&e.to_string());
+                    self.print_sql_error(&e, line);
                     return false;
                 }
             }
@@ -589,25 +640,38 @@ impl Shell {
     /// Run a whole script (as from `.read` or a pipe): dot commands on
     /// their own lines, SQL statements ending with `;`.
     fn run_script(&mut self, text: &str) -> Flow {
+        self.run_script_as(text, ErrStyle::Script)
+    }
+
+    fn run_script_as(&mut self, text: &str, style: ErrStyle) -> Flow {
+        let saved = (self.style, self.lineno, self.buf_line);
+        self.style = style;
+        self.lineno = 0;
         let mut buf = String::new();
+        let mut flow = Flow::Continue;
         for line in text.lines() {
-            match self.feed(&mut buf, line) {
-                Some(Flow::Quit) => return Flow::Quit,
-                Some(Flow::Continue) | None => {}
+            if let Some(Flow::Quit) = self.feed(&mut buf, line) {
+                flow = Flow::Quit;
+                break;
             }
         }
-        if !buf.trim().is_empty() {
+        if matches!(flow, Flow::Continue) && !buf.trim().is_empty() {
             let sql = std::mem::take(&mut buf);
             if !self.run_sql(&sql) && self.bail {
-                return Flow::Quit;
+                flow = Flow::Quit;
             }
         }
-        Flow::Continue
+        (self.style, self.lineno, self.buf_line) = saved;
+        flow
     }
 
     /// Add one line of input. Returns `None` while a statement is still
     /// incomplete.
     fn feed(&mut self, buf: &mut String, line: &str) -> Option<Flow> {
+        self.lineno += 1;
+        if buf.trim().is_empty() {
+            self.buf_line = self.lineno;
+        }
         if buf.trim().is_empty() && line.trim_start().starts_with('.') {
             buf.clear();
             return Some(self.dot(line.trim()));
@@ -799,9 +863,12 @@ fn main() {
         param_list: Vec::new(),
         errors: 0,
         out: Box::new(std::io::BufWriter::new(std::io::stdout())),
+        style: ErrStyle::Arg,
+        lineno: 0,
+        buf_line: 0,
     };
     for c in &cmds {
-        if let Flow::Quit = shell.run_script(c) {
+        if let Flow::Quit = shell.run_script_as(c, ErrStyle::Arg) {
             return;
         }
     }
@@ -825,6 +892,11 @@ fn main() {
         std::process::exit(if failed { 1 } else { 0 });
     }
     let interactive = std::io::stdin().is_terminal();
+    shell.style = if interactive {
+        ErrStyle::Interactive
+    } else {
+        ErrStyle::Script
+    };
     if interactive {
         println!(
             "Little SQL {}\nEnter \".help\" for usage hints.",

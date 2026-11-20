@@ -212,6 +212,11 @@ pub enum TableSource {
     Subquery(Box<Select>),
     /// A parenthesised join: `FROM a JOIN (b JOIN c ON ...) ON ...`.
     Nested(Vec<FromItem>),
+    /// A table-valued function: `json_each(x)`, `json_tree(x, path)`.
+    Function {
+        name: String,
+        args: Vec<Expr>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

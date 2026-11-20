@@ -110,7 +110,7 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>> {
                     continue;
                 }
                 if let Some(s) = start.take() {
-                    out.push(sql[s..t.start].to_string());
+                    out.push(sql[s..t.end].to_string());
                 }
                 in_trigger = false;
                 first_words.clear();

@@ -368,3 +368,54 @@ comparisons are BINARY equalities in one affinity class, so equality is
 transitive under SQLite's comparison rules. The derived term is an extra
 filter (DECISIONS D4: plans only narrow; every original term is still
 checked), so a derivation can never change an answer, only the plan.
+
+## D33. Table-valued functions are correlated subquery sources
+
+`json_each` and `json_tree` in FROM bind to a source whose body evaluates
+the arguments and walks the JSON, rather than to a general virtual-table
+interface. Their arguments may name FROM items to their left (`FROM t,
+json_each(t.doc)`), so they are bound with the partly built scope visible,
+the cursors they read are recorded, and the join planner only places the
+function after those items. The source is re-run for every outer row, as
+SQLite re-runs `xFilter`. The `id` column counts byte offsets in SQLite's
+binary JSON (JSONB) encoding, which Little SQL computes from the parsed
+tree rather than storing JSONB; this is exact for standard JSON (string
+escapes are kept as written, see D35) and can differ only for JSON5
+spellings such as `0x1F` or `'single quotes'`, which SQLite sizes as
+written but Little SQL stores rewritten. The first row of a
+`json_tree` that starts below the root copies SQLite's quirky key and
+path derivation exactly. Reason: one small, checked feature that answers
+the common uses (unnesting a JSON list, searching documents) without a
+virtual-table layer nothing else needs yet.
+
+## D34. The shell words SQL errors as sqlite3 does
+
+Errors found while preparing a statement are reported as parse errors and
+the rest as runtime errors, in the three forms sqlite3 uses: `Error: in
+prepare, ...` / `Error: stepping, ...` for command-line SQL and `-cmd`,
+`Parse error: ...` at the prompt, and `Parse error near line N: ...` for
+piped input and `.read`, with the result code appended for constraint,
+corruption and I/O errors. sqlite3 also prints the statement with a caret
+under the failing token; Little SQL does not track error offsets, so it
+leaves that out. Reason: scripts and people comparing the two shells see
+the same messages.
+
+## D35. JSON text keeps its escapes; JSON5 input is accepted
+
+SQLite 3.45 stores a parsed string with its escapes as written and prints
+it back the same way (`"\/"` stays `"\/"`, `"\u0041"` stays `"\u0041"`),
+decoding only when a value leaves JSON as SQL text. Little SQL's JSON tree
+does the same: a string holds its escaped body, keys are compared by
+decoded text, and values coming from SQL are escaped once. That makes
+`json()` output and json_each's byte offsets match exactly. SQLite also
+accepts JSON5 in every JSON function (unquoted keys, trailing commas,
+single quotes, hex, `.5`, `+1`, `Infinity`, `NaN`, comments, extra
+whitespace) and rewrites it as standard JSON; the parser does the same,
+including SQLite's quirks (`\v` becomes `\u0009`, any letter case of
+`inf` / `nan`). `json_valid(x, flags)` separates strict RFC 8259 text from
+JSON5, and `json_error_position` reports SQLite's error position. On
+18,000 randomly mutated inputs, validity and output matched sqlite3
+exactly, and error positions matched in about 99 % of the malformed cases
+(the rest are trailing-text and number-prefix corner cases). Reason: the
+JSON functions should give sqlite3's answers for the inputs people really
+send, which include JSON5 and escaped text.

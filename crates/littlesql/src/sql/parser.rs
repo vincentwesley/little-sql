@@ -1226,8 +1226,30 @@ impl<'a> Parser<'a> {
             } else {
                 (None, first)
             };
-            if self.is_op("(") {
-                return self.unsupported("table-valued functions");
+            if self.eat_op("(") {
+                let mut args = Vec::new();
+                if !self.is_op(")") {
+                    loop {
+                        args.push(self.expr()?);
+                        if !self.eat_op(",") {
+                            break;
+                        }
+                    }
+                }
+                self.expect_op(")")?;
+                let alias = self.opt_alias()?;
+                return Ok(FromItem {
+                    join,
+                    natural,
+                    source: TableSource::Function {
+                        name: name.to_ascii_lowercase(),
+                        args,
+                    },
+                    alias,
+                    on: None,
+                    using: Vec::new(),
+                    indexed: Indexed::Any,
+                });
             }
             TableSource::Table { schema, name }
         };
@@ -1477,6 +1499,7 @@ impl<'a> Parser<'a> {
     }
 
     fn prefix(&mut self) -> Result<Expr> {
+        let at = self.pos;
         let tok = self.advance();
         match tok {
             Tok::Num(n) => Ok(Expr::Literal(Self::number(&n))),
@@ -1610,13 +1633,13 @@ impl<'a> Parser<'a> {
                     return self.function(w);
                 }
                 if is_reserved(&w) {
-                    self.pos -= 1;
+                    self.pos = at;
                     return Err(self.unexpected());
                 }
                 self.name_tail(w, false)
             }
             _ => {
-                self.pos -= 1;
+                self.pos = at;
                 Err(self.unexpected())
             }
         }

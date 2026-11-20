@@ -146,6 +146,11 @@ pub enum Body {
     },
     /// The current row of a recursive CTE, read inside its step.
     WorkTable(usize),
+    /// `json_each(args)` or `json_tree(args)` (`tree`).
+    TableFn {
+        tree: bool,
+        args: Vec<Expr>,
+    },
 }
 
 pub enum KeySrc {
@@ -647,6 +652,18 @@ pub fn explain_query(q: &Query, depth: usize, out: &mut Vec<PlanLine>) {
                     query, correlated, ..
                 } = &s.kind
                 {
+                    if let Body::TableFn { args, .. } = &query.body {
+                        // SQLite's idxNum: bit 0 for the JSON argument,
+                        // bit 1 for the root path.
+                        let idx = if args.len() == 2 { 3 } else { 1 };
+                        out.push(PlanLine {
+                            depth,
+                            text: format!("SCAN {} VIRTUAL TABLE INDEX {idx}:", s.name),
+                            cursor: Some(s.cursor),
+                        });
+                        explain_exprs(s.on_filters.iter().chain(s.filters.iter()), depth, out);
+                        continue;
+                    }
                     let how = if *correlated {
                         "CO-ROUTINE"
                     } else {
@@ -751,7 +768,7 @@ pub fn explain_query(q: &Query, depth: usize, out: &mut Vec<PlanLine>) {
             });
             explain_query(step, depth + 1, out);
         }
-        Body::WorkTable(_) => {}
+        Body::WorkTable(_) | Body::TableFn { .. } => {}
     }
     if !q.order_by.is_empty() {
         out.push(PlanLine {

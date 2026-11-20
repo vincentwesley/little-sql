@@ -25,6 +25,9 @@ struct ScopeCol {
     /// Hidden from `*` and from unqualified lookups: the right-hand copy of
     /// a column merged by USING or NATURAL.
     hidden: bool,
+    /// Left out of `*` and NATURAL joins but nameable: the hidden columns
+    /// of a table-valued function.
+    nostar: bool,
 }
 
 struct ScopeSource {
@@ -94,6 +97,9 @@ struct Item {
     left_join: bool,
     ncols: usize,
     indexed: ast::Indexed,
+    /// Cursors of this query's other FROM items that this one reads (the
+    /// arguments of a table-valued function); it must run inside them.
+    deps: Vec<usize>,
 }
 
 struct Conj {
@@ -542,6 +548,7 @@ impl<'a> Binder<'a> {
                     aff: c.affinity,
                     coll: c.collation,
                     hidden: false,
+                    nostar: false,
                 })
                 .collect(),
             rowid: if table.without_rowid {
@@ -558,6 +565,7 @@ impl<'a> Binder<'a> {
                 left_join: false,
                 ncols,
                 indexed: ast::Indexed::Any,
+                deps: Vec::new(),
             },
             src,
         )
@@ -589,6 +597,7 @@ impl<'a> Binder<'a> {
                 aff: c.aff,
                 coll: c.coll,
                 hidden: false,
+                nostar: false,
             })
             .collect();
         let src = ScopeSource {
@@ -613,6 +622,7 @@ impl<'a> Binder<'a> {
             left_join: false,
             ncols,
             indexed: ast::Indexed::Any,
+            deps: Vec::new(),
         };
         Ok((item, src))
     }
@@ -732,7 +742,71 @@ impl<'a> Binder<'a> {
                 Err(Error::Sql(format!("no such table: {name}")))
             }
             TableSource::Nested(_) => unreachable!("nested joins are flattened by the caller"),
+            TableSource::Function { .. } => unreachable!("table functions are bound by the caller"),
         }
+    }
+
+    /// A table-valued function in FROM (`json_each`, `json_tree`). Its
+    /// arguments may read the FROM items to its left, so they are bound with
+    /// the scope built so far visible; the source is re-evaluated for each
+    /// row of the items it reads.
+    fn table_function(
+        &mut self,
+        fi: &FromItem,
+        name: &str,
+        args: &[ast::Expr],
+        scope: &mut Scope,
+    ) -> Result<(Item, ScopeSource)> {
+        let tree = match lower(name).as_str() {
+            "json_each" => false,
+            "json_tree" => true,
+            _ => return Err(Error::Sql(format!("no such table: {name}"))),
+        };
+        if args.is_empty() || args.len() > 2 {
+            return Err(Error::Sql(format!(
+                "wrong number of arguments to function {}()",
+                lower(name)
+            )));
+        }
+        let mark = self.refs.len();
+        self.scopes.push(std::mem::take(scope));
+        let bound: Result<Vec<Expr>> = args.iter().map(|a| self.bind_expr(a)).collect();
+        *scope = self.scopes.pop().unwrap();
+        let bound = bound?;
+        let deps: Vec<usize> = {
+            let mut d: Vec<usize> = self.refs[mark..]
+                .iter()
+                .copied()
+                .filter(|c| scope.sources.iter().any(|s| s.cursor == *c))
+                .collect();
+            d.sort_unstable();
+            d.dedup();
+            d
+        };
+        let correlated = !self.refs[mark..].is_empty();
+        let cols = crate::json::TABLE_COLUMNS
+            .iter()
+            .map(|n| ColInfo {
+                name: n.to_string(),
+                aff: Affinity::Blob,
+                coll: Collation::Binary,
+            })
+            .collect();
+        let q = Query {
+            body: Body::TableFn { tree, args: bound },
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            cols,
+        };
+        let alias = fi.alias.clone().unwrap_or_else(|| lower(name));
+        let (mut item, mut src) = self.query_source(q, correlated, &alias, &[])?;
+        for c in src.cols.iter_mut().skip(8) {
+            c.nostar = true;
+        }
+        src.rowid = Some(10);
+        item.deps = deps;
+        Ok((item, src))
     }
 
     /// Merge a simple view or FROM-subquery into the enclosing query (as
@@ -873,7 +947,7 @@ impl<'a> Binder<'a> {
                                 continue;
                             }
                             for (ci, c) in src.cols.iter().enumerate() {
-                                if c.hidden && want.is_none() {
+                                if (c.hidden && want.is_none()) || c.nostar {
                                     continue;
                                 }
                                 let before = self.used.clone();
@@ -930,6 +1004,7 @@ impl<'a> Binder<'a> {
                 aff: affinity(e),
                 coll: collation(e).map_or(Collation::Binary, |c| c.0),
                 hidden: false,
+                nostar: false,
             })
             .collect();
         Ok(Some(ScopeSource {
@@ -1013,6 +1088,32 @@ impl<'a> Binder<'a> {
                 continue;
             }
             let has_right = list.iter().any(|f| f.join == JoinKind::Right);
+            if let TableSource::Function { name, args } = &fi.source {
+                if has_right {
+                    return Err(Error::Unsupported(
+                        "a table-valued function in a RIGHT JOIN".into(),
+                    ));
+                }
+                let (mut item, src) = self.table_function(fi, name, args, scope)?;
+                let idx = items.len();
+                let mut left_on = None;
+                match fi.join {
+                    JoinKind::Inner => {}
+                    JoinKind::Left => {
+                        item.left_join = true;
+                        left_on = Some(idx);
+                    }
+                    _ => return Err(Error::Unsupported("this join with a table function".into())),
+                }
+                items.push(item);
+                scope.sources.push(src);
+                let last = scope.sources.len() - 1;
+                self.join_columns(fi, scope, last, left_on, bound)?;
+                if let Some(on) = &fi.on {
+                    on_asts.push((on.clone(), left_on));
+                }
+                continue;
+            }
             if !has_right {
                 if let Some(src) = self.try_flatten(fi, items, bound)? {
                     scope.sources.push(src);
@@ -1084,7 +1185,7 @@ impl<'a> Binder<'a> {
                     scope.sources[..right].iter().any(|s| {
                         s.cols
                             .iter()
-                            .any(|l| !l.hidden && l.name.eq_ignore_ascii_case(&c.name))
+                            .any(|l| !l.hidden && !l.nostar && l.name.eq_ignore_ascii_case(&c.name))
                     })
                 })
                 .map(|c| c.name.clone())
@@ -1215,7 +1316,7 @@ impl<'a> Binder<'a> {
                         }
                         any = true;
                         for (ci, c) in src.cols.iter().enumerate() {
-                            if c.hidden && want.is_none() {
+                            if (c.hidden && want.is_none()) || c.nostar {
                                 continue;
                             }
                             results.push(self.make_col(src, ci));
@@ -1944,7 +2045,15 @@ impl<'a> Binder<'a> {
         let wrapped: Vec<ast::Expr>;
         let args = if matches!(
             name,
-            "json_array" | "json_object" | "json_group_array" | "json_group_object" | "json_quote"
+            "json_array"
+                | "json_object"
+                | "json_group_array"
+                | "json_group_object"
+                | "json_quote"
+                | "json_set"
+                | "json_insert"
+                | "json_replace"
+                | "json_patch"
         ) {
             wrapped = args.iter().map(json_arg).collect();
             &wrapped[..]
@@ -2591,7 +2700,15 @@ impl<'a> Binder<'a> {
         let reorder = n > 1 && !items.iter().any(|i| i.left_join);
         for step in 0..n {
             let candidates: Vec<usize> = if reorder {
-                (0..n).filter(|i| !placed[*i]).collect()
+                (0..n)
+                    .filter(|i| {
+                        !placed[*i]
+                            && items[*i]
+                                .deps
+                                .iter()
+                                .all(|c| local.get(c).is_none_or(|j| placed[*j]))
+                    })
+                    .collect()
             } else {
                 vec![step]
             };
@@ -2769,7 +2886,8 @@ fn json_arg(a: &ast::Expr) -> ast::Expr {
     };
     let tag = match name.as_str() {
         "json" | "json_array" | "json_object" | "json_quote" | "->" | "json_group_array"
-        | "json_group_object" => "json_sub",
+        | "json_group_object" | "json_set" | "json_insert" | "json_replace" | "json_remove"
+        | "json_patch" => "json_sub",
         "json_extract" => "json_sub_container",
         _ => return a.clone(),
     };
@@ -2788,12 +2906,18 @@ fn intern(name: &str) -> &'static str {
         "raise",
         "json",
         "json_valid",
+        "json_error_position",
         "json_type",
         "json_extract",
         "json_array",
         "json_object",
         "json_array_length",
         "json_quote",
+        "json_set",
+        "json_insert",
+        "json_replace",
+        "json_remove",
+        "json_patch",
         "->",
         "->>",
         "json_sub",
@@ -2917,6 +3041,7 @@ fn select_mentions(sel: &ast::Select, table: &str) -> bool {
             TableSource::Table { name, .. } => name.eq_ignore_ascii_case(t),
             TableSource::Subquery(s) => body(&s.body, t),
             TableSource::Nested(n) => from(n, t),
+            TableSource::Function { .. } => false,
         })
     }
     body(&sel.body, table)

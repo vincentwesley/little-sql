@@ -84,13 +84,24 @@ pub fn lookup_scalar(name: &str, nargs: usize) -> Result<Option<ScalarFn>> {
         ("datetime", 0, N, crate::datetime::f_datetime),
         ("raise", 2, 2, f_raise),
         ("json", 1, 1, crate::json::f_json),
-        ("json_valid", 1, 1, crate::json::f_json_valid),
+        ("json_valid", 1, 2, crate::json::f_json_valid),
+        (
+            "json_error_position",
+            1,
+            1,
+            crate::json::f_json_error_position,
+        ),
         ("json_type", 1, 2, crate::json::f_json_type),
         ("json_extract", 2, N, crate::json::f_json_extract),
         ("json_array", 0, N, crate::json::f_json_array),
         ("json_object", 0, N, crate::json::f_json_object),
         ("json_array_length", 1, 2, crate::json::f_json_array_length),
         ("json_quote", 1, 1, crate::json::f_json_quote),
+        ("json_set", 1, N, crate::json::f_json_set),
+        ("json_insert", 1, N, crate::json::f_json_insert),
+        ("json_replace", 1, N, crate::json::f_json_replace),
+        ("json_remove", 1, N, crate::json::f_json_remove),
+        ("json_patch", 2, 2, crate::json::f_json_patch),
         ("->", 2, 2, crate::json::f_arrow),
         ("->>", 2, 2, crate::json::f_arrow2),
         ("json_sub", 1, 1, crate::json::f_json_sub),
@@ -1210,7 +1221,7 @@ impl AggState {
             // NULLs are kept (as JSON null); errors surface at finish.
             let mut item = String::new();
             if self.func == AggFunc::JsonGroupObject {
-                crate::json::write(&crate::json::J::Str(args[0].to_text()), &mut item);
+                crate::json::write(&crate::json::text(&args[0].to_text()), &mut item);
                 item.push(':');
             }
             let last = args.last().unwrap();

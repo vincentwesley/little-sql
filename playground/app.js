@@ -87,6 +87,16 @@ FROM (SELECT t.region, t.name, count(*) AS n
 GROUP BY region;`,
   },
   {
+    title: "json_each: a JSON list as a table",
+    sql: `SELECT j.value AS flat_type,
+       count(s.price) AS sales,
+       round(avg(s.price)) AS avg_price
+FROM json_each('["3 ROOM", "4 ROOM", "5 ROOM", "EXECUTIVE"]') AS j
+LEFT JOIN sales s ON s.flat_type = j.value AND s.month >= '2026-01'
+GROUP BY j.key
+ORDER BY j.key;`,
+  },
+  {
     title: "Recursive CTE: monthly sales with gaps filled",
     sql: `WITH RECURSIVE months(m) AS (
   SELECT '2025-01'

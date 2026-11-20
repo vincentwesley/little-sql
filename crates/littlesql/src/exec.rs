@@ -543,6 +543,19 @@ impl<'a> Exec<'a> {
                 }
                 Ok(())
             }
+            Body::TableFn { tree, args } => {
+                let vals = args
+                    .iter()
+                    .map(|e| self.eval(e))
+                    .collect::<Result<Vec<_>>>()?;
+                for row in crate::json::table_rows(*tree, &vals)? {
+                    let keys = result_keys(&row);
+                    if !emit(row, keys)? {
+                        break;
+                    }
+                }
+                Ok(())
+            }
             Body::WorkTable(id) => match self.work.get(id).cloned() {
                 Some(row) => {
                     let keys = result_keys(&row);
