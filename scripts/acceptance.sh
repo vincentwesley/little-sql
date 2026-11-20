@@ -10,7 +10,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 # Milestones whose checks exist. Extend as milestones land.
-IMPLEMENTED=(M0 M1 M2 M3 M4 M5 M7 M8)
+IMPLEMENTED=(M0 M1 M2 M3 M4 M5 M7 M8 M9)
 UPTO="${1:-${IMPLEMENTED[-1]}}"
 
 SCRATCH="$(mktemp -d)"

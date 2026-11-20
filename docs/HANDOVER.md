@@ -2,9 +2,9 @@
 
 Updated after every milestone so a new session can continue from here.
 
-## Status (after M8, 2026-11-20)
+## Status (after M9, 2026-11-20)
 
-M0–M5, M7 and M8 are done: `scripts/acceptance.sh` passes all 18 checks.
+M0–M5 and M7–M9 are done: `scripts/acceptance.sh` passes all 19 checks.
 
 | Suite | Passed | Failed | Rate |
 |-------|-------:|-------:|-----:|
@@ -12,7 +12,7 @@ M0–M5, M7 and M8 are done: `scripts/acceptance.sh` passes all 18 checks.
 | sqllogictest full corpus, read mode | 5,729,099 | 0 | 100.00 % |
 | sqllogictest CI sample, native mode | 323,361 | 0 | 100.00 % |
 | sqllogictest CI sample, read mode | 240,267 | 0 | 100.00 % |
-| Differential (14 files, 5 fixtures) | 252 | 6 | 97.67 % |
+| Differential (15 files, 5 fixtures) | 267 | 6 | 97.80 % |
 | Planner: plans identical to sqlite3's EQP | 29 | 0 | — |
 
 The six differential failures are known gaps (window functions ×5,
@@ -52,13 +52,16 @@ JSON ×1), marked `-- known-failure:` and still counted.
 
 ## Next steps, in order
 
-1. M9 performance: `scripts/bench.sh [--quick]` (timings vs sqlite3 on the
-   demo DB and generated data), profile and fix the worst cases; add M9 to
-   `IMPLEMENTED` in `scripts/acceptance.sh`.
-2. Optional features: window functions (the 5 known differential
-   failures), JSON functions, ALTER TABLE.
-3. M10: fresh-clone acceptance run, stranger review of README / CLI /
+1. M10: fresh-clone acceptance run, stranger review of README / CLI /
    playground, final HANDOVER lists, one PR for the whole project.
+2. Optional, if time allows: window functions (the 5 known differential
+   failures), JSON functions, ALTER TABLE, transitive constant propagation
+   in the planner (see Known issues).
+
+## Performance (M9)
+
+`scripts/bench.sh` (table in README and `results/bench.md`): reads 1–7×
+sqlite3, writes about 5–6.5×. What was done and why: DECISIONS D26.
 
 ## Playground (M5)
 
@@ -88,4 +91,9 @@ The full-corpus report is produced with
   the corpus `test/` directory as the root.
 - Join order is greedy; it can pick a worse order than SQLite's for 3+
   table joins with skewed sizes (results are still correct).
+- No transitive constant propagation: `o.customer_id = 17 AND c.id =
+  o.customer_id` does not derive `c.id = 17`, so SQLite sometimes starts a
+  join from a different table. GROUP BY over a join can also pick an index
+  order where SQLite sorts. Both are valid plans; they are left out of the
+  plan-equality suite.
 - The CLI has no line editing (no dependencies); use `rlwrap` if wanted.

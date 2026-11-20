@@ -34,6 +34,12 @@ struct ScopeSource {
     cols: Vec<ScopeCol>,
     /// Column index that yields the rowid, for tables that have one.
     rowid: Option<usize>,
+    /// For a flattened view or subquery: each column is this expression
+    /// over the inner query's (now merged) sources.
+    virt: Option<Vec<Expr>>,
+    /// For each virtual column, the (cursor, column) pairs it reads; they
+    /// are marked as used only when the column itself is used.
+    virt_used: Vec<Vec<(usize, usize)>>,
 }
 
 #[derive(Default)]
@@ -123,6 +129,9 @@ pub struct Binder<'a> {
     view_depth: usize,
     /// Nesting depth of SELECTs being bound.
     query_depth: usize,
+    /// Set when the last name resolved to a flattened view's column (its
+    /// name, for naming result columns).
+    virt_hit: Option<String>,
     /// INDEXED BY / NOT INDEXED, by cursor.
     indexed: HashMap<usize, ast::Indexed>,
     work_tables: Vec<WorkDef>,
@@ -218,6 +227,7 @@ impl<'a> Binder<'a> {
             aggs: Vec::new(),
             view_depth: 0,
             query_depth: 0,
+            virt_hit: None,
             indexed: HashMap::new(),
             work_tables: Vec::new(),
             next_work: 0,
@@ -474,6 +484,8 @@ impl<'a> Binder<'a> {
         let cursor = self.new_cursor(ncols + 1);
         let name = alias.unwrap_or(&table.name).to_string();
         let src = ScopeSource {
+            virt_used: Vec::new(),
+            virt: None,
             cursor,
             name: lower(&name),
             cols: table
@@ -534,6 +546,8 @@ impl<'a> Binder<'a> {
             })
             .collect();
         let src = ScopeSource {
+            virt_used: Vec::new(),
+            virt: None,
             cursor,
             name: lower(name),
             cols,
@@ -675,7 +689,240 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Merge a simple view or FROM-subquery into the enclosing query (as
+    /// SQLite's query flattener does) instead of materializing it: its
+    /// FROM items join the outer ones, its WHERE terms become outer terms,
+    /// and its columns become expressions over its tables. Returns None,
+    /// with nothing changed, when the subquery's shape does not allow it.
+    fn try_flatten(
+        &mut self,
+        fi: &FromItem,
+        items: &mut Vec<Item>,
+        bound: &mut Vec<(Expr, Option<usize>)>,
+    ) -> Result<Option<ScopeSource>> {
+        if fi.join != JoinKind::Inner {
+            return Ok(None);
+        }
+        let (sel, name, rename, keep_scopes, keep_ctes) = match &fi.source {
+            TableSource::Subquery(s) => (
+                Rc::new(s.as_ref().clone()),
+                fi.alias.clone().unwrap_or_default(),
+                Vec::new(),
+                self.scopes.len(),
+                self.ctes.len(),
+            ),
+            TableSource::Table { schema: None, name } => {
+                let lname = lower(name);
+                if self.ctes.iter().any(|c| c.name == lname)
+                    || self.work_tables.iter().any(|w| w.name == lname)
+                    || self.schema.table(name).is_some()
+                {
+                    return Ok(None);
+                }
+                match self.schema.view(name) {
+                    Some(v) => (
+                        Rc::new(v.select.clone()),
+                        fi.alias.clone().unwrap_or_else(|| v.name.clone()),
+                        v.columns.clone(),
+                        0,
+                        0,
+                    ),
+                    None => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        if !sel.with.is_empty()
+            || !sel.order_by.is_empty()
+            || sel.limit.is_some()
+            || sel.offset.is_some()
+        {
+            return Ok(None);
+        }
+        let SelectBody::Core(core) = &sel.body else {
+            return Ok(None);
+        };
+        if core.distinct
+            || !core.group_by.is_empty()
+            || core.having.is_some()
+            || core.from.is_empty()
+            || !flat_from(&core.from)
+        {
+            return Ok(None);
+        }
+        if self.view_depth > 50 {
+            return Ok(None);
+        }
+        let (mark_items, mark_bound) = (items.len(), bound.len());
+        let saved_scopes = self.scopes.split_off(keep_scopes.min(self.scopes.len()));
+        let saved_ctes = self.ctes.split_off(keep_ctes.min(self.ctes.len()));
+        let saved_aggs = std::mem::take(&mut self.aggs);
+        self.view_depth += 1;
+        let attempt = self.flatten_body(core, items, bound, &rename, &name);
+        self.view_depth -= 1;
+        self.scopes.extend(saved_scopes);
+        self.ctes.extend(saved_ctes);
+        self.aggs = saved_aggs;
+        match attempt {
+            Ok(Some(src)) => Ok(Some(src)),
+            // Not flattenable after all, or an error the ordinary path will
+            // report: undo and fall back.
+            _ => {
+                items.truncate(mark_items);
+                bound.truncate(mark_bound);
+                Ok(None)
+            }
+        }
+    }
+
+    fn flatten_body(
+        &mut self,
+        core: &ast::SelectCore,
+        items: &mut Vec<Item>,
+        bound: &mut Vec<(Expr, Option<usize>)>,
+        rename: &[String],
+        name: &str,
+    ) -> Result<Option<ScopeSource>> {
+        let mut inner_scope = Scope::default();
+        let mut inner_on = Vec::new();
+        self.bind_from(&core.from, items, &mut inner_scope, &mut inner_on, bound)?;
+        self.scopes.push(inner_scope);
+        self.aggs.push(AggFrame {
+            slot: 0,
+            calls: Vec::new(),
+            allowed: true,
+        });
+        type Bound = (Vec<Expr>, Vec<String>, Vec<Vec<(usize, usize)>>);
+        let result = (|| -> Result<Bound> {
+            for (on, left_on) in &inner_on {
+                let mut parts = Vec::new();
+                split_and(on, &mut parts);
+                for p in parts {
+                    bound.push((self.bind_expr(p)?, *left_on));
+                }
+            }
+            if let Some(w) = &core.where_ {
+                let mut parts = Vec::new();
+                split_and(w, &mut parts);
+                for p in parts {
+                    bound.push((self.bind_expr(p)?, None));
+                }
+            }
+            let mut exprs = Vec::new();
+            let mut names = Vec::new();
+            let mut reads = Vec::new();
+            for rc in &core.columns {
+                match rc {
+                    ResultColumn::Star | ResultColumn::TableStar(_) => {
+                        let want = match rc {
+                            ResultColumn::TableStar(t) => Some(lower(t)),
+                            _ => None,
+                        };
+                        let scope = self.scopes.pop().unwrap();
+                        for src in &scope.sources {
+                            if want.as_ref().is_some_and(|w| *w != src.name) {
+                                continue;
+                            }
+                            for (ci, c) in src.cols.iter().enumerate() {
+                                if c.hidden && want.is_none() {
+                                    continue;
+                                }
+                                let before = self.used.clone();
+                                exprs.push(self.make_col(src, ci));
+                                reads.push(self.take_new_uses(&before));
+                                names.push(c.name.clone());
+                            }
+                        }
+                        self.scopes.push(scope);
+                    }
+                    ResultColumn::Expr { expr, alias, text } => {
+                        self.virt_hit = None;
+                        let before = self.used.clone();
+                        let e = self.bind_expr(expr)?;
+                        reads.push(self.take_new_uses(&before));
+                        let virt_name = self.virt_hit.take();
+                        names.push(match (alias, expr) {
+                            (Some(a), _) => a.clone(),
+                            (None, ast::Expr::Name { .. }) if virt_name.is_some() => {
+                                virt_name.unwrap()
+                            }
+                            (None, ast::Expr::Name { name, .. }) => match &e {
+                                Expr::Col { cur, col, .. } => {
+                                    self.column_name(*cur, *col).unwrap_or_else(|| name.clone())
+                                }
+                                _ => name.clone(),
+                            },
+                            _ => text.clone(),
+                        });
+                        exprs.push(e);
+                    }
+                }
+            }
+            Ok((exprs, names, reads))
+        })();
+        let frame = self.aggs.pop().unwrap();
+        self.scopes.pop();
+        let (exprs, mut names, reads) = result?;
+        if !frame.calls.is_empty() || exprs.is_empty() {
+            return Ok(None);
+        }
+        if !rename.is_empty() {
+            if rename.len() != exprs.len() {
+                return Ok(None);
+            }
+            names = rename.to_vec();
+        }
+        let cols = names
+            .into_iter()
+            .zip(&exprs)
+            .map(|(n, e)| ScopeCol {
+                name: n,
+                aff: affinity(e),
+                coll: collation(e).map_or(Collation::Binary, |c| c.0),
+                hidden: false,
+            })
+            .collect();
+        Ok(Some(ScopeSource {
+            cursor: usize::MAX,
+            name: lower(name),
+            cols,
+            rowid: None,
+            virt: Some(exprs),
+            virt_used: reads,
+        }))
+    }
+
+    /// The (cursor, column) uses added since `before`, which are undone.
+    fn take_new_uses(&mut self, before: &[Vec<bool>]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (c, cols) in self.used.iter_mut().enumerate() {
+            for (k, u) in cols.iter_mut().enumerate() {
+                let was = before
+                    .get(c)
+                    .and_then(|b| b.get(k))
+                    .copied()
+                    .unwrap_or(false);
+                if *u && !was {
+                    out.push((c, k));
+                    *u = false;
+                }
+            }
+        }
+        out
+    }
+
     fn make_col(&mut self, src: &ScopeSource, col: usize) -> Expr {
+        if let Some(v) = &src.virt {
+            let e = v[col].clone();
+            for (c, k) in &src.virt_used[col] {
+                self.used[*c][*k] = true;
+            }
+            let mut r = Vec::new();
+            refs(&e, &mut r);
+            self.refs.extend(r);
+            self.virt_hit = src.cols.get(col).map(|c| c.name.clone());
+            return e;
+        }
         self.refs.push(src.cursor);
         self.used[src.cursor][col] = true;
         match src.cols.get(col) {
@@ -714,6 +961,18 @@ impl<'a> Binder<'a> {
                     on_asts.push((on.clone(), None));
                 }
                 continue;
+            }
+            let has_right = list.iter().any(|f| f.join == JoinKind::Right);
+            if !has_right {
+                if let Some(src) = self.try_flatten(fi, items, bound)? {
+                    scope.sources.push(src);
+                    let last = scope.sources.len() - 1;
+                    self.join_columns(fi, scope, last, None, bound)?;
+                    if let Some(on) = &fi.on {
+                        on_asts.push((on.clone(), None));
+                    }
+                    continue;
+                }
             }
             let (mut item, src) = self.resolve_source(fi)?;
             let idx = items.len();
@@ -919,9 +1178,12 @@ impl<'a> Binder<'a> {
                     }
                 }
                 ResultColumn::Expr { expr, alias, text } => {
+                    self.virt_hit = None;
                     let e = self.bind_expr(expr)?;
+                    let virt_name = self.virt_hit.take();
                     let name = match (alias, expr) {
                         (Some(a), _) => a.clone(),
+                        (None, ast::Expr::Name { .. }) if virt_name.is_some() => virt_name.unwrap(),
                         (None, ast::Expr::Name { name, .. }) => match &e {
                             Expr::Col { cur, col, .. } => {
                                 self.column_name(*cur, *col).unwrap_or_else(|| name.clone())
@@ -2266,6 +2528,18 @@ fn leftmost_columns(body: &SelectBody) -> Vec<Option<ast::Expr>> {
         SelectBody::Values(_) => Vec::new(),
         SelectBody::Compound { left, .. } => leftmost_columns(left),
     }
+}
+
+/// Can a FROM list be merged into an enclosing query: only plain (inner)
+/// joins of tables, views and subqueries.
+fn flat_from(items: &[FromItem]) -> bool {
+    items.iter().all(|i| {
+        i.join == JoinKind::Inner
+            && match &i.source {
+                TableSource::Nested(n) => flat_from(n),
+                _ => true,
+            }
+    })
 }
 
 /// Does the FROM clause of `sel` (at any depth of compound) name `table`?

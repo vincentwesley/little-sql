@@ -66,6 +66,29 @@ pub struct KeyOrder {
 }
 
 impl KeyOrder {
+    /// `fields` against a stored record, on the first `n` fields.
+    fn compare_stored(
+        &self,
+        fields: &[Value],
+        payload: &[u8],
+        n: usize,
+        enc: TextEncoding,
+    ) -> Result<Ordering> {
+        let n = n.min(fields.len());
+        crate::record::compare_record_key(
+            payload,
+            fields,
+            n,
+            &|i| {
+                self.fields
+                    .get(i)
+                    .copied()
+                    .unwrap_or((Collation::Binary, false))
+            },
+            enc,
+        )
+    }
+
     fn compare(&self, a: &[Value], b: &[Value], n: usize) -> Ordering {
         for i in 0..n {
             let (x, y) = (a.get(i), b.get(i));
@@ -89,6 +112,15 @@ impl KeyOrder {
     }
 }
 
+/// Outcome of an attempt to change a page in place.
+enum InPlace {
+    Done,
+    /// The key is not in the tree.
+    Missing,
+    /// The general path is needed.
+    NotDone,
+}
+
 /// What an insert or delete is looking for.
 pub enum Key<'k> {
     Rowid(i64),
@@ -104,6 +136,8 @@ pub enum Key<'k> {
 /// The b-tree writer for one pager.
 pub struct Writer<'p> {
     pager: &'p Pager,
+    /// The insert being stored went at the very end of its leaf.
+    append: std::cell::Cell<bool>,
     usable: usize,
     enc: TextEncoding,
 }
@@ -121,6 +155,7 @@ impl<'p> Writer<'p> {
     pub fn new(pager: &'p Pager) -> Writer<'p> {
         Writer {
             pager,
+            append: std::cell::Cell::new(false),
             usable: pager.usable_size(),
             enc: pager.encoding(),
         }
@@ -464,6 +499,93 @@ impl<'p> Writer<'p> {
     }
 
     fn insert(&self, root: u32, key: &Key, cell: Vec<u8>, replace: bool) -> Result<()> {
+        // Most inserts land in a leaf with room to spare: add the cell to
+        // the page bytes directly. Everything else (splits, replacing an
+        // existing key) takes the general path below.
+        if self.try_insert_in_place(root, key, &cell)? {
+            return Ok(());
+        }
+        self.insert_general(root, key, cell, replace)
+    }
+
+    /// Key comparison against cell `i` of a page, without decoding the
+    /// page into a [`Node`].
+    fn compare_on_page(&self, key: &Key, page: &PageRef, i: usize) -> Result<Ordering> {
+        let off = page.cell_offset(i)?;
+        let kind = page.kind();
+        match key {
+            Key::Rowid(r) => {
+                let d = &page.data[off..];
+                let rowid = match kind {
+                    INTERIOR_TABLE => read_varint(&d[4..]).0 as i64,
+                    _ => {
+                        let (_, n) = read_varint(d);
+                        read_varint(&d[n..]).0 as i64
+                    }
+                };
+                Ok(r.cmp(&rowid))
+            }
+            Key::Entry { fields, order, n } => {
+                let cell = parse_cell(&page.data, off, kind, self.usable)?;
+                let payload = read_payload(self.pager, page, &cell)?;
+                order.compare_stored(fields, payload.as_slice(), *n, self.enc)
+            }
+        }
+    }
+
+    fn search_page(&self, page: &PageRef, key: &Key) -> Result<(usize, bool)> {
+        let (mut lo, mut hi) = (0, page.ncells());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.compare_on_page(key, page, mid)? {
+                Ordering::Greater => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        let eq = lo < page.ncells() && self.compare_on_page(key, page, lo)? == Ordering::Equal;
+        Ok((lo, eq))
+    }
+
+    /// Insert a new cell into its leaf if the leaf's free gap can hold it.
+    /// Returns false (having changed nothing) when the general path is
+    /// needed.
+    fn try_insert_in_place(&self, root: u32, key: &Key, cell: &[u8]) -> Result<bool> {
+        let mut pgno = root;
+        for _ in 0..40 {
+            let page = PageRef::load(self.pager, pgno)?;
+            let (i, eq) = self.search_page(&page, key)?;
+            if eq && (page.is_leaf() || page.is_index()) {
+                return Ok(false);
+            }
+            if !page.is_leaf() {
+                pgno = page.child(i)?;
+                continue;
+            }
+            let hdr = page.hdr();
+            let n = page.ncells();
+            let ptrs = page.cell_array();
+            let mut content = be16(&page.data, hdr + 5);
+            if content == 0 {
+                content = 65536;
+            }
+            let gap = content.saturating_sub(ptrs + 2 * n);
+            if gap < cell.len() + 2 || content > self.usable {
+                return Ok(false);
+            }
+            let mut buf = page.data.to_vec();
+            let start = content - cell.len();
+            buf[start..content].copy_from_slice(cell);
+            buf.copy_within(ptrs + 2 * i..ptrs + 2 * n, ptrs + 2 * i + 2);
+            buf[ptrs + 2 * i..ptrs + 2 * i + 2].copy_from_slice(&(start as u16).to_be_bytes());
+            buf[hdr + 3..hdr + 5].copy_from_slice(&((n + 1) as u16).to_be_bytes());
+            buf[hdr + 5..hdr + 7].copy_from_slice(&(start as u16).to_be_bytes());
+            self.pager.write_page(pgno, buf)?;
+            return Ok(true);
+        }
+        corrupt("b-tree is deeper than any valid database allows")
+    }
+
+    fn insert_general(&self, root: u32, key: &Key, cell: Vec<u8>, replace: bool) -> Result<()> {
         let mut path: Vec<(Node, usize)> = Vec::new();
         let mut node = self.read_node(root)?;
         loop {
@@ -487,7 +609,10 @@ impl<'p> Writer<'p> {
             }
             if node.is_leaf() {
                 node.cells.insert(i, cell);
-                return self.store(path, node, root);
+                self.append.set(i + 1 == node.cells.len());
+                let r = self.store(path, node, root);
+                self.append.set(false);
+                return r;
             }
             let child = node.child(i);
             path.push((node, i));
@@ -525,35 +650,22 @@ impl<'p> Writer<'p> {
         // Leaves of table b-trees copy the divider key; every other kind
         // moves a cell up into the parent.
         let consumes = kind != LEAF_TABLE;
-        let mut groups: Vec<Vec<Vec<u8>>> = vec![Vec::new()];
-        let mut dividers: Vec<Vec<u8>> = Vec::new();
-        let mut used = 0;
-        let mut it = cells.into_iter().peekable();
-        while let Some(c) = it.next() {
-            let need = c.len() + 2;
-            let cur = groups.last_mut().unwrap();
-            if used + need <= cap || cur.is_empty() {
-                used += need;
-                cur.push(c);
-                continue;
-            }
-            if consumes {
-                if it.peek().is_none() {
-                    // The last cell cannot be a divider (nothing would be
-                    // left for the last page); use the previous one.
-                    let prev = cur.pop().unwrap();
-                    dividers.push(prev);
-                    groups.push(vec![c]);
-                } else {
-                    dividers.push(c);
-                    groups.push(Vec::new());
-                }
-                used = 0;
-            } else {
-                dividers.push(Vec::new());
-                groups.push(vec![c]);
-                used = need;
-            }
+        // Appending at the end: fill each page completely (the remainder
+        // goes on, and the next appends fill it). Elsewhere: split evenly,
+        // so that random inserts do not leave a trail of near-empty pages.
+        let total: usize = cells.iter().map(|c| c.len() + 2).sum();
+        let even = (total / total.div_ceil(cap).max(2) + 1).min(cap);
+        let first = if self.append.get() { cap } else { even };
+        let (mut groups, mut dividers) = Self::pack(&cells, first, consumes);
+        if groups
+            .last()
+            .unwrap()
+            .iter()
+            .map(|c| c.len() + 2)
+            .sum::<usize>()
+            > cap
+        {
+            (groups, dividers) = Self::pack(&cells, cap, consumes);
         }
         let n_new = if all_new {
             groups.len()
@@ -601,6 +713,44 @@ impl<'p> Writer<'p> {
             self.write_node(node)?;
         }
         Ok(parent_cells)
+    }
+
+    /// Group cells into pages of at most `limit` bytes (cells plus their
+    /// pointers). For kinds that move a divider up, the cell between two
+    /// groups becomes that divider.
+    fn pack(cells: &[Vec<u8>], limit: usize, consumes: bool) -> (Vec<Vec<Vec<u8>>>, Vec<Vec<u8>>) {
+        let mut groups: Vec<Vec<Vec<u8>>> = vec![Vec::new()];
+        let mut dividers: Vec<Vec<u8>> = Vec::new();
+        let mut used = 0;
+        let mut it = cells.iter().cloned().peekable();
+        while let Some(c) = it.next() {
+            let need = c.len() + 2;
+            let cur = groups.last_mut().unwrap();
+            if used + need <= limit || cur.is_empty() {
+                used += need;
+                cur.push(c);
+                continue;
+            }
+            if consumes {
+                if it.peek().is_none() {
+                    // The last cell cannot be a divider (nothing would be
+                    // left for the last page); use the previous one.
+                    let prev = cur.pop().unwrap();
+                    dividers.push(prev);
+                    used = need;
+                    groups.push(vec![c]);
+                } else {
+                    dividers.push(c);
+                    groups.push(Vec::new());
+                    used = 0;
+                }
+            } else {
+                dividers.push(Vec::new());
+                groups.push(vec![c]);
+                used = need;
+            }
+        }
+        (groups, dividers)
     }
 
     /// Split the root: its content moves to new pages and the root becomes
@@ -671,7 +821,78 @@ impl<'p> Writer<'p> {
         )
     }
 
+    /// Remove a cell from its leaf directly in the page bytes, when the
+    /// leaf keeps at least one cell. The freed bytes go on the page's
+    /// freeblock list (or the fragment count), as the file format requires.
+    fn try_delete_in_place(&self, root: u32, key: &Key) -> Result<InPlace> {
+        let mut pgno = root;
+        for _ in 0..40 {
+            let page = PageRef::load(self.pager, pgno)?;
+            let (i, eq) = self.search_page(&page, key)?;
+            if !page.is_leaf() {
+                if eq && page.is_index() {
+                    return Ok(InPlace::NotDone);
+                }
+                pgno = page.child(i)?;
+                continue;
+            }
+            if !eq {
+                return Ok(InPlace::Missing);
+            }
+            let n = page.ncells();
+            if n < 2 {
+                return Ok(InPlace::NotDone);
+            }
+            let off = page.cell_offset(i)?;
+            let cell = parse_cell(&page.data, off, page.kind(), self.usable)?;
+            self.free_cell_overflow(&page.data[off..off + cell.size], page.kind())?;
+            // Lay the page out again without the cell: one pass over the
+            // cell pointers, no free-space list to maintain.
+            let buf = self.compact_without(&page, i)?;
+            self.pager.write_page(pgno, buf)?;
+            return Ok(InPlace::Done);
+        }
+        corrupt("b-tree is deeper than any valid database allows")
+    }
+
+    /// The page's bytes with cell `skip` removed and the remaining cells
+    /// packed against the end of the page (no freeblocks or fragments).
+    fn compact_without(&self, page: &PageRef, skip: usize) -> Result<Vec<u8>> {
+        let size = self.pager.page_size();
+        let hdr = page.hdr();
+        let kind = page.kind();
+        let ptrs = page.cell_array();
+        let n = page.ncells();
+        let mut buf = vec![0u8; size];
+        buf[..ptrs].copy_from_slice(&page.data[..ptrs]);
+        // Bytes past the usable area (the reserved region) are kept.
+        buf[self.usable..].copy_from_slice(&page.data[self.usable..]);
+        let mut content = self.usable;
+        let mut j = 0;
+        for k in 0..n {
+            if k == skip {
+                continue;
+            }
+            let off = page.cell_offset(k)?;
+            let len = parse_cell(&page.data, off, kind, self.usable)?.size;
+            content -= len;
+            buf[content..content + len].copy_from_slice(&page.data[off..off + len]);
+            buf[ptrs + 2 * j..ptrs + 2 * j + 2].copy_from_slice(&(content as u16).to_be_bytes());
+            j += 1;
+        }
+        buf[hdr + 1..hdr + 3].copy_from_slice(&[0, 0]);
+        buf[hdr + 3..hdr + 5].copy_from_slice(&(j as u16).to_be_bytes());
+        buf[hdr + 5..hdr + 7].copy_from_slice(&((content % 65536) as u16).to_be_bytes());
+        buf[hdr + 7] = 0;
+        Ok(buf)
+    }
+
     fn delete(&self, root: u32, key: &Key) -> Result<bool> {
+        match self.try_delete_in_place(root, key)? {
+            InPlace::Done => return Ok(true),
+            InPlace::Missing => return Ok(false),
+            InPlace::NotDone => {}
+        }
         let default = KeyOrder::default();
         let order = match key {
             Key::Entry { order, .. } => *order,

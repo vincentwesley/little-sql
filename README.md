@@ -24,7 +24,7 @@ run the same queries through the `sqlite3` tool and compare the answers.
 | sqllogictest, full corpus (622 files), read mode | 5,729,099 | 0 | 100.00 % |
 | sqllogictest, CI sample (49 files), native mode | 323,361 | 0 | 100.00 % |
 | sqllogictest, CI sample (49 files), read mode | 240,267 | 0 | 100.00 % |
-| Differential tests against sqlite3 3.45.1 | 252 | 6 | 97.67 % |
+| Differential tests against sqlite3 3.45.1 | 267 | 6 | 97.80 % |
 <!-- results:end -->
 
 What the numbers mean:
@@ -158,6 +158,35 @@ push and keeps it as a downloadable artifact.
 - Foreign keys are parsed but not enforced, which is also SQLite's default.
 - Concurrent access from several processes: Little SQL takes no file locks.
   Use one process at a time.
+
+## Performance
+
+`scripts/bench.sh` runs the same SQL through Little SQL and sqlite3 3.45.1
+(best of 5 runs, each a fresh process, on a 4-core cloud VM). Reads use the
+demo database (128,000 rows); writes build a 200,000-row table.
+
+| Benchmark | Little SQL | sqlite3 | Ratio |
+|---|---:|---:|---:|
+| Scan + GROUP BY (128k rows, view join) | 0.083 s | 0.021 s | 3.9× |
+| Sort, top 10 | 0.095 s | 0.013 s | 7.3× |
+| Index range search | 0.003 s | 0.003 s | 0.9× |
+| Covering index scan | 0.033 s | 0.013 s | 2.4× |
+| LIKE filter, full scan | 0.061 s | 0.013 s | 4.6× |
+| Correlated subquery (27 towns) | 0.092 s | 0.016 s | 5.6× |
+| Join + GROUP BY region | 0.094 s | 0.058 s | 1.6× |
+| Bulk INSERT ... SELECT (200000 rows) | 0.340 s | 0.073 s | 4.7× |
+| Bulk insert + CREATE INDEX | 0.705 s | 0.121 s | 5.8× |
+| Bulk insert + UPDATE half | 0.739 s | 0.113 s | 6.5× |
+| Bulk insert + DELETE half | 0.551 s | 0.107 s | 5.2× |
+
+Little SQL is a tree-walking interpreter over decoded rows, where SQLite
+compiles to bytecode and has two decades of tuning, so it is slower; the
+point is that it stays within a small factor while using the same plans. The
+biggest wins came from profiling (DECISIONS D26): inserting into a leaf's
+free space in place, comparing index keys against record bytes without
+decoding them, flattening simple views into the outer query, keeping only
+the top rows for `ORDER BY ... LIMIT`, and splitting pages evenly except
+when appending.
 
 ## How it is built
 

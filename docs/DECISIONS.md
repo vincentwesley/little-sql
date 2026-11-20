@@ -255,3 +255,37 @@ SQLite's answers change between versions (3.46 added `%U`, `%V` and friends
 to `strftime`, for example; 3.45 returns NULL for them, as Little SQL does),
 and the published reports name their reference. A moving reference would
 make the score drift for reasons that have nothing to do with this engine.
+
+## D26. Performance work, guided by profiles
+
+Measured with `scripts/bench.sh` and profiled with valgrind's callgrind
+(no `perf` in the build machine). In order of effect:
+
+- **Insert in place.** A new cell that fits a leaf's free gap is written
+  straight into the page bytes; only splits take the decode-and-rebuild
+  path. 200,000-row insert: 2.1 s → 0.34 s.
+- **View and subquery flattening.** A view or FROM-subquery without
+  aggregation, DISTINCT, LIMIT, ORDER BY, compound parts or outer joins is
+  merged into the outer query (its tables join the outer ones, its WHERE
+  terms become outer terms, its columns become expressions), so the planner
+  sees base tables and indexes instead of a materialized copy. Columns of
+  the view are marked as read only when the outer query uses them, so
+  covering-index decisions match SQLite's.
+- **Allocation-free key comparison.** Index searches compare the search
+  key with the stored record bytes field by field; numbers and BINARY text
+  never become values.
+- **Top-N sorting.** `ORDER BY ... LIMIT n` keeps only the best
+  `n + offset` rows during the scan (partial selection when the buffer
+  doubles, with a sequence number so the result equals a stable sort).
+- **Even page splits.** Splitting packs pages full only when the new cell
+  is the last on its page (appends); otherwise cells are spread evenly.
+  Random-order inserts had left trails of near-empty pages (a test file
+  used 877 pages where sqlite3 used 95; now 129).
+- **Delete in place.** A deleted cell's page is compacted in one pass
+  without decoding cells into separate buffers. (An earlier version kept a
+  freeblock list instead; sqlite3's integrity check rejected it because
+  adjacent freeblocks must be merged, and the simpler compaction was chosen.
+  Little SQL's own integrity check now verifies free-space accounting too.)
+
+Not done: bytecode compilation, a page cache smarter than clear-when-full,
+and SQLite's three-sibling balancing.

@@ -191,6 +191,65 @@ pub fn decode_record(
     Ok(())
 }
 
+/// Compare `key` with the first `n` fields of a stored record, as `key`
+/// against the record, field by field with `order(i)` giving each field's
+/// collation and direction. Numbers, and text under BINARY in a UTF-8
+/// database, are compared straight from the record bytes without building
+/// values, which is what makes index searches cheap.
+pub fn compare_record_key(
+    payload: &[u8],
+    key: &[crate::value::Value],
+    n: usize,
+    order: &dyn Fn(usize) -> (crate::value::Collation, bool),
+    enc: TextEncoding,
+) -> Result<std::cmp::Ordering> {
+    use crate::value::Collation;
+    use std::cmp::Ordering;
+    let (hdr_len, first) = read_varint(payload);
+    let hdr_len = hdr_len as usize;
+    if hdr_len > payload.len() || first > hdr_len {
+        return corrupt("record header longer than payload");
+    }
+    let mut hp = first;
+    let mut bp = hdr_len;
+    for (i, k) in key.iter().enumerate().take(n) {
+        if hp >= hdr_len {
+            // The record has fewer fields than the key.
+            return Ok(Ordering::Greater);
+        }
+        let (t, m) = read_varint(&payload[hp..hdr_len]);
+        hp += m;
+        let len = serial_type_len(t);
+        if bp + len > payload.len() {
+            return corrupt("record body runs past payload");
+        }
+        let body = &payload[bp..bp + len];
+        bp += len;
+        let (coll, desc) = order(i);
+        let o = match (k, t) {
+            (Value::Text(ks), t) if t >= 13 && t % 2 == 1 && enc == TextEncoding::Utf8 => {
+                match std::str::from_utf8(body) {
+                    Ok(stored) if coll == Collation::Binary => ks.as_bytes().cmp(stored.as_bytes()),
+                    Ok(stored) => coll.compare(ks, stored),
+                    Err(_) => k.compare(&decode_body(t, body, enc), coll),
+                }
+            }
+            (Value::Blob(kb), t) if t >= 12 && t % 2 == 0 => kb.as_ref().cmp(body),
+            // Everything else decodes without allocating, except mixed
+            // text/blob comparisons and UTF-16 text, which are rare.
+            _ => k.compare(&decode_body(t, body, enc), coll),
+        };
+        if o != Ordering::Equal {
+            return Ok(if desc { o.reverse() } else { o });
+        }
+    }
+    if n > key.len() && hp < hdr_len {
+        // The key is shorter than the compared prefix.
+        return Ok(Ordering::Less);
+    }
+    Ok(Ordering::Equal)
+}
+
 /// Decode every column of a record.
 pub fn decode_all(payload: &[u8], enc: TextEncoding) -> Result<Vec<Value>> {
     let mut out = Vec::new();

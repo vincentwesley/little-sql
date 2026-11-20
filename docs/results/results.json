@@ -796,12 +796,12 @@
    "mode": "read",
    "engine": "littlesql 0.1.0",
    "reference": "sqlite3 3.45.1",
-   "files": 14,
+   "files": 15,
    "total": {
-    "pass": 252,
+    "pass": 267,
     "fail": 6,
-    "scored": 258,
-    "pass_rate": 97.67,
+    "scored": 273,
+    "pass_rate": 97.8,
     "not_applicable": 0,
     "setup": 0
    },
@@ -942,6 +942,16 @@
      "pass": 20,
      "fail": 0,
      "scored": 20,
+     "pass_rate": 100,
+     "not_applicable": 0,
+     "setup": 0
+    },
+    {
+     "name": "views",
+     "files": 1,
+     "pass": 15,
+     "fail": 0,
+     "scored": 15,
      "pass_rate": 100,
      "not_applicable": 0,
      "setup": 0

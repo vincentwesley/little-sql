@@ -279,17 +279,21 @@ fn compare_entry(
     index: &Index,
     enc: TextEncoding,
 ) -> Result<Ordering> {
-    let mut vals = Vec::with_capacity(key.len());
-    decode_record(payload, enc, key.len(), None, &mut vals)?;
-    for (i, k) in key.iter().enumerate() {
-        let v = vals.get(i).unwrap_or(&Value::Null);
-        let ic = &index.cols[i];
-        let o = v.compare(k, ic.collation);
-        if o != Ordering::Equal {
-            return Ok(if ic.desc { o.reverse() } else { o });
-        }
-    }
-    Ok(Ordering::Equal)
+    // The seek wants the entry compared with the key (the reverse of
+    // compare_record_key's key-against-entry).
+    crate::record::compare_record_key(
+        payload,
+        key,
+        key.len(),
+        &|i| {
+            index
+                .cols
+                .get(i)
+                .map_or((Collation::Binary, false), |c| (c.collation, c.desc))
+        },
+        enc,
+    )
+    .map(Ordering::reverse)
 }
 
 /// An index stores REAL column values that are whole numbers as integers;
@@ -456,14 +460,31 @@ impl<'a> Exec<'a> {
                 Ok(true)
             });
         }
-        let mut buf: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
+        // With a LIMIT only the first LIMIT + OFFSET rows in sort order are
+        // kept: whenever the buffer doubles, a partial selection drops the
+        // rest. The sequence number makes the order total, so the result
+        // is exactly that of a stable sort of every row.
+        let keep = limit.map(|n| (n as usize).saturating_add(offset as usize));
+        let order = &q.order_by;
+        let cmp = |a: &(Vec<Value>, usize, Vec<Value>), b: &(Vec<Value>, usize, Vec<Value>)| {
+            compare_keys(&a.0, &b.0, order).then(a.1.cmp(&b.1))
+        };
+        let mut buf: Vec<(Vec<Value>, usize, Vec<Value>)> = Vec::new();
+        let mut seq = 0usize;
         self.run_body(q, &mut |row, keys| {
-            buf.push((keys, row));
+            buf.push((keys, seq, row));
+            seq += 1;
+            if let Some(k) = keep {
+                if k > 0 && buf.len() >= 2 * k.max(64) {
+                    buf.select_nth_unstable_by(k - 1, cmp);
+                    buf.truncate(k);
+                }
+            }
             Ok(true)
         })?;
-        buf.sort_by(|a, b| compare_keys(&a.0, &b.0, &q.order_by));
+        buf.sort_by(cmp);
         let take = limit.map_or(usize::MAX, |n| n as usize);
-        for (_, row) in buf.into_iter().skip(offset as usize).take(take) {
+        for (_, _, row) in buf.into_iter().skip(offset as usize).take(take) {
             if !sink(row)? {
                 break;
             }

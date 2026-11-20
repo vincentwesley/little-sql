@@ -172,6 +172,52 @@ impl Checker<'_> {
                 break;
             }
         }
+        // Free space: the gap, the freeblock list and the fragment count
+        // must account for every byte not used by cells (as SQLite checks).
+        let hdr = page.hdr();
+        let content = match be16(&page.data, hdr + 5) {
+            0 => 65536,
+            c => c,
+        };
+        if content < content_floor || content > self.usable {
+            self.problem(format!(
+                "{what}: page {pgno}: free space corruption (content start)"
+            ));
+            return;
+        }
+        let mut free = content - content_floor + page.data[hdr + 7] as usize;
+        let mut fb = be16(&page.data, hdr + 1);
+        let mut last_end = 0usize;
+        let mut hops = 0;
+        while fb != 0 {
+            hops += 1;
+            let size = if fb + 4 <= self.usable {
+                be16(&page.data, fb + 2)
+            } else {
+                0
+            };
+            if fb < content
+                || fb + size > self.usable
+                || size < 4
+                || fb < last_end + 4
+                || hops > 10_000
+            {
+                self.problem(format!(
+                    "{what}: page {pgno}: free space corruption (freeblock list)"
+                ));
+                return;
+            }
+            free += size;
+            last_end = fb + size;
+            fb = be16(&page.data, fb);
+        }
+        let in_cells: usize = spans.iter().map(|(a, b)| b - a).sum();
+        if content_floor + free + in_cells != self.usable {
+            self.problem(format!(
+                "{what}: page {pgno}: free space corruption ({} bytes unaccounted for)",
+                self.usable as isize - (content_floor + free + in_cells) as isize
+            ));
+        }
         // Keys: in order, and inside (lo, hi].
         let cmp = |a: &Bound, b: &Bound| -> Ordering {
             match (a, b) {

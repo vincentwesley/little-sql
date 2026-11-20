@@ -69,3 +69,9 @@ CREATE VIEW order_totals AS
 SELECT o.id AS order_id, o.customer_id, sum(l.qty * p.price) AS total, count(*) AS n_lines
 FROM orders o JOIN lines l ON l.order_id = o.id JOIN products p ON p.sku = l.sku
 GROUP BY o.id;
+
+-- A view simple enough to be flattened into the queries that use it.
+CREATE VIEW pending_orders AS
+SELECT o.id, o.placed, c.name AS customer, c.city, o.customer_id
+FROM orders o JOIN customers c ON c.id = o.customer_id
+WHERE o.status = 'pending';

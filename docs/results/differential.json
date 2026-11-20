@@ -3,8 +3,8 @@
   "mode": "read",
   "engine": "littlesql 0.1.0",
   "reference": "sqlite3 3.45.1",
-  "files": 14,
-  "total": { "pass": 252, "fail": 6, "scored": 258, "pass_rate": 97.67, "not_applicable": 0, "setup": 0 },
+  "files": 15,
+  "total": { "pass": 267, "fail": 6, "scored": 273, "pass_rate": 97.80, "not_applicable": 0, "setup": 0 },
   "categories": [
     { "name": "advanced", "files": 1, "pass": 8, "fail": 6, "scored": 14, "pass_rate": 57.14, "not_applicable": 0, "setup": 0 },
     { "name": "aggregates", "files": 1, "pass": 23, "fail": 0, "scored": 23, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
@@ -19,6 +19,7 @@
     { "name": "storage_big_pages", "files": 1, "pass": 4, "fail": 0, "scored": 4, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
     { "name": "storage_small_pages", "files": 1, "pass": 12, "fail": 0, "scored": 12, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
     { "name": "storage_utf16", "files": 1, "pass": 7, "fail": 0, "scored": 7, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
-    { "name": "subqueries", "files": 1, "pass": 20, "fail": 0, "scored": 20, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 }
+    { "name": "subqueries", "files": 1, "pass": 20, "fail": 0, "scored": 20, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
+    { "name": "views", "files": 1, "pass": 15, "fail": 0, "scored": 15, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 }
   ]
 }

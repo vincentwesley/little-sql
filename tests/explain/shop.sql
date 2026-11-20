@@ -29,3 +29,4 @@ SELECT * FROM customers NOT INDEXED WHERE city = 'Bedok';
 SELECT sku FROM products INDEXED BY products_cat_price WHERE category = 'veg' ORDER BY price;
 SELECT c.name, count(*) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.id;
 SELECT p.sku, sum(l.qty) FROM products p LEFT JOIN lines l ON l.sku = p.sku GROUP BY p.sku;
+SELECT x.name FROM (SELECT name, credit FROM customers WHERE credit > 100) AS x WHERE x.name > 'C';
