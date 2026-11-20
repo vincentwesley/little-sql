@@ -43,6 +43,11 @@ What the numbers mean:
   100.00 %.
 - The six differential failures are features not implemented yet: window
   functions (5) and JSON functions (1). They stay in the count.
+- 100 % means every applicable record passes, not that Little SQL is a
+  complete SQLite. The corpus concentrates on core SELECT semantics, joins,
+  indexes, views and basic DML; features it never exercises (window
+  functions, for example) show up in the differential tests and in
+  [Not supported](#not-supported-yet) below.
 
 Details of the scoring rules are in [docs/DECISIONS.md](docs/DECISIONS.md)
 (D5, D6, D14), and which test files the CI sample includes and why is in
@@ -212,19 +217,23 @@ SQL text ─▶ lexer ─▶ parser ─▶ AST ─▶ binder/planner ─▶ plan
 ## Running the tests
 
 ```bash
-cargo test --workspace                      # unit tests
-scripts/fetch-sqllogictest.sh               # the CI sample (66 MB)
-./target/release/slt run corpus/test        # sqllogictest, read mode
-./target/release/slt diff tests/differential   # differential tests
-scripts/acceptance.sh                       # every acceptance check
+cargo test --workspace                                 # unit and integration tests
+scripts/fetch-sqllogictest.sh                          # the CI sample (66 MB)
+./target/release/slt run --mode native corpus/test     # sqllogictest, native mode
+./target/release/slt run corpus/test                   # sqllogictest, read mode
+./target/release/slt diff tests/differential           # differential tests
+scripts/acceptance.sh                                  # every acceptance check
 ```
 
-`sqlite3` must be installed for the sqllogictest read mode, the differential
-tests and the acceptance checks. For the full corpus (1.1 GB):
+`sqlite3` 3.45.1 (the version in Ubuntu 24.04) must be installed for the
+read mode, the differential tests and the acceptance checks; other versions
+answer a few queries differently. `--failures FILE` writes every failing
+record with its reason. For the full corpus (1.1 GB download, about a minute
+per mode on four cores):
 
 ```bash
-scripts/fetch-sqllogictest.sh --full
-./target/release/slt run corpus/test
+scripts/slt-full.sh                  # writes results/slt-{native,read}-full.json
+node scripts/publish-results.mjs     # updates this README's table
 ```
 
 ## Licence and credits

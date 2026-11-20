@@ -369,12 +369,22 @@ impl Cursor {
     /// empty.
     pub fn first(&mut self) -> Result<()> {
         self.stack.clear();
+        // A database with no pages yet (new and never written) has an
+        // empty schema table and nothing else.
+        if self.pager.page_count() == 0 {
+            return Ok(());
+        }
         self.descend_leftmost(self.root)
     }
 
     /// Position at the last entry.
     pub fn last(&mut self) -> Result<()> {
         self.stack.clear();
+        // A database with no pages yet (new and never written) has an
+        // empty schema table and nothing else.
+        if self.pager.page_count() == 0 {
+            return Ok(());
+        }
         self.descend_rightmost(self.root)
     }
 
@@ -421,6 +431,11 @@ impl Cursor {
     pub fn seek_rowid(&mut self, rowid: i64) -> Result<()> {
         self.seeks += 1;
         self.stack.clear();
+        // A database with no pages yet (new and never written) has an
+        // empty schema table and nothing else.
+        if self.pager.page_count() == 0 {
+            return Ok(());
+        }
         let mut pgno = self.root;
         loop {
             let page = PageRef::load(&self.pager, pgno)?;
@@ -453,6 +468,11 @@ impl Cursor {
     pub fn seek(&mut self, cmp: &mut dyn FnMut(&[u8]) -> Result<Ordering>) -> Result<()> {
         self.seeks += 1;
         self.stack.clear();
+        // A database with no pages yet (new and never written) has an
+        // empty schema table and nothing else.
+        if self.pager.page_count() == 0 {
+            return Ok(());
+        }
         let mut pgno = self.root;
         loop {
             let page = PageRef::load(&self.pager, pgno)?;

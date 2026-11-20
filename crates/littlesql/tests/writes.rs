@@ -313,3 +313,12 @@ fn deep_tree_survives_range_deletes() {
     db.execute("DELETE FROM t WHERE id > 0").unwrap();
     check(&db);
 }
+
+#[test]
+fn empty_database_reads_as_empty() {
+    let db = Database::memory();
+    let rs = db.query("SELECT count(*) FROM sqlite_schema").unwrap();
+    assert_eq!(rs.rows[0][0], Value::Int(0));
+    check(&db);
+    assert!(db.query("SELECT * FROM nothing").is_err());
+}
