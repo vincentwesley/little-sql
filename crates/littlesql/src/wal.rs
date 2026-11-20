@@ -30,7 +30,8 @@ fn be32(b: &[u8], off: usize) -> u32 {
 /// multiple of 8.
 fn checksum(big_endian: bool, data: &[u8], seed: (u32, u32)) -> (u32, u32) {
     let (mut s0, mut s1) = seed;
-    for chunk in data.chunks_exact(8) {
+    for chunk in data.as_chunks::<8>().0 {
+        let chunk = &chunk[..];
         let (a, b) = if big_endian {
             (be32(chunk, 0), be32(chunk, 4))
         } else {

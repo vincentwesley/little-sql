@@ -10,7 +10,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 # Milestones whose checks exist. Extend as milestones land.
-IMPLEMENTED=(M0 M1 M2 M3 M4)
+IMPLEMENTED=(M0 M1 M2 M3 M4 M5)
 UPTO="${1:-${IMPLEMENTED[-1]}}"
 
 SCRATCH="$(mktemp -d)"
@@ -190,7 +190,7 @@ if want M5; then
   }
   check A5.1 "Playground builds; every file under 25 MiB" a51
   check A5.2 "Playground works end to end (Node smoke test)" node scripts/playground-smoke.mjs
-  check A5.3 "Published numbers match the latest results" scripts/publish-results.sh --check
+  check A5.3 "Published numbers match the latest results" node scripts/publish-results.mjs --check
 fi
 
 # ---------------------------------------------------------------- M7

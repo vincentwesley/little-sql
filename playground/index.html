@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Little SQL playground</title>
+<meta name="description" content="A SQL engine written from scratch in Rust, running in your browser on real SQLite files.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>Little SQL</h1>
+    <p>A SQL engine written from scratch in Rust, compiled to WebAssembly. It reads real SQLite files; everything runs in your browser.</p>
+  </div>
+  <nav>
+    <button class="tab active" data-page="query">Query</button>
+    <button class="tab" data-page="tests">Test results</button>
+    <button class="tab" data-page="about">About</button>
+  </nav>
+</header>
+
+<main>
+<section id="page-query" class="page active">
+  <aside id="sidebar">
+    <div class="db-picker">
+      <label for="db-select">Database</label>
+      <select id="db-select">
+        <option value="demo">HDB resale prices (demo)</option>
+        <option value="empty">Empty database</option>
+        <option value="file">Open a file…</option>
+      </select>
+      <input type="file" id="file-input" accept=".db,.sqlite,.sqlite3,.db3,application/vnd.sqlite3,application/x-sqlite3" hidden>
+      <p id="db-status" class="muted">Loading…</p>
+    </div>
+    <h2>Schema</h2>
+    <div id="schema" class="schema"></div>
+  </aside>
+
+  <div id="workspace">
+    <div class="editor-bar">
+      <label for="examples">Examples</label>
+      <select id="examples"></select>
+      <span class="spacer"></span>
+      <span class="muted hint">Ctrl+Enter runs</span>
+      <button id="run" class="primary">Run</button>
+    </div>
+    <textarea id="sql" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="SQL"></textarea>
+
+    <div id="output">
+      <div id="status" class="status muted">Ready.</div>
+      <div id="error" class="error" hidden></div>
+      <div id="results"></div>
+    </div>
+  </div>
+</section>
+
+<section id="page-tests" class="page">
+  <div class="prose">
+    <h2>Test pass rate by feature</h2>
+    <p id="tests-summary" class="muted">Loading…</p>
+    <div id="tests"></div>
+  </div>
+</section>
+
+<section id="page-about" class="page">
+  <div class="prose">
+    <h2>What this is</h2>
+    <p>Little SQL is a small database engine written from scratch: a reader for the SQLite file format, B-tree traversal, a SQL parser, a query planner that uses indexes, and an executor for joins, grouping, ordering, aggregates and subqueries. It has no dependencies. This page runs it as WebAssembly in a web worker.</p>
+    <p>Each query shows its <strong>query plan</strong>: which table or index every loop reads, how many times the loop ran and how many rows it visited. The words are SQLite's own (<code>SCAN</code>, <code>SEARCH … USING INDEX</code>), and on the project's planner test set the plans are identical to SQLite's.</p>
+    <h2>Your data stays here</h2>
+    <p>A database you open is read in your browser and never uploaded anywhere. Little SQL can open SQLite files of any page size and text encoding; files that use features it does not support yet will say so.</p>
+    <h2>The demo database</h2>
+    <p>Every HDB resale flat transaction in Singapore registered from January 2022 to November 2026: tables <code>resale</code> and <code>towns</code>, and a view <code>sales</code> that joins them.</p>
+    <p class="credit">Contains information from Resale flat prices based on registration date from Jan-2017 onwards, accessed on 12 November 2026 from <a href="https://data.gov.sg/datasets/d_8b84c4ee58e3cfc0ece0d773c8ca6abc/view">data.gov.sg</a>, which is made available under the terms of the <a href="https://data.gov.sg/open-data-licence">Singapore Open Data Licence version 1.0</a>.</p>
+    <h2>Source</h2>
+    <p><a href="https://github.com/vincentwesley/little-sql">github.com/vincentwesley/little-sql</a> — MIT licence.</p>
+  </div>
+</section>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

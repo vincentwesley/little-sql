@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/littlesql", "crates/littlesql-cli", "crates/slt"]
+members = ["crates/littlesql", "crates/littlesql-cli", "crates/littlesql-wasm", "crates/slt"]
 
 [workspace.package]
 version = "0.1.0"

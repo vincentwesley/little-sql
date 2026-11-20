@@ -24,7 +24,7 @@ the playground smoke test) and `node`.
 | A4.2 | M4 | select5 (64-table joins) finishes | `select5.test` runs with zero failures within the per-statement time limit |
 | A5.1 | M5 | Playground builds and is small | `scripts/build-playground.sh`; every file under `playground/dist/` < 25 MiB |
 | A5.2 | M5 | Playground works end to end | `node scripts/playground-smoke.mjs` loads the wasm in Node, opens the demo database, runs a query and an EXPLAIN |
-| A5.3 | M5 | Published numbers are current | `scripts/publish-results.sh --check`: the README table and `playground/dist/results.json` equal the latest runner results |
+| A5.3 | M5 | Published numbers are current | `node scripts/publish-results.mjs --check`: the fresh reports in `results/` equal the committed copies in `docs/results/`, and the README table and `playground/dist/results.json` equal those |
 | A7.1 | M7 | Native mode runs | `slt run --mode native --min-rate <FLOOR> corpus/test` |
 | A7.2 | M7 | Written files are valid SQLite | `scripts/write-check.sh`: files written by Little SQL pass `sqlite3 FILE "PRAGMA integrity_check"` and have the same content |
 | A8.1 | M8 | Transactions and crash recovery | `scripts/crash-check.sh`: rollback restores state; a WAL left without checkpoint is recovered by both Little SQL and sqlite3 with identical content |

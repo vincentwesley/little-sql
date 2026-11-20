@@ -1,0 +1,28 @@
+{
+  "suite": "sqllogictest sample",
+  "mode": "read",
+  "engine": "littlesql 0.1.0",
+  "reference": "sqlite3 3.45.1",
+  "files": 49,
+  "total": { "pass": 240267, "fail": 0, "scored": 240267, "pass_rate": 100.00, "not_applicable": 18393, "setup": 83094 },
+  "categories": [
+    { "name": "evidence", "files": 12, "pass": 324, "fail": 0, "scored": 324, "pass_rate": 100.00, "not_applicable": 5, "setup": 165 },
+    { "name": "index/between", "files": 4, "pass": 32771, "fail": 0, "scored": 32771, "pass_rate": 100.00, "not_applicable": 0, "setup": 1199 },
+    { "name": "index/commute", "files": 3, "pass": 23720, "fail": 0, "scored": 23720, "pass_rate": 100.00, "not_applicable": 0, "setup": 1177 },
+    { "name": "index/delete", "files": 5, "pass": 11769, "fail": 0, "scored": 11769, "pass_rate": 100.00, "not_applicable": 0, "setup": 53284 },
+    { "name": "index/in", "files": 3, "pass": 30015, "fail": 0, "scored": 30015, "pass_rate": 100.00, "not_applicable": 0, "setup": 1176 },
+    { "name": "index/orderby", "files": 3, "pass": 30060, "fail": 0, "scored": 30060, "pass_rate": 100.00, "not_applicable": 0, "setup": 1177 },
+    { "name": "index/orderby_nosort", "files": 3, "pass": 30066, "fail": 0, "scored": 30066, "pass_rate": 100.00, "not_applicable": 0, "setup": 1176 },
+    { "name": "index/random", "files": 3, "pass": 21045, "fail": 0, "scored": 21045, "pass_rate": 100.00, "not_applicable": 4280, "setup": 1177 },
+    { "name": "index/view", "files": 4, "pass": 11613, "fail": 0, "scored": 11613, "pass_rate": 100.00, "not_applicable": 3165, "setup": 20693 },
+    { "name": "random/aggregates", "files": 1, "pass": 10000, "fail": 0, "scored": 10000, "pass_rate": 100.00, "not_applicable": 3910, "setup": 12 },
+    { "name": "random/expr", "files": 1, "pass": 10000, "fail": 0, "scored": 10000, "pass_rate": 100.00, "not_applicable": 5414, "setup": 12 },
+    { "name": "random/groupby", "files": 1, "pass": 10000, "fail": 0, "scored": 10000, "pass_rate": 100.00, "not_applicable": 547, "setup": 12 },
+    { "name": "random/select", "files": 1, "pass": 10000, "fail": 0, "scored": 10000, "pass_rate": 100.00, "not_applicable": 1072, "setup": 12 },
+    { "name": "select1", "files": 1, "pass": 1000, "fail": 0, "scored": 1000, "pass_rate": 100.00, "not_applicable": 0, "setup": 31 },
+    { "name": "select2", "files": 1, "pass": 1000, "fail": 0, "scored": 1000, "pass_rate": 100.00, "not_applicable": 0, "setup": 31 },
+    { "name": "select3", "files": 1, "pass": 3320, "fail": 0, "scored": 3320, "pass_rate": 100.00, "not_applicable": 0, "setup": 31 },
+    { "name": "select4", "files": 1, "pass": 2832, "fail": 0, "scored": 2832, "pass_rate": 100.00, "not_applicable": 0, "setup": 1025 },
+    { "name": "select5", "files": 1, "pass": 732, "fail": 0, "scored": 732, "pass_rate": 100.00, "not_applicable": 0, "setup": 704 }
+  ]
+}

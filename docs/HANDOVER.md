@@ -2,9 +2,9 @@
 
 Updated after every milestone so a new session can continue from here.
 
-## Status (after M4, 2026-11-13)
+## Status (after M5, 2026-11-20)
 
-M0–M4 are done: `scripts/acceptance.sh` passes all 12 checks for M0–M4.
+M0–M5 are done: `scripts/acceptance.sh` passes all 15 checks for M0–M5.
 
 | Suite | Passed | Failed | Rate |
 |-------|-------:|-------:|-----:|
@@ -31,7 +31,12 @@ counted.
   in list/csv/tabs/line/json/column/table/box/markdown modes.
 - `crates/slt`: sqllogictest runner (read and native modes), differential
   runner, reports.
-- `scripts/fetch-sqllogictest.sh` (sample or `--full`), `scripts/acceptance.sh`.
+- `crates/littlesql-wasm` + `playground/` (see below), `data/` (HDB CSV).
+- `scripts/fetch-sqllogictest.sh` (sample or `--full`), `scripts/acceptance.sh`,
+  `build-demo-db.sh`, `build-playground.sh`, `playground-smoke.mjs`,
+  `publish-results.mjs`.
+- `rust-toolchain.toml` pins Rust 1.97.0 (CI's newer clippy had broken the
+  first CI run).
 - CI: `.github/workflows/ci.yml` (fmt, clippy, test, build; then the
   acceptance checks on the sample; manual dispatch input `full` for the
   whole corpus).
@@ -42,18 +47,26 @@ counted.
 
 ## Next steps, in order
 
-1. M5: `crates/littlesql-wasm` (raw C ABI, no wasm-bindgen), static
-   playground under `playground/` built into `playground/dist/` by
-   `scripts/build-playground.sh`, demo DB from the HDB CSV
-   (`scripts/build-demo-db.sh`), `scripts/playground-smoke.mjs`,
-   `scripts/publish-results.sh [--check]` that writes the README table and
-   `results.json` from `results/*.json`. Then add M5 to `IMPLEMENTED` in
-   `scripts/acceptance.sh`.
-2. M7 writes: B-tree insert/split/delete, freelist, CREATE/DROP/INSERT/
-   UPDATE/DELETE, real `check.rs`; `slt run --mode native`; `write-check.sh`.
-3. M8 transactions + WAL crash tests (`crash-check.sh`); M9 benchmarks
-   (`bench.sh`); M10 fresh-clone acceptance + stranger review + single PR.
-4. Read-side extras if time allows: window functions, JSON.
+1. M7 writes: B-tree insert/split/delete, freelist, CREATE/DROP/INSERT/
+   UPDATE/DELETE, real `check.rs`; `slt run --mode native`;
+   `scripts/write-check.sh`; add a `native` line to `tests/slt/FLOOR`; add
+   M7 to `IMPLEMENTED` in `scripts/acceptance.sh`; publish native results
+   (`node scripts/publish-results.mjs`).
+2. M8 transactions + WAL crash tests (`scripts/crash-check.sh`); M9
+   benchmarks (`scripts/bench.sh`); M10 fresh-clone acceptance + stranger
+   review + single PR.
+3. Read-side extras if time allows: window functions, JSON.
+
+## Playground (M5)
+
+`scripts/build-playground.sh` → `playground/dist/` (static: wasm 875 KB,
+demo DB 18 MB). `node scripts/playground-smoke.mjs` tests it in Node; it was
+also checked in Chromium via Playwright (queries, plans, test page, opening a
+local file; no console errors). Results shown on the page and in README come
+from `docs/results/*.json` via `node scripts/publish-results.mjs`; after
+any change to the score, rerun the suites into `results/` and publish.
+The full-corpus report is produced with
+`slt run --suite "sqllogictest full corpus" --json results/slt-read-full.json <corpus>/test`.
 
 ## Environment notes for a new session
 

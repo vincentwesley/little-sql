@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
@@ -44,12 +44,15 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Install sqlite3 and node
-        run: sudo apt-get update && sudo apt-get install -y sqlite3 nodejs
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install sqlite3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
       - name: Cache the corpus sample
         uses: actions/cache@v4
         with:
@@ -65,3 +68,8 @@ jobs:
         with:
           name: results
           path: results/
+      - name: Upload the playground (a static site)
+        uses: actions/upload-artifact@v4
+        with:
+          name: playground
+          path: playground/dist/

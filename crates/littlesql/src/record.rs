@@ -96,12 +96,14 @@ pub(crate) fn decode_text(bytes: &[u8], enc: TextEncoding) -> Value {
         },
         TextEncoding::Utf16Le | TextEncoding::Utf16Be => {
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| {
                     if enc == TextEncoding::Utf16Le {
-                        u16::from_le_bytes([c[0], c[1]])
+                        u16::from_le_bytes(*c)
                     } else {
-                        u16::from_be_bytes([c[0], c[1]])
+                        u16::from_be_bytes(*c)
                     }
                 })
                 .collect();

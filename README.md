@@ -54,40 +54,61 @@ cd little-sql
 cargo build --release
 ```
 
-Open a database and run a query:
+Build the demo database (needs `sqlite3`) and query it:
 
 ```bash
-./target/release/littlesql mydata.db "SELECT name, count(*) FROM sqlite_schema GROUP BY type"
+scripts/build-demo-db.sh          # writes target/demo/hdb.db
+./target/release/littlesql target/demo/hdb.db "SELECT count(*), max(price) FROM resale"
 ```
 
 Or start the interactive shell, which works like `sqlite3`:
 
 ```text
-$ ./target/release/littlesql shop.db
+$ ./target/release/littlesql target/demo/hdb.db
 Little SQL 0.1.0
 Enter ".help" for usage hints.
 littlesql> .tables
-customers     lines         order_totals  orders        products
+resale  sales   towns
 littlesql> .mode box
-littlesql> SELECT city, count(*) AS n, round(avg(credit), 2) AS avg_credit
-      ...>   FROM customers WHERE city IS NOT NULL
-      ...>   GROUP BY city ORDER BY avg_credit DESC LIMIT 3;
-┌─────────────┬────┬────────────┐
-│    city     │ n  │ avg_credit │
-├─────────────┼────┼────────────┤
-│ Jurong West │ 43 │ 76.15      │
-│ Punggol     │ 43 │ 75.16      │
-│ Clementi    │ 43 │ 74.92      │
-└─────────────┴────┴────────────┘
-littlesql> EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 7 ORDER BY placed DESC;
+littlesql> SELECT region, count(*) AS sales, round(avg(price)) AS avg_price
+      ...>   FROM sales WHERE month >= '2026-01'
+      ...>   GROUP BY region ORDER BY avg_price DESC;
+┌────────────┬───────┬───────────┐
+│   region   │ sales │ avg_price │
+├────────────┼───────┼───────────┤
+│ Central    │ 4446  │ 770249.0  │
+│ East       │ 3779  │ 701592.0  │
+│ North-East │ 5339  │ 670435.0  │
+│ West       │ 5110  │ 606126.0  │
+│ North      │ 3799  │ 588373.0  │
+└────────────┴───────┴───────────┘
+littlesql> EXPLAIN QUERY PLAN SELECT * FROM resale WHERE town_id = 5 AND month >= '2026-06';
 QUERY PLAN
-`--SEARCH orders USING INDEX orders_customer (customer_id=?)
+`--SEARCH resale USING INDEX resale_town_month (town_id=? AND month>=?)
 ```
 
 `EXPLAIN` (without `QUERY PLAN`) runs the query and shows the same tree with
 how many times each loop ran and how many rows it visited. `.eqp on` prints
 that tree after every query; `.stats on` prints pages read. `.help` lists
 every command, and `littlesql -help` every option.
+
+## The playground
+
+The engine also runs in the browser, compiled to WebAssembly: open the demo
+database (every HDB resale flat sale in Singapore since 2022) or any SQLite
+file of your own, run queries, see each query's plan with how many rows
+every loop visited, and see the test pass rate by feature. The file you open
+never leaves your browser.
+
+```bash
+rustup target add wasm32-unknown-unknown
+scripts/build-playground.sh                 # builds playground/dist/
+python3 -m http.server -d playground/dist   # then open http://localhost:8000
+```
+
+`playground/dist/` is a plain static site (the largest file, the demo
+database, is 18 MB), so any static host can serve it. CI builds it on every
+push and keeps it as a downloadable artifact.
 
 ## What it supports
 
@@ -138,7 +159,9 @@ SQL text ─▶ lexer ─▶ parser ─▶ AST ─▶ binder/planner ─▶ plan
 |-------|------------|
 | `crates/littlesql` | The engine: storage, pager, WAL, B-trees, records, schema, SQL parser, binder/planner, executor, functions |
 | `crates/littlesql-cli` | The `littlesql` shell |
+| `crates/littlesql-wasm` | The engine as WebAssembly, behind a small C ABI |
 | `crates/slt` | The test runner: sqllogictest (read and native modes) and the differential suite |
+| `playground/` | The browser playground (HTML, CSS, JavaScript; no build step) |
 
 [docs/PLAN.md](docs/PLAN.md) describes the architecture and milestones,
 [docs/DECISIONS.md](docs/DECISIONS.md) every design decision and why, and
@@ -164,6 +187,14 @@ scripts/fetch-sqllogictest.sh --full
 
 ## Licence and credits
 
-MIT, see [LICENSE](LICENSE). The SQLite file format, SQL dialect and
+MIT, see [LICENSE](LICENSE).
+
+The demo database contains information from Resale flat prices based on
+registration date from Jan-2017 onwards, accessed on 12 November 2026 from
+[data.gov.sg](https://data.gov.sg/datasets/d_8b84c4ee58e3cfc0ece0d773c8ca6abc/view),
+which is made available under the terms of the
+[Singapore Open Data Licence version 1.0](https://data.gov.sg/open-data-licence).
+
+The SQLite file format, SQL dialect and
 sqllogictest corpus are the work of the SQLite project and are in the public
 domain. Security reports: see [SECURITY.md](SECURITY.md).

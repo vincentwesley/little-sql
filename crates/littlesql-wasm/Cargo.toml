@@ -1,0 +1,14 @@
+[package]
+name = "littlesql-wasm"
+description = "Little SQL compiled to WebAssembly for the browser playground"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Raw C ABI exports; no wasm-bindgen (see docs/DECISIONS.md D2).
+[dependencies]
+littlesql = { path = "../littlesql" }

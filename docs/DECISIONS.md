@@ -174,3 +174,27 @@ the differential suite checks it.
 'A'` returns `A`, because SQLite inserts rows into a temporary index where an
 equal key replaces the earlier one. Little SQL does the same. INTERSECT and
 EXCEPT return the left side's (last) row.
+
+## D19. The demo data is committed; results are published from reports
+
+The 2022-onwards slice of the HDB dataset is committed as a 1.4 MB
+`data/hdb-resale-2022-onwards.csv.gz`, and `scripts/build-demo-db.sh` turns
+it into the 18 MB demo database. *Why:* the source dataset grows every
+month, so downloading it at build time would change the demo and its
+example answers; the compressed CSV is small, while the database is a build
+product.
+
+Test numbers are never typed by hand: the runner writes JSON reports,
+`scripts/publish-results.mjs` copies them into `docs/results/` (committed),
+builds `results.json` for the playground and rewrites the README table.
+Acceptance check A5.3 fails if a fresh run disagrees with what is published.
+
+## D20. The playground: a module web worker over a raw C ABI
+
+The page (`playground/`) is plain HTML, CSS and JavaScript with no build
+step and no framework. The engine runs in a web worker so a slow query
+never freezes the page; if it traps (an engine bug), the worker starts a new
+instance and reopens the database. Each query's result carries its plan with
+loop and row counts, shown above the rows, because seeing how a query ran
+is the point of the playground. *Why no framework or bundler:* nothing here
+needs one, and a static directory can be hosted anywhere.
