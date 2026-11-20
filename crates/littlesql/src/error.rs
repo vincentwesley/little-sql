@@ -21,6 +21,16 @@ pub enum Error {
     Constraint(String),
     /// The operating system or storage layer failed.
     Io(String),
+    /// `RAISE(kind, message)` in a trigger.
+    Raise(RaiseKind, String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RaiseKind {
+    Ignore,
+    Rollback,
+    Abort,
+    Fail,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -29,11 +39,12 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Corrupt(m) => write!(f, "database disk image is malformed: {m}"),
-            Error::Parse(m) => write!(f, "parse error: {m}"),
+            Error::Parse(m) => write!(f, "{m}"),
             Error::Sql(m) => write!(f, "{m}"),
             Error::Unsupported(m) => write!(f, "not supported by Little SQL: {m}"),
             Error::Runtime(m) => write!(f, "{m}"),
             Error::Constraint(m) => write!(f, "{m}"),
+            Error::Raise(_, m) => write!(f, "{m}"),
             Error::Io(m) => write!(f, "I/O error: {m}"),
         }
     }

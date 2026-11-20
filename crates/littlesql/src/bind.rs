@@ -1898,6 +1898,11 @@ impl<'a> Binder<'a> {
         star: bool,
         filter: Option<&ast::Expr>,
     ) -> Result<Expr> {
+        if name == "raise" && TRIGGER_ROWS.with(|r| r.borrow().is_empty()) {
+            return Err(Error::Sql(
+                "RAISE() may only be used within a trigger-program".into(),
+            ));
+        }
         // A JSON value handed straight from one JSON function to a JSON
         // builder nests as JSON (SQLite's JSON "subtype").
         let wrapped: Vec<ast::Expr>;
@@ -2647,6 +2652,7 @@ fn json_arg(a: &ast::Expr) -> ast::Expr {
 
 fn intern(name: &str) -> &'static str {
     const NAMES: &[&str] = &[
+        "raise",
         "json",
         "json_valid",
         "json_type",

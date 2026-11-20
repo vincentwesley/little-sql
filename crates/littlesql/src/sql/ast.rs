@@ -27,6 +27,13 @@ pub enum Stmt {
     Begin,
     Commit,
     Rollback,
+    Savepoint(String),
+    AlterTable {
+        table: String,
+        action: AlterAction,
+    },
+    Release(String),
+    RollbackTo(String),
     Pragma {
         name: String,
         value: Option<String>,
@@ -445,4 +452,20 @@ pub struct Update {
 pub struct Delete {
     pub table: String,
     pub where_: Option<Expr>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterAction {
+    RenameTable(String),
+    RenameColumn {
+        from: String,
+        to: String,
+    },
+    /// The definition, and its text as written (it is spliced into the
+    /// stored CREATE TABLE).
+    AddColumn {
+        def: ColumnDef,
+        text: String,
+    },
+    DropColumn(String),
 }

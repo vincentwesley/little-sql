@@ -322,3 +322,60 @@ fn empty_database_reads_as_empty() {
     check(&db);
     assert!(db.query("SELECT * FROM nothing").is_err());
 }
+
+#[test]
+fn savepoints_and_alter_table() {
+    let db = Database::memory();
+    db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INT); CREATE INDEX tb ON t(b)")
+        .unwrap();
+    db.execute("SAVEPOINT s; INSERT INTO t(a, b) VALUES ('x', 1); SAVEPOINT s2; INSERT INTO t(a, b) VALUES ('y', 2); ROLLBACK TO s2; RELEASE s")
+        .unwrap();
+    assert_eq!(
+        db.query("SELECT count(*) FROM t").unwrap().rows[0][0],
+        Value::Int(1)
+    );
+    db.execute("ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'd'; ALTER TABLE t RENAME COLUMN b TO bb; ALTER TABLE t RENAME TO u")
+        .unwrap();
+    let rs = db.query("SELECT id, a, bb, c FROM u WHERE bb = 1").unwrap();
+    assert_eq!(rs.rows[0][3].to_text(), "d");
+    let sql = db
+        .query("SELECT sql FROM sqlite_schema WHERE name = 'tb'")
+        .unwrap();
+    assert_eq!(sql.rows[0][0].to_text(), "CREATE INDEX tb ON \"u\"(bb)");
+    assert!(db.execute("ALTER TABLE u DROP COLUMN bb").is_err());
+    db.execute("ALTER TABLE u DROP COLUMN a").unwrap();
+    let rs = db.query("SELECT * FROM u").unwrap();
+    assert_eq!(rs.columns, ["id", "bb", "c"]);
+    check(&db);
+}
+
+#[test]
+fn raise_in_triggers() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE a(id INTEGER PRIMARY KEY, bal INT);
+         CREATE TRIGGER neg BEFORE UPDATE ON a WHEN NEW.bal < 0 BEGIN SELECT RAISE(ABORT, 'negative'); END;
+         CREATE TRIGGER zero BEFORE INSERT ON a WHEN NEW.bal = 0 BEGIN SELECT RAISE(IGNORE); END;
+         CREATE TRIGGER big BEFORE INSERT ON a WHEN NEW.bal > 99 BEGIN SELECT RAISE(FAIL, 'big'); END;",
+    )
+    .unwrap();
+    db.execute("INSERT INTO a(bal) VALUES (5), (0), (7)")
+        .unwrap();
+    let sum =
+        |db: &Database| db.query("SELECT group_concat(bal) FROM a").unwrap().rows[0][0].to_text();
+    assert_eq!(sum(&db), "5,7");
+    assert_eq!(
+        db.execute("UPDATE a SET bal = bal - 6")
+            .unwrap_err()
+            .to_string(),
+        "negative"
+    );
+    assert_eq!(sum(&db), "5,7");
+    // FAIL keeps the rows the statement had already inserted.
+    assert!(db
+        .execute("INSERT INTO a(bal) VALUES (8), (100), (9)")
+        .is_err());
+    assert_eq!(sum(&db), "5,7,8");
+    assert!(db.query("SELECT RAISE(ABORT, 'x')").is_err());
+    check(&db);
+}

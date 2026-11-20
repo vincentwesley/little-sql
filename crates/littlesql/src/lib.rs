@@ -15,6 +15,7 @@
 //! [`sql`] (parser), [`bind`] (name resolution and planning), [`plan`] and
 //! [`exec`] (the plan and its interpreter), and [`db`] (the public handle).
 
+pub mod alter;
 pub mod bind;
 pub mod btree;
 pub mod btree_write;
@@ -86,4 +87,57 @@ pub fn sql_is_complete(sql: &str) -> bool {
         // is complete enough to report.
         Err(e) => !e.to_string().contains("unterminated"),
     }
+}
+
+/// Split SQL text into statements at top-level semicolons (a CREATE
+/// TRIGGER body stays whole), without parsing them. Shells use this to run
+/// statements one at a time, so a syntax error in one does not stop the
+/// statements before it, as in sqlite3.
+pub fn split_statements(sql: &str) -> Result<Vec<String>> {
+    use sql::lexer::Tok;
+    let toks = sql::lexer::tokenize(sql)?;
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut in_trigger = false;
+    let mut first_words: Vec<String> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        match &t.tok {
+            Tok::Eof => break,
+            Tok::Op(";") => {
+                let ends_trigger = i > 0
+                    && matches!(&toks[i - 1].tok, Tok::Word(w) if w.eq_ignore_ascii_case("END"));
+                if in_trigger && !ends_trigger {
+                    continue;
+                }
+                if let Some(s) = start.take() {
+                    out.push(sql[s..t.start].to_string());
+                }
+                in_trigger = false;
+                first_words.clear();
+            }
+            other => {
+                if start.is_none() {
+                    start = Some(t.start);
+                }
+                if first_words.len() < 3 {
+                    if let Tok::Word(w) = other {
+                        first_words.push(w.to_ascii_uppercase());
+                        let fw: Vec<&str> = first_words.iter().map(String::as_str).collect();
+                        if matches!(
+                            fw.as_slice(),
+                            ["CREATE", "TRIGGER"] | ["CREATE", "TEMP" | "TEMPORARY", "TRIGGER"]
+                        ) {
+                            in_trigger = true;
+                        }
+                    } else {
+                        first_words.push(String::new());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(s) = start {
+        out.push(sql[s..].to_string());
+    }
+    Ok(out)
 }

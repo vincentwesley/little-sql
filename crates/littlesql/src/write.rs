@@ -50,6 +50,8 @@ pub(crate) fn run_write(db: &Database, stmt: &Stmt, text: &str) -> Result<Result
             }
             commit(db)?;
             db.explicit_txn.set(false);
+            db.savepoints.borrow_mut().clear();
+            db.savepoint_txn.set(false);
             return Ok(ResultSet::default());
         }
         Stmt::Rollback => {
@@ -60,7 +62,49 @@ pub(crate) fn run_write(db: &Database, stmt: &Stmt, text: &str) -> Result<Result
             }
             db.pager.rollback();
             db.explicit_txn.set(false);
+            db.savepoints.borrow_mut().clear();
+            db.savepoint_txn.set(false);
             db.reload_schema()?;
+            return Ok(ResultSet::default());
+        }
+        Stmt::Savepoint(name) => {
+            if db.pager.is_writable() {
+                prepare_file(db)?;
+            }
+            if !db.explicit_txn.get() {
+                db.explicit_txn.set(true);
+                db.savepoint_txn.set(true);
+            }
+            let views = db.temp_views.borrow().clone();
+            db.savepoints
+                .borrow_mut()
+                .push((name.clone(), db.pager.savepoint(), views));
+            return Ok(ResultSet::default());
+        }
+        Stmt::Release(name) | Stmt::RollbackTo(name) => {
+            let pos = db
+                .savepoints
+                .borrow()
+                .iter()
+                .rposition(|(n, _, _)| n.eq_ignore_ascii_case(name))
+                .ok_or_else(|| Error::Sql(format!("no such savepoint: {name}")))?;
+            if matches!(stmt, Stmt::RollbackTo(_)) {
+                // Undo everything since the savepoint; it stays open.
+                let mut sps = db.savepoints.borrow_mut();
+                sps.truncate(pos + 1);
+                let (_, sp, views) = &sps[pos];
+                db.pager.restore(sp.clone());
+                *db.temp_views.borrow_mut() = views.clone();
+                std::mem::drop(sps);
+                db.reload_schema()?;
+            } else {
+                db.savepoints.borrow_mut().truncate(pos);
+                if pos == 0 && db.savepoint_txn.get() {
+                    commit(db)?;
+                    db.explicit_txn.set(false);
+                    db.savepoint_txn.set(false);
+                }
+            }
             return Ok(ResultSet::default());
         }
         _ => {}
@@ -84,10 +128,24 @@ pub(crate) fn run_write(db: &Database, stmt: &Stmt, text: &str) -> Result<Result
             Ok(rs)
         }
         Err(e) => {
-            if db.explicit_txn.get() {
-                db.pager.restore(sp);
-            } else {
-                db.pager.rollback();
+            match &e {
+                // RAISE(ROLLBACK): the whole transaction ends.
+                Error::Raise(crate::error::RaiseKind::Rollback, _) => {
+                    db.pager.rollback();
+                    db.explicit_txn.set(false);
+                    db.savepoints.borrow_mut().clear();
+                    db.savepoint_txn.set(false);
+                }
+                // RAISE(FAIL): what the statement already did stays.
+                Error::Raise(crate::error::RaiseKind::Fail, _) => {
+                    if !db.explicit_txn.get() {
+                        commit(db)?;
+                    }
+                    db.reload_schema()?;
+                    return Err(e);
+                }
+                _ if db.explicit_txn.get() => db.pager.restore(sp),
+                _ => db.pager.rollback(),
             }
             crate::func::set_counters(crate::func::ConnCounters {
                 last_insert_rowid: before.last_insert_rowid,
@@ -189,6 +247,7 @@ fn execute(db: &Database, stmt: &Stmt, text: &str) -> Result<ResultSet> {
         Stmt::Delete(del) => delete(db, del),
         Stmt::CreateTrigger(ct) => create_trigger(db, ct, text),
         Stmt::Reindex(name) => reindex(db, name.as_deref()),
+        Stmt::AlterTable { table, action } => crate::alter::alter_table(db, table, action),
         other => Err(Error::Unsupported(format!("statement {other:?}"))),
     }
 }
@@ -228,7 +287,7 @@ fn name_taken(db: &Database, name: &str) -> Option<&'static str> {
     }
 }
 
-fn bump_schema_cookie(w: &Writer, db: &Database) -> Result<()> {
+pub(crate) fn bump_schema_cookie(w: &Writer, db: &Database) -> Result<()> {
     let p1 = db.pager.get(1)?;
     let cookie = u32::from_be_bytes(p1[40..44].try_into().unwrap()).wrapping_add(1);
     w.set_header_u32(40, cookie)
@@ -708,7 +767,7 @@ fn fire(
     event: Event,
     set_cols: &[String],
     row: &crate::bind::TriggerRow,
-) -> Result<()> {
+) -> Result<bool> {
     for t in triggers_for(db, table, timing, event, set_cols) {
         let running = FIRING.with(|f| f.borrow().iter().any(|n| n.eq_ignore_ascii_case(&t.name)));
         if running {
@@ -749,9 +808,13 @@ fn fire(
             Ok(())
         });
         FIRING.with(|f| f.borrow_mut().pop());
-        result?;
+        match result {
+            // RAISE(IGNORE): stop, and skip the row being changed.
+            Err(Error::Raise(crate::error::RaiseKind::Ignore, _)) => return Ok(false),
+            r => r?,
+        }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn trigger_row(
@@ -1485,14 +1548,16 @@ fn insert(db: &Database, ins: &ast::Insert) -> Result<ResultSet> {
                 })
             });
             let before = trigger_row(&table, Some((r.unwrap_or(-1), &row)), None);
-            fire(
+            if !fire(
                 db,
                 &table.name,
                 TriggerTiming::Before,
                 Event::Insert,
                 &[],
                 &before,
-            )?;
+            )? {
+                continue;
+            }
         }
         if let Some((rowid, stored)) = ins_.insert_row_full(row, given_rowid)? {
             changes += 1;
@@ -1606,14 +1671,16 @@ fn delete(db: &Database, del: &ast::Delete) -> Result<ResultSet> {
     for (rowid, row, _) in &rows {
         if triggered {
             let tr = trigger_row(&table, None, Some((*rowid, row)));
-            fire(
+            if !fire(
                 db,
                 &table.name,
                 TriggerTiming::Before,
                 Event::Delete,
                 &[],
                 &tr,
-            )?;
+            )? {
+                continue;
+            }
             // A BEFORE trigger may already have removed or changed the row.
             if !table.without_rowid {
                 match ins.row_at(*rowid)? {
@@ -1734,14 +1801,16 @@ fn update(db: &Database, up: &ast::Update) -> Result<ResultSet> {
         }
         if triggered {
             let tr = trigger_row(&table, Some((new_rowid, &row)), Some((rowid, &old)));
-            fire(
+            if !fire(
                 db,
                 &table.name,
                 TriggerTiming::Before,
                 Event::Update,
                 &set_names,
                 &tr,
-            )?;
+            )? {
+                continue;
+            }
         }
         // Take the old row out first so it never conflicts with itself.
         ins.delete_row(rowid, &old)?;

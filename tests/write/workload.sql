@@ -45,3 +45,17 @@ INSERT INTO people(name) VALUES ('last');
 CREATE TABLE checked(id INTEGER PRIMARY KEY, qty INT CHECK (qty >= 0), label TEXT, CONSTRAINT nonempty CHECK (label <> ''));
 INSERT OR IGNORE INTO checked(qty, label) VALUES (1, 'a'), (-1, 'b'), (2, ''), (NULL, 'c');
 UPDATE OR IGNORE checked SET qty = qty - 1;
+-- Savepoints.
+SAVEPOINT sp_outer;
+INSERT INTO checked(qty, label) VALUES (10, 'sp');
+SAVEPOINT sp_inner;
+INSERT INTO checked(qty, label) VALUES (11, 'gone');
+ROLLBACK TO sp_inner;
+RELEASE sp_outer;
+-- ALTER TABLE, rewriting indexes, triggers and views that refer to it.
+ALTER TABLE people ADD COLUMN nickname TEXT DEFAULT 'none';
+ALTER TABLE people RENAME COLUMN born TO birth_year;
+ALTER TABLE temp_data DROP COLUMN "max(name)";
+ALTER TABLE people RENAME TO persons;
+UPDATE persons SET birth_year = 2006 WHERE id = 2;
+INSERT INTO persons(name, birth_year) VALUES ('after alter', 1980);

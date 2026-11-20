@@ -132,14 +132,14 @@ impl Shell {
         let started = Instant::now();
         // Statements run one at a time so earlier results print even if a
         // later one fails.
-        let stmts = match littlesql::sql::parser::parse_statements(sql) {
+        let stmts = match littlesql::split_statements(sql) {
             Ok(s) => s,
             Err(e) => {
                 self.print_error(&e.to_string());
                 return false;
             }
         };
-        for (_, text) in stmts {
+        for text in stmts {
             let t0 = Instant::now();
             match self.db.query(&text) {
                 Ok(rs) => {

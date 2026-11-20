@@ -82,6 +82,7 @@ pub fn lookup_scalar(name: &str, nargs: usize) -> Result<Option<ScalarFn>> {
         ("date", 0, N, crate::datetime::f_date),
         ("time", 0, N, crate::datetime::f_time),
         ("datetime", 0, N, crate::datetime::f_datetime),
+        ("raise", 2, 2, f_raise),
         ("json", 1, 1, crate::json::f_json),
         ("json_valid", 1, 1, crate::json::f_json_valid),
         ("json_type", 1, 2, crate::json::f_json_type),
@@ -587,6 +588,19 @@ fn f_total_changes(_: &[Value]) -> Result<Value> {
 
 fn f_last_insert_rowid(_: &[Value]) -> Result<Value> {
     Ok(Value::Int(counters().last_insert_rowid))
+}
+
+/// `RAISE(kind, message)`: fail the statement in the way `kind` says (the
+/// statement runner in `write` handles each kind).
+fn f_raise(a: &[Value]) -> Result<Value> {
+    use crate::error::RaiseKind;
+    let kind = match a[0].to_text().as_str() {
+        "IGNORE" => RaiseKind::Ignore,
+        "ROLLBACK" => RaiseKind::Rollback,
+        "FAIL" => RaiseKind::Fail,
+        _ => RaiseKind::Abort,
+    };
+    Err(Error::Raise(kind, a[1].to_text()))
 }
 
 fn f_zeroblob(a: &[Value]) -> Result<Value> {

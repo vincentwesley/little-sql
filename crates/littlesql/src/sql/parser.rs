@@ -356,10 +356,50 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("ROLLBACK") {
             self.eat_kw("TRANSACTION");
-            if self.is_kw("TO") {
-                return self.unsupported("savepoints");
+            if self.eat_kw("TO") {
+                self.eat_kw("SAVEPOINT");
+                return Ok(Stmt::RollbackTo(self.ident()?));
             }
             return Ok(Stmt::Rollback);
+        }
+        if self.eat_kw("ALTER") {
+            self.expect_kw("TABLE")?;
+            let table = self.qualified_name()?;
+            let action = if self.eat_kw("RENAME") {
+                if self.eat_kw("TO") {
+                    AlterAction::RenameTable(self.ident()?)
+                } else {
+                    self.eat_kw("COLUMN");
+                    let from = self.ident()?;
+                    self.expect_kw("TO")?;
+                    AlterAction::RenameColumn {
+                        from,
+                        to: self.ident()?,
+                    }
+                }
+            } else if self.eat_kw("ADD") {
+                self.eat_kw("COLUMN");
+                let start = self.toks[self.pos].start;
+                let def = self.column_def()?;
+                let end = self.toks[self.pos - 1].end;
+                AlterAction::AddColumn {
+                    def,
+                    text: self.sql[start..end].to_string(),
+                }
+            } else if self.eat_kw("DROP") {
+                self.eat_kw("COLUMN");
+                AlterAction::DropColumn(self.ident()?)
+            } else {
+                return Err(self.unexpected());
+            };
+            return Ok(Stmt::AlterTable { table, action });
+        }
+        if self.eat_kw("SAVEPOINT") {
+            return Ok(Stmt::Savepoint(self.ident()?));
+        }
+        if self.eat_kw("RELEASE") {
+            self.eat_kw("SAVEPOINT");
+            return Ok(Stmt::Release(self.ident()?));
         }
         if self.eat_kw("PRAGMA") {
             let name = self.qualified_name()?;
@@ -390,13 +430,7 @@ impl<'a> Parser<'a> {
                 return Ok(Stmt::Noop(name));
             }
         }
-        for (kw, what) in [
-            ("ALTER", "ALTER TABLE"),
-            ("SAVEPOINT", "savepoints"),
-            ("RELEASE", "savepoints"),
-            ("ATTACH", "ATTACH"),
-            ("DETACH", "DETACH"),
-        ] {
+        for (kw, what) in [("ATTACH", "ATTACH"), ("DETACH", "DETACH")] {
             if self.is_kw(kw) {
                 return self.unsupported(what);
             }
@@ -1482,6 +1516,35 @@ impl<'a> Parser<'a> {
                         return Ok(Expr::Unary(UnaryOp::Not, Box::new(self.expr_bp(4)?)));
                     }
                     "EXISTS" => return self.exists(),
+                    "RAISE" if self.is_op("(") => {
+                        self.expect_op("(")?;
+                        let kind = self.ident()?.to_ascii_uppercase();
+                        if !["IGNORE", "ROLLBACK", "ABORT", "FAIL"].contains(&kind.as_str()) {
+                            return Err(Error::Parse(format!("near \"{kind}\": syntax error")));
+                        }
+                        let msg = if kind != "IGNORE" {
+                            // As in SQLite, the message is a string literal.
+                            self.expect_op(",")?;
+                            match self.peek().clone() {
+                                Tok::Str(m) => {
+                                    self.pos += 1;
+                                    Expr::Literal(Value::text(m))
+                                }
+                                _ => return Err(self.unexpected()),
+                            }
+                        } else {
+                            Expr::Literal(Value::Null)
+                        };
+                        self.expect_op(")")?;
+                        return Ok(Expr::Function {
+                            name: "raise".into(),
+                            args: vec![Expr::Literal(Value::text(kind)), msg],
+                            distinct: false,
+                            star: false,
+                            filter: None,
+                            over: None,
+                        });
+                    }
                     "NULL" => return Ok(Expr::Literal(Value::Null)),
                     "CASE" => return self.case(),
                     "CAST" => {

@@ -44,6 +44,11 @@ pub struct Database {
     pub(crate) schema: RefCell<Rc<Schema>>,
     /// True between BEGIN and COMMIT/ROLLBACK.
     pub(crate) explicit_txn: std::cell::Cell<bool>,
+    /// Open savepoints, outermost first, each with the state to return to.
+    pub(crate) savepoints: RefCell<Vec<(String, crate::pager::Savepoint, Vec<String>)>>,
+    /// The transaction was started by SAVEPOINT (not BEGIN), so releasing
+    /// the outermost savepoint commits it.
+    pub(crate) savepoint_txn: std::cell::Cell<bool>,
     /// CREATE TEMP VIEW definitions: they belong to this connection only and
     /// are never written to the file.
     pub(crate) temp_views: RefCell<Vec<String>>,
@@ -70,6 +75,8 @@ impl Database {
             pager,
             schema: RefCell::new(schema),
             explicit_txn: std::cell::Cell::new(false),
+            savepoints: RefCell::new(Vec::new()),
+            savepoint_txn: std::cell::Cell::new(false),
             temp_views: RefCell::new(Vec::new()),
             limits: Default::default(),
             wal_path,

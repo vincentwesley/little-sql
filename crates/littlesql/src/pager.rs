@@ -104,6 +104,7 @@ pub struct Pager {
 }
 
 /// Uncommitted changes at a point in time (see [`Pager::savepoint`]).
+#[derive(Clone)]
 pub struct Savepoint {
     dirty: BTreeMap<u32, Page>,
     n_pages: u32,
