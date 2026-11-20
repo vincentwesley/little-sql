@@ -796,11 +796,11 @@
    "mode": "read",
    "engine": "littlesql 0.1.0",
    "reference": "sqlite3 3.45.1",
-   "files": 20,
+   "files": 21,
    "total": {
-    "pass": 424,
+    "pass": 443,
     "fail": 0,
-    "scored": 424,
+    "scored": 443,
     "pass_rate": 100,
     "not_applicable": 0,
     "setup": 0
@@ -992,6 +992,16 @@
      "pass": 15,
      "fail": 0,
      "scored": 15,
+     "pass_rate": 100,
+     "not_applicable": 0,
+     "setup": 0
+    },
+    {
+     "name": "window_frames",
+     "files": 1,
+     "pass": 19,
+     "fail": 0,
+     "scored": 19,
      "pass_rate": 100,
      "not_applicable": 0,
      "setup": 0

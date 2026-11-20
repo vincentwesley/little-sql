@@ -960,6 +960,35 @@ impl<'a> Exec<'a> {
             }
             Ordering::Equal
         };
+        // Compare two values of ORDER BY term `k` in window order.
+        let key_cmp = |k: usize, x: &Value, y: &Value| -> Ordering {
+            let (_, desc, nulls_first, coll) = &w.order[k];
+            match (x.is_null(), y.is_null()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => {
+                    if *nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (false, true) => {
+                    if *nulls_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
+                _ => {
+                    let o = x.compare(y, *coll);
+                    if *desc {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                }
+            }
+        };
         let cmp_ord = |a: usize, b: usize| -> Ordering {
             for (k, (_, desc, nulls_first, coll)) in w.order.iter().enumerate() {
                 let (x, y) = (&ord[a][k], &ord[b][k]);
@@ -996,32 +1025,71 @@ impl<'a> Exec<'a> {
         };
         let mut idx: Vec<usize> = (0..n).collect();
         idx.sort_by(|&a, &b| cmp_part(a, b).then_with(|| cmp_ord(a, b)));
-        // Constant frame offsets.
-        let offset = |me: &mut Exec<'a>, b: &WinBound| -> Result<i64> {
-            match b {
-                WinBound::Preceding(e) | WinBound::Following(e) => {
-                    let v = me.eval(e)?;
-                    match v {
-                        Value::Int(i) if i >= 0 => Ok(i),
-                        Value::Real(r) if r >= 0.0 && r == r.trunc() => Ok(r as i64),
-                        _ => Err(Error::Sql(
-                            "frame starting offset must be a non-negative integer".into(),
-                        )),
+        // Constant frame offsets: whole numbers for ROWS and GROUPS, any
+        // number for RANGE.
+        let range = w.frame.units == WinUnits::Range;
+        let offset = |me: &mut Exec<'a>, b: &WinBound, which: &str| -> Result<Value> {
+            let (WinBound::Preceding(e) | WinBound::Following(e)) = b else {
+                return Ok(Value::Int(0));
+            };
+            let v = me.eval(e)?.apply_numeric_for_compare();
+            let ok = match &v {
+                Value::Int(i) => *i >= 0,
+                Value::Real(r) => *r >= 0.0 && (range || *r == r.trunc()),
+                _ => false,
+            };
+            if !ok {
+                let kind = if range { "number" } else { "integer" };
+                return Err(Error::Runtime(format!(
+                    "frame {which} offset must be a non-negative {kind}"
+                )));
+            }
+            Ok(v)
+        };
+        let start_val = offset(self, &w.frame.start, "starting")?;
+        let end_val = offset(self, &w.frame.end, "ending")?;
+        let start_off = start_val.to_int();
+        let end_off = end_val.to_int();
+        // RANGE n PRECEDING / FOLLOWING: the ORDER BY value shifted by n
+        // (towards earlier rows for PRECEDING). NULLs frame their peers;
+        // text and blobs are not shifted, as in SQLite.
+        let shifted = |v: &Value, off: &Value, preceding: bool| -> Option<Value> {
+            if v.is_null() {
+                return None;
+            }
+            let down = preceding != w.order.first().is_some_and(|o| o.1);
+            Some(match (v, off) {
+                (Value::Int(a), Value::Int(b)) => {
+                    let r = if down {
+                        a.checked_sub(*b)
+                    } else {
+                        a.checked_add(*b)
+                    };
+                    match r {
+                        Some(r) => Value::Int(r),
+                        None => Value::Real(if down {
+                            *a as f64 - *b as f64
+                        } else {
+                            *a as f64 + *b as f64
+                        }),
                     }
                 }
-                _ => Ok(0),
+                (Value::Int(_) | Value::Real(_), _) => {
+                    let (a, b) = (v.to_real(), off.to_real());
+                    Value::Real(if down { a - b } else { a + b })
+                }
+                _ => v.clone(),
+            })
+        };
+        let excluded = |k: usize, j: usize, group: &[usize]| -> bool {
+            use crate::sql::ast::Exclude;
+            match w.frame.exclude {
+                Exclude::NoOthers => false,
+                Exclude::CurrentRow => j == k,
+                Exclude::Group => group[j] == group[k],
+                Exclude::Ties => j != k && group[j] == group[k],
             }
         };
-        let start_off = offset(self, &w.frame.start)?;
-        let end_off = offset(self, &w.frame.end)?;
-        if w.frame.units == WinUnits::Range
-            && (matches!(
-                w.frame.start,
-                WinBound::Preceding(_) | WinBound::Following(_)
-            ) || matches!(w.frame.end, WinBound::Preceding(_) | WinBound::Following(_)))
-        {
-            return Err(Error::Unsupported("RANGE frames with an offset".into()));
-        }
         let mut out = vec![Value::Null; n];
         let mut p0 = 0;
         while p0 < n {
@@ -1054,8 +1122,23 @@ impl<'a> Exec<'a> {
             let frame = |k: usize| -> (i64, i64) {
                 let g = group[k] as i64;
                 let (k, mm) = (k as i64, m as i64);
+                let val = |p: usize| &ord[rows[p]][0];
+                let first_at_or_after = |t: &Value| -> i64 {
+                    rows.partition_point(|r| key_cmp(0, &ord[*r][0], t) == Ordering::Less) as i64
+                };
+                let last_at_or_before = |t: &Value| -> i64 {
+                    rows.partition_point(|r| key_cmp(0, &ord[*r][0], t) != Ordering::Greater) as i64
+                        - 1
+                };
                 let s = match (&w.frame.units, &w.frame.start) {
                     (_, WinBound::UnboundedPreceding) => 0,
+                    (WinUnits::Range, WinBound::Preceding(_) | WinBound::Following(_)) => {
+                        let pre = matches!(w.frame.start, WinBound::Preceding(_));
+                        match shifted(val(k as usize), &start_val, pre) {
+                            Some(t) => first_at_or_after(&t),
+                            None => gstart[g as usize] as i64,
+                        }
+                    }
                     (WinUnits::Rows, WinBound::Preceding(_)) => k - start_off,
                     (WinUnits::Rows, WinBound::CurrentRow) => k,
                     (WinUnits::Rows, WinBound::Following(_)) => k + start_off,
@@ -1075,6 +1158,13 @@ impl<'a> Exec<'a> {
                 };
                 let e = match (&w.frame.units, &w.frame.end) {
                     (_, WinBound::UnboundedFollowing) => mm - 1,
+                    (WinUnits::Range, WinBound::Preceding(_) | WinBound::Following(_)) => {
+                        let pre = matches!(w.frame.end, WinBound::Preceding(_));
+                        match shifted(val(k as usize), &end_val, pre) {
+                            Some(t) => last_at_or_before(&t),
+                            None => gend(g as usize) as i64,
+                        }
+                    }
                     (WinUnits::Rows, WinBound::Preceding(_)) => k - end_off,
                     (WinUnits::Rows, WinBound::CurrentRow) => k,
                     (WinUnits::Rows, WinBound::Following(_)) => k + end_off,
@@ -1097,6 +1187,7 @@ impl<'a> Exec<'a> {
             match w.func {
                 WinFunc::Agg(f) => {
                     let incremental = matches!(w.frame.start, WinBound::UnboundedPreceding)
+                        && w.frame.exclude == crate::sql::ast::Exclude::NoOthers
                         && matches!(
                             w.frame.end,
                             WinBound::CurrentRow | WinBound::UnboundedFollowing
@@ -1122,7 +1213,7 @@ impl<'a> Exec<'a> {
                             let mut j = s;
                             while j <= e {
                                 let r = rows[j as usize];
-                                if keep[r] {
+                                if keep[r] && !excluded(k, j as usize, &group) {
                                     st.step(&args[r]);
                                 }
                                 j += 1;
@@ -1181,9 +1272,20 @@ impl<'a> Exec<'a> {
                             }
                             WinFunc::FirstValue | WinFunc::LastValue | WinFunc::NthValue => {
                                 let (s, e) = frame(k);
+                                // Positions in the frame that are not excluded.
+                                let inframe: Vec<i64> = (s..=e)
+                                    .filter(|j| !excluded(k, *j as usize, &group))
+                                    .collect();
+                                let nth_of = |i: i64| -> i64 {
+                                    usize::try_from(i)
+                                        .ok()
+                                        .and_then(|i| inframe.get(i))
+                                        .copied()
+                                        .unwrap_or(-1)
+                                };
                                 let pos = match w.func {
-                                    WinFunc::FirstValue => s,
-                                    WinFunc::LastValue => e,
+                                    WinFunc::FirstValue => nth_of(0),
+                                    WinFunc::LastValue => inframe.last().copied().unwrap_or(-1),
                                     _ => {
                                         let nth = args[r][1].to_int();
                                         if nth <= 0 {
@@ -1192,10 +1294,10 @@ impl<'a> Exec<'a> {
                                                     .into(),
                                             ));
                                         }
-                                        s + nth - 1
+                                        nth_of(nth - 1)
                                     }
                                 };
-                                if s <= e && pos >= s && pos <= e {
+                                if pos >= 0 {
                                     args[rows[pos as usize]][0].clone()
                                 } else {
                                     Value::Null

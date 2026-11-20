@@ -3,8 +3,8 @@
   "mode": "read",
   "engine": "littlesql 0.1.0",
   "reference": "sqlite3 3.45.1",
-  "files": 20,
-  "total": { "pass": 424, "fail": 0, "scored": 424, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
+  "files": 21,
+  "total": { "pass": 443, "fail": 0, "scored": 443, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
   "categories": [
     { "name": "advanced", "files": 1, "pass": 14, "fail": 0, "scored": 14, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
     { "name": "aggregates", "files": 1, "pass": 23, "fail": 0, "scored": 23, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
@@ -25,6 +25,7 @@
     { "name": "storage_utf16", "files": 1, "pass": 7, "fail": 0, "scored": 7, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
     { "name": "subqueries", "files": 1, "pass": 20, "fail": 0, "scored": 20, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
     { "name": "views", "files": 1, "pass": 15, "fail": 0, "scored": 15, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
+    { "name": "window_frames", "files": 1, "pass": 19, "fail": 0, "scored": 19, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 },
     { "name": "windows", "files": 1, "pass": 26, "fail": 0, "scored": 26, "pass_rate": 100.00, "not_applicable": 0, "setup": 0 }
   ]
 }

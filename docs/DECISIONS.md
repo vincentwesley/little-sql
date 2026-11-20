@@ -419,3 +419,18 @@ exactly, and error positions matched in about 99 % of the malformed cases
 (the rest are trailing-text and number-prefix corner cases). Reason: the
 JSON functions should give sqlite3's answers for the inputs people really
 send, which include JSON5 and escaped text.
+
+## D36. RANGE offsets and EXCLUDE follow SQLite's rules exactly
+
+`RANGE n PRECEDING / FOLLOWING` needs exactly one ORDER BY term (SQLite's
+error otherwise). Each row's bounds are its ORDER BY value shifted by n
+(towards earlier rows for PRECEDING, so the direction flips under DESC),
+found by binary search in the sorted partition; a NULL value frames its
+NULL peers, and text or blob values are not shifted, as in SQLite's
+`windowCodeRangeTest`. Offsets may be fractional for RANGE but must be
+whole for ROWS and GROUPS, with SQLite's error messages. `EXCLUDE CURRENT
+ROW / GROUP / TIES` removes rows from the frame of aggregates and of
+`first_value`, `last_value` and `nth_value`; frames with an exclusion are
+evaluated per row rather than incrementally. Reason: completes the window
+function grammar SQLite 3.45 accepts, verified against sqlite3 on
+NULLs, mixed types, DESC and NULLS FIRST orderings.

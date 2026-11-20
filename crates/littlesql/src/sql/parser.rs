@@ -1780,10 +1780,26 @@ impl<'a> Parser<'a> {
             } else {
                 (self.frame_bound()?, FrameBound::CurrentRow)
             };
-            if self.eat_kw("EXCLUDE") {
-                return self.unsupported("EXCLUDE in a window frame");
-            }
-            spec.frame = Some(Frame { units, start, end });
+            let exclude = if !self.eat_kw("EXCLUDE") {
+                Exclude::NoOthers
+            } else if self.eat_kw("NO") {
+                self.expect_kw("OTHERS")?;
+                Exclude::NoOthers
+            } else if self.eat_kw("CURRENT") {
+                self.expect_kw("ROW")?;
+                Exclude::CurrentRow
+            } else if self.eat_kw("GROUP") {
+                Exclude::Group
+            } else {
+                self.expect_kw("TIES")?;
+                Exclude::Ties
+            };
+            spec.frame = Some(Frame {
+                units,
+                start,
+                end,
+                exclude,
+            });
         }
         self.expect_op(")")?;
         Ok(spec)
@@ -1919,10 +1935,8 @@ mod tests {
         assert!(parse_one("SELECT FROM").is_err());
         assert!(parse_one("SELECT 1 +").is_err());
         assert!(parse_one("SELEC 1").is_err());
-        assert!(matches!(
-            parse_one("SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE TIES) FROM t"),
-            Err(Error::Unsupported(_))
-        ));
+        assert!(parse_one("SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE TIES) FROM t").is_ok());
+        assert!(parse_one("SELECT sum(x) OVER (ORDER BY y EXCLUDE TIES) FROM t").is_err());
         assert!(parse_one(
             "SELECT rank() OVER w, sum(x) OVER (w ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING) \
              FROM t WINDOW w AS (PARTITION BY a ORDER BY b DESC)"

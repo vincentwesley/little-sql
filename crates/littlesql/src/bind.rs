@@ -1989,6 +1989,7 @@ impl<'a> Binder<'a> {
                     units: WinUnits::Range,
                     start: WinBound::UnboundedPreceding,
                     end: WinBound::CurrentRow,
+                    exclude: ast::Exclude::NoOthers,
                 },
                 Some(f) => WinFrame {
                     units: match f.units {
@@ -1998,8 +1999,19 @@ impl<'a> Binder<'a> {
                     },
                     start: bound_of(&f.start)?,
                     end: bound_of(&f.end)?,
+                    exclude: f.exclude,
                 },
             };
+            let has_offset =
+                |b: &WinBound| matches!(b, WinBound::Preceding(_) | WinBound::Following(_));
+            if frame.units == WinUnits::Range
+                && (has_offset(&frame.start) || has_offset(&frame.end))
+                && order.len() != 1
+            {
+                return Err(Error::Sql(
+                    "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression".into(),
+                ));
+            }
             if matches!(frame.start, WinBound::UnboundedFollowing)
                 || matches!(frame.end, WinBound::UnboundedPreceding)
             {

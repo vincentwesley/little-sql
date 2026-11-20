@@ -232,6 +232,7 @@ pub struct WinFrame {
     pub units: WinUnits,
     pub start: WinBound,
     pub end: WinBound,
+    pub exclude: crate::sql::ast::Exclude,
 }
 
 pub struct Agg {

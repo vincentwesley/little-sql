@@ -24,7 +24,7 @@ run the same queries through the `sqlite3` tool and compare the answers.
 | sqllogictest, full corpus (622 files), read mode | 5,729,099 | 0 | 100.00 % |
 | sqllogictest, CI sample (622 files), native mode | 5,939,879 | 0 | 100.00 % |
 | sqllogictest, CI sample (622 files), read mode | 5,729,099 | 0 | 100.00 % |
-| Differential tests against sqlite3 3.45.1 | 424 | 0 | 100.00 % |
+| Differential tests against sqlite3 3.45.1 | 443 | 0 | 100.00 % |
 <!-- results:end -->
 
 What the numbers mean:
@@ -148,8 +148,8 @@ push and keeps it as a downloadable artifact.
   `WITH RECURSIVE`, and window functions (`row_number`, `rank`,
   `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`,
   `first_value`, `last_value`, `nth_value` and every aggregate, with
-  `PARTITION BY`, `ORDER BY`, `ROWS` / `GROUPS` / `RANGE` frames, `FILTER`
-  and named `WINDOW`s), and JSON (`json`, `json_extract`, `->`, `->>`,
+  `PARTITION BY`, `ORDER BY`, `ROWS` / `GROUPS` / `RANGE` frames with
+  numeric offsets, `EXCLUDE`, `FILTER` and named `WINDOW`s), and JSON (`json`, `json_extract`, `->`, `->>`,
   `json_array`, `json_object`, `json_type`, `json_valid`,
   `json_array_length`, `json_quote`, `json_group_array`,
   `json_group_object`, the editing functions `json_set`, `json_insert`,
@@ -176,8 +176,7 @@ push and keeps it as a downloadable artifact.
 
 - The `jsonb_*` functions that return binary JSON (JSONB input is read),
   virtual tables other than `json_each` / `json_tree`, `ATTACH`, TEMP
-  tables; `RANGE` window frames with a
-  numeric offset and frame `EXCLUDE`.
+  tables.
 - Expression and partial indexes: tables with them are readable (the
   planner ignores those indexes) but Little SQL refuses to write to them.
 - Foreign keys are parsed but not enforced, which is also SQLite's default.

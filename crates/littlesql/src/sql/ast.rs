@@ -157,6 +157,16 @@ pub struct Frame {
     pub units: FrameUnits,
     pub start: FrameBound,
     pub end: FrameBound,
+    pub exclude: Exclude,
+}
+
+/// `EXCLUDE ...` in a window frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exclude {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
 }
 
 #[derive(Clone, Debug, PartialEq)]

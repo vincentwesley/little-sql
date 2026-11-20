@@ -16,7 +16,7 @@ checks, verified from a fresh clone of `claude/nice-brown-acniv0` (1 min
 | sqllogictest full corpus (622 files), read mode | 5,729,099 | 0 | 100.00 % |
 | sqllogictest CI sample (49 files), native mode | 323,361 | 0 | 100.00 % |
 | sqllogictest CI sample (49 files), read mode | 240,267 | 0 | 100.00 % |
-| Differential tests vs sqlite3 3.45.1 (20 files, 5 fixtures) | 424 | 0 | 100.00 % |
+| Differential tests vs sqlite3 3.45.1 (21 files, 5 fixtures) | 443 | 0 | 100.00 % |
 | Planner: plans identical to sqlite3's `EXPLAIN QUERY PLAN` | 33 | 0 | — |
 
 Reference: sqlite3 3.45.1 (DECISIONS D25). Numbers come from
@@ -40,7 +40,7 @@ by hand.
   `build-demo-db.sh`, `build-playground.sh`, `playground-smoke.mjs`,
   `publish-results.mjs`, `write-check.sh`, `crash-check.sh`, `bench.sh`.
 - `data/` — the HDB resale CSV (2022 onwards, Singapore Open Data Licence).
-- `docs/` — PLAN, DECISIONS (D1–D35), RESEARCH, ACCEPTANCE, results/.
+- `docs/` — PLAN, DECISIONS (D1–D36), RESEARCH, ACCEPTANCE, results/.
 
 ## How to continue
 
@@ -73,7 +73,7 @@ by hand.
 ## Done and verified
 
 Final pass rate: **5,939,879 / 5,939,879 (100.00 %)** on the full
-sqllogictest corpus in native mode; 424 / 424 differential tests.
+sqllogictest corpus in native mode; 443 / 443 differential tests.
 
 - M0 Foundations: Cargo workspace, MIT licence, SECURITY.md, README for
   users, CI on GitHub Actions (fmt, clippy, tests, build, acceptance;
@@ -114,8 +114,10 @@ sqllogictest corpus in native mode; 424 / 424 differential tests.
   (`json_set`, `json_insert`, `json_replace`, `json_remove`,
   `json_patch`), JSON5 input with escapes kept as written,
   `json_valid(x, flags)` and `json_error_position` (D35; fuzzed against
-  sqlite3), and shell error messages worded as sqlite3's (D34). Each has a
-  differential test file (`json_table`, `json_edit`, `json5`).
+  sqlite3), shell error messages worded as sqlite3's (D34), and window
+  frames with `RANGE n PRECEDING / FOLLOWING` and `EXCLUDE` (D36). Each
+  has a differential test file (`json_table`, `json_edit`, `json5`,
+  `window_frames`).
 - M10 Final review: fresh-clone acceptance (19/19), README read-through
   and CLI / playground run as a stranger (fixed: a new empty database
   reported corruption on `.tables`; README test commands), one pull
@@ -128,10 +130,9 @@ sqllogictest corpus in native mode; 424 / 424 differential tests.
   NEEDS-VIN. CI keeps the built site as a downloadable artifact.
 - **`jsonb_*` functions** (which return binary JSON), **TEMP tables and
   triggers**, **virtual tables** other than `json_each` / `json_tree`,
-  **ATTACH**, **RANGE frames with a numeric offset**, **frame EXCLUDE**:
-  not exercised by the corpus; each is rejected with a clear "not
-  supported" error rather than approximated. Most useful next: the window
-  frame gaps, then TEMP tables / ATTACH (a second schema).
+  **ATTACH**: not exercised by the corpus; each is rejected with a clear
+  "not supported" error rather than approximated. Most useful next: TEMP
+  tables / ATTACH (a second schema).
 - **Multi-process access** (file locks, `-shm`): out of scope by design
   (DECISIONS D13).
 - **SQLite-grade speed**: would need a bytecode VM and three-sibling
