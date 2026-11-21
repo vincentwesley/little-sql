@@ -28,6 +28,7 @@ use crate::pager::{Pager, HEADER_SIZE};
 use crate::record::{decode_all, read_varint, write_varint, TextEncoding};
 use crate::value::{Collation, Value};
 use std::cmp::Ordering;
+use std::rc::Rc;
 
 /// One b-tree page held in memory while it changes.
 struct Node {
@@ -134,8 +135,8 @@ pub enum Key<'k> {
 }
 
 /// The b-tree writer for one pager.
-pub struct Writer<'p> {
-    pager: &'p Pager,
+pub struct Writer {
+    pager: Rc<Pager>,
     /// The insert being stored went at the very end of its leaf.
     append: std::cell::Cell<bool>,
     usable: usize,
@@ -151,10 +152,10 @@ fn header_len(kind: u8) -> usize {
     }
 }
 
-impl<'p> Writer<'p> {
-    pub fn new(pager: &'p Pager) -> Writer<'p> {
+impl Writer {
+    pub fn new(pager: &Rc<Pager>) -> Writer {
         Writer {
-            pager,
+            pager: pager.clone(),
             append: std::cell::Cell::new(false),
             usable: pager.usable_size(),
             enc: pager.encoding(),
@@ -182,7 +183,7 @@ impl<'p> Writer<'p> {
     }
 
     fn read_node(&self, pgno: u32) -> Result<Node> {
-        let page = PageRef::load(self.pager, pgno)?;
+        let page = PageRef::load(&self.pager, pgno)?;
         let kind = page.kind();
         let mut cells = Vec::with_capacity(page.ncells());
         for i in 0..page.ncells() {
@@ -370,7 +371,7 @@ impl<'p> Writer<'p> {
             pgno: 0,
             data: std::rc::Rc::from(cell.to_vec()),
         };
-        Ok(read_payload(self.pager, &page, &c)?.as_slice().to_vec())
+        Ok(read_payload(&self.pager, &page, &c)?.as_slice().to_vec())
     }
 
     fn cell_rowid(cell: &[u8], kind: u8) -> i64 {
@@ -527,7 +528,7 @@ impl<'p> Writer<'p> {
             }
             Key::Entry { fields, order, n } => {
                 let cell = parse_cell(&page.data, off, kind, self.usable)?;
-                let payload = read_payload(self.pager, page, &cell)?;
+                let payload = read_payload(&self.pager, page, &cell)?;
                 order.compare_stored(fields, payload.as_slice(), *n, self.enc)
             }
         }
@@ -552,7 +553,7 @@ impl<'p> Writer<'p> {
     fn try_insert_in_place(&self, root: u32, key: &Key, cell: &[u8]) -> Result<bool> {
         let mut pgno = root;
         for _ in 0..40 {
-            let page = PageRef::load(self.pager, pgno)?;
+            let page = PageRef::load(&self.pager, pgno)?;
             let (i, eq) = self.search_page(&page, key)?;
             if eq && (page.is_leaf() || page.is_index()) {
                 return Ok(false);
@@ -827,7 +828,7 @@ impl<'p> Writer<'p> {
     fn try_delete_in_place(&self, root: u32, key: &Key) -> Result<InPlace> {
         let mut pgno = root;
         for _ in 0..40 {
-            let page = PageRef::load(self.pager, pgno)?;
+            let page = PageRef::load(&self.pager, pgno)?;
             let (i, eq) = self.search_page(&page, key)?;
             if !page.is_leaf() {
                 if eq && page.is_index() {

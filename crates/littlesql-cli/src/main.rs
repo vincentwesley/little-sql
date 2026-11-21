@@ -8,6 +8,8 @@
 //! With SQL on the command line it runs it and exits; otherwise it reads
 //! statements from standard input (with a prompt when that is a terminal).
 
+mod dump;
+
 use littlesql::plan::render_plan;
 use littlesql::{Database, Limits, ResultSet, Value};
 use std::io::{BufRead, IsTerminal, Write};
@@ -35,7 +37,8 @@ Options:
 
 const DOT_HELP: &str = "\
 .bail on|off          Stop after hitting an error
-.databases            Show the open database file
+.databases            List the database files (main, temp, attached)
+.dump ?PATTERN?       Write the database (or matching tables) as SQL text
 .eqp on|off           Show the query plan (with row counts) after each query
 .exit / .quit         Leave the shell
 .headers on|off       Show or hide column names
@@ -450,6 +453,24 @@ impl Shell {
             .map_err(|e| e.to_string())
     }
 
+    /// The connection's files as (quoted name, prefix for listings):
+    /// main, temp (once used) and attached files.
+    fn databases(&self) -> Vec<(String, String)> {
+        self.query_rows("PRAGMA database_list")
+            .unwrap_or_default()
+            .iter()
+            .map(|r| {
+                let name = r[1].to_text();
+                let prefix = if name == "main" {
+                    String::new()
+                } else {
+                    format!("{name}.")
+                };
+                (dump::quote_name(&name), prefix)
+            })
+            .collect()
+    }
+
     fn like_pattern(arg: Option<&str>) -> String {
         match arg {
             Some(p) => format!(" AND name LIKE '{}'", p.replace('\'', "''")),
@@ -468,34 +489,47 @@ impl Shell {
                 let _ = write!(self.out, "{DOT_HELP}");
             }
             ".tables" | ".table" => {
-                let sql = format!(
-                    "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') \
-                     AND name NOT LIKE 'sqlite_%'{} ORDER BY name",
-                    Self::like_pattern(arg1)
-                );
-                match self.query_rows(&sql) {
-                    Ok(rows) => {
-                        let names: Vec<String> = rows.iter().map(|r| r[0].to_text()).collect();
-                        print_columns(&mut self.out, &names);
+                let mut names = Vec::new();
+                for (db, prefix) in self.databases() {
+                    let sql = format!(
+                        "SELECT name FROM {db}.sqlite_schema WHERE type IN ('table', 'view') \
+                         AND name NOT LIKE 'sqlite_%'{}",
+                        Self::like_pattern(arg1)
+                    );
+                    match self.query_rows(&sql) {
+                        Ok(rows) => {
+                            names.extend(rows.iter().map(|r| format!("{prefix}{}", r[0].to_text())))
+                        }
+                        Err(e) => {
+                            self.print_error(&e);
+                            return Flow::Continue;
+                        }
                     }
-                    Err(e) => self.print_error(&e),
                 }
+                names.sort();
+                print_columns(&mut self.out, &names);
             }
             ".indexes" | ".indices" => {
                 let filter = match arg1 {
                     Some(t) => format!(" AND tbl_name LIKE '{}'", t.replace('\'', "''")),
                     None => String::new(),
                 };
-                let sql = format!(
-                    "SELECT name FROM sqlite_schema WHERE type = 'index'{filter} ORDER BY name"
-                );
-                match self.query_rows(&sql) {
-                    Ok(rows) => {
-                        let names: Vec<String> = rows.iter().map(|r| r[0].to_text()).collect();
-                        print_columns(&mut self.out, &names);
+                let mut names = Vec::new();
+                for (db, prefix) in self.databases() {
+                    let sql =
+                        format!("SELECT name FROM {db}.sqlite_schema WHERE type = 'index'{filter}");
+                    match self.query_rows(&sql) {
+                        Ok(rows) => {
+                            names.extend(rows.iter().map(|r| format!("{prefix}{}", r[0].to_text())))
+                        }
+                        Err(e) => {
+                            self.print_error(&e);
+                            return Flow::Continue;
+                        }
                     }
-                    Err(e) => self.print_error(&e),
                 }
+                names.sort();
+                print_columns(&mut self.out, &names);
             }
             ".schema" => {
                 let filter = match arg1 {
@@ -505,47 +539,61 @@ impl Shell {
                     }
                     None => String::new(),
                 };
-                let sql = format!(
-                    "SELECT sql, type, name FROM sqlite_schema WHERE sql IS NOT NULL \
-                     AND name NOT LIKE 'sqlite_%'{filter} ORDER BY rowid"
-                );
-                match self.query_rows(&sql) {
-                    Ok(rows) => {
-                        for r in rows {
-                            let mut text = r[0].to_text();
-                            // Like sqlite3, follow a view with its column names.
-                            if r[1].to_text() == "view" {
-                                let name = r[2].to_text();
-                                let q = format!(
-                                    "SELECT * FROM \"{}\" LIMIT 0",
-                                    name.replace('"', "\"\"")
-                                );
-                                if let Ok(rs) = self.db.query(&q) {
-                                    text.push_str(&format!(
-                                        "\n/* {}({}) */",
-                                        name,
-                                        rs.columns.join(",")
-                                    ));
-                                }
-                            }
-                            let _ = writeln!(self.out, "{text};");
+                for (db, prefix) in self.databases() {
+                    let sql = format!(
+                        "SELECT sql, type, name FROM {db}.sqlite_schema WHERE sql IS NOT NULL \
+                         AND name NOT LIKE 'sqlite_%'{filter} ORDER BY rowid"
+                    );
+                    let rows = match self.query_rows(&sql) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            self.print_error(&e);
+                            return Flow::Continue;
                         }
+                    };
+                    for r in rows {
+                        let mut text = add_schema(&r[0].to_text(), &prefix);
+                        // Like sqlite3, follow a view with its column names.
+                        if r[1].to_text() == "view" {
+                            let name = r[2].to_text();
+                            let q =
+                                format!("SELECT * FROM {db}.{} LIMIT 0", dump::quote_name(&name));
+                            if let Ok(rs) = self.db.query(&q) {
+                                let cols: Vec<String> =
+                                    rs.columns.iter().map(|c| dump::quote_name(c)).collect();
+                                text.push_str(&format!(
+                                    "\n/* {prefix}{}({}) */",
+                                    dump::quote_name(&name),
+                                    cols.join(",")
+                                ));
+                            }
+                        }
+                        let _ = writeln!(self.out, "{text};");
                     }
-                    Err(e) => self.print_error(&e),
                 }
             }
-            ".databases" => {
-                let _ = writeln!(
-                    self.out,
-                    "main: {} {}",
-                    if self.path.is_empty() {
-                        "\"\""
-                    } else {
-                        &self.path
-                    },
-                    if self.readonly { "r/o" } else { "r/w" }
-                );
-            }
+            ".databases" => match self.query_rows("PRAGMA database_list") {
+                Ok(rows) => {
+                    for r in rows {
+                        let file = r[2].to_text();
+                        let name = r[1].to_text();
+                        let ro = name == "main" && self.readonly;
+                        let _ = writeln!(
+                            self.out,
+                            "{name}: {} {}",
+                            if file.is_empty() { "\"\"" } else { &file },
+                            if ro { "r/o" } else { "r/w" }
+                        );
+                    }
+                }
+                Err(e) => self.print_error(&e),
+            },
+            ".dump" => match dump::dump(&self.db, arg1) {
+                Ok(text) => {
+                    let _ = write!(self.out, "{text}");
+                }
+                Err(e) => self.print_error(&e),
+            },
             ".mode" => match arg1.and_then(Mode::parse) {
                 Some(m) => self.mode = m,
                 None => self.print_error(
@@ -737,22 +785,43 @@ fn json_string(s: &str) -> String {
     out
 }
 
+/// A stored CREATE statement shown for a database other than main: the
+/// object's name gets the `db.` prefix, as sqlite3's `.schema` writes it.
+fn add_schema(sql: &str, prefix: &str) -> String {
+    if prefix.is_empty() {
+        return sql.to_string();
+    }
+    let words = [
+        "CREATE TABLE ",
+        "CREATE VIEW ",
+        "CREATE INDEX ",
+        "CREATE UNIQUE INDEX ",
+        "CREATE TRIGGER ",
+    ];
+    for w in words {
+        if sql.len() >= w.len() && sql[..w.len()].eq_ignore_ascii_case(w) {
+            return format!("{}{prefix}{}", &sql[..w.len()], &sql[w.len()..]);
+        }
+    }
+    sql.to_string()
+}
+
 /// Print names in columns, as sqlite3's `.tables` does.
 fn print_columns(out: &mut Box<dyn Write>, names: &[String]) {
     if names.is_empty() {
         return;
     }
-    let w = names.iter().map(|n| n.chars().count()).max().unwrap_or(0) + 2;
-    let per_row = (80 / w).max(1);
+    // sqlite3 pads every name to the longest and puts two spaces between
+    // columns (keeping the padding at the end of a line).
+    let w = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+    let per_row = (80 / (w + 2)).max(1);
     let rows = names.len().div_ceil(per_row);
     for r in 0..rows {
-        let mut line = String::new();
-        for c in 0..per_row {
-            if let Some(n) = names.get(c * rows + r) {
-                line.push_str(&format!("{n:<w$}"));
-            }
-        }
-        let _ = writeln!(out, "{}", line.trim_end());
+        let cells: Vec<String> = (0..per_row)
+            .filter_map(|c| names.get(c * rows + r))
+            .map(|n| format!("{n:<w$}"))
+            .collect();
+        let _ = writeln!(out, "{}", cells.join("  "));
     }
 }
 

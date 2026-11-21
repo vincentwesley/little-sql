@@ -31,6 +31,31 @@ use std::rc::Rc;
 /// SQLite 3.45.1, the version whose file format this engine writes.
 const SQLITE_VERSION_NUMBER: u32 = 3_045_001;
 
+/// A savepoint of every file of the connection.
+pub(crate) fn savepoint_all(
+    db: &Database,
+) -> Vec<(Rc<crate::pager::Pager>, crate::pager::Savepoint)> {
+    db.pagers()
+        .into_iter()
+        .map(|p| {
+            let sp = p.savepoint();
+            (p, sp)
+        })
+        .collect()
+}
+
+pub(crate) fn restore_all(sps: Vec<(Rc<crate::pager::Pager>, crate::pager::Savepoint)>) {
+    for (p, sp) in sps {
+        p.restore(sp);
+    }
+}
+
+pub(crate) fn rollback_all(db: &Database) {
+    for p in db.pagers() {
+        p.rollback();
+    }
+}
+
 pub(crate) fn run_write(db: &Database, stmt: &Stmt, text: &str) -> Result<ResultSet> {
     match stmt {
         Stmt::Begin => {
@@ -60,7 +85,7 @@ pub(crate) fn run_write(db: &Database, stmt: &Stmt, text: &str) -> Result<Result
                     "cannot rollback - no transaction is active".into(),
                 ));
             }
-            db.pager.rollback();
+            rollback_all(db);
             db.explicit_txn.set(false);
             db.savepoints.borrow_mut().clear();
             db.savepoint_txn.set(false);
@@ -69,16 +94,14 @@ pub(crate) fn run_write(db: &Database, stmt: &Stmt, text: &str) -> Result<Result
         }
         Stmt::Savepoint(name) => {
             if db.pager.is_writable() {
-                prepare_file(db)?;
+                prepare_file(&db.pager)?;
             }
             if !db.explicit_txn.get() {
                 db.explicit_txn.set(true);
                 db.savepoint_txn.set(true);
             }
-            let views = db.temp_views.borrow().clone();
-            db.savepoints
-                .borrow_mut()
-                .push((name.clone(), db.pager.savepoint(), views));
+            let sps = savepoint_all(db);
+            db.savepoints.borrow_mut().push((name.clone(), sps));
             return Ok(ResultSet::default());
         }
         Stmt::Release(name) | Stmt::RollbackTo(name) => {
@@ -86,16 +109,15 @@ pub(crate) fn run_write(db: &Database, stmt: &Stmt, text: &str) -> Result<Result
                 .savepoints
                 .borrow()
                 .iter()
-                .rposition(|(n, _, _)| n.eq_ignore_ascii_case(name))
+                .rposition(|(n, _)| n.eq_ignore_ascii_case(name))
                 .ok_or_else(|| Error::Sql(format!("no such savepoint: {name}")))?;
             if matches!(stmt, Stmt::RollbackTo(_)) {
                 // Undo everything since the savepoint; it stays open.
                 let mut sps = db.savepoints.borrow_mut();
                 sps.truncate(pos + 1);
-                let (_, sp, views) = &sps[pos];
-                db.pager.restore(sp.clone());
-                *db.temp_views.borrow_mut() = views.clone();
+                let saved = sps[pos].1.clone();
                 std::mem::drop(sps);
+                restore_all(saved);
                 db.reload_schema()?;
             } else {
                 db.savepoints.borrow_mut().truncate(pos);
@@ -107,16 +129,19 @@ pub(crate) fn run_write(db: &Database, stmt: &Stmt, text: &str) -> Result<Result
             }
             return Ok(ResultSet::default());
         }
+        Stmt::Attach { file, name } => return crate::attach::attach(db, file, name),
+        Stmt::Detach(name) => return crate::attach::detach(db, name),
         _ => {}
     }
-    prepare_file(db)?;
-    let sp = db.pager.savepoint();
+    let target = statement_target(db, stmt)?;
+    prepare_file(&target)?;
+    let sp = savepoint_all(db);
     let before = crate::func::counters();
-    match execute(db, stmt, text) {
+    match db.with_target(target, || execute(db, stmt, text)) {
         Ok(rs) => {
             if !db.explicit_txn.get() {
                 if let Err(e) = commit(db) {
-                    db.pager.rollback();
+                    rollback_all(db);
                     db.reload_schema()?;
                     return Err(e);
                 }
@@ -131,7 +156,7 @@ pub(crate) fn run_write(db: &Database, stmt: &Stmt, text: &str) -> Result<Result
             match &e {
                 // RAISE(ROLLBACK): the whole transaction ends.
                 Error::Raise(crate::error::RaiseKind::Rollback, _) => {
-                    db.pager.rollback();
+                    rollback_all(db);
                     db.explicit_txn.set(false);
                     db.savepoints.borrow_mut().clear();
                     db.savepoint_txn.set(false);
@@ -144,8 +169,8 @@ pub(crate) fn run_write(db: &Database, stmt: &Stmt, text: &str) -> Result<Result
                     db.reload_schema()?;
                     return Err(e);
                 }
-                _ if db.explicit_txn.get() => db.pager.restore(sp),
-                _ => db.pager.rollback(),
+                _ if db.explicit_txn.get() => restore_all(sp),
+                _ => rollback_all(db),
             }
             crate::func::set_counters(crate::func::ConnCounters {
                 last_insert_rowid: before.last_insert_rowid,
@@ -157,10 +182,153 @@ pub(crate) fn run_write(db: &Database, stmt: &Stmt, text: &str) -> Result<Result
     }
 }
 
+/// The file a statement changes: named by a `db.` qualifier or `TEMP`, or
+/// else the file of the object it names, found in SQLite's order (temp,
+/// main, attached). Defaults to main.
+pub(crate) fn statement_target(db: &Database, stmt: &Stmt) -> Result<Rc<crate::pager::Pager>> {
+    let schema = db.schema();
+    // Inside a non-TEMP trigger, unqualified names mean its own file.
+    let fixed = crate::bind::fixed_db();
+    let named = |q: &Option<String>| -> Result<Option<Rc<crate::pager::Pager>>> {
+        q.as_deref()
+            .or(fixed.as_deref())
+            .map(|d| db.file_pager(d))
+            .transpose()
+    };
+    let of_table = |q: &Option<String>, name: &str| -> Result<Option<Rc<crate::pager::Pager>>> {
+        let q = &q.clone().or_else(|| fixed.clone());
+        if let Some(t) = schema.table_in(q.as_deref(), name)? {
+            return Ok(t.pager.clone());
+        }
+        if let Some(v) = schema.view_in(q.as_deref(), name)? {
+            return Ok(v.pager.clone());
+        }
+        named(q)
+    };
+    let temp = || db.file_pager("temp");
+    let found = match stmt {
+        Stmt::CreateTable(ct) => {
+            if ct.temp
+                && ct
+                    .db
+                    .as_deref()
+                    .is_some_and(|d| !d.eq_ignore_ascii_case("temp"))
+            {
+                return Err(Error::Sql(
+                    "temporary table name must be unqualified".into(),
+                ));
+            }
+            if ct.temp {
+                Some(temp()?)
+            } else {
+                named(&ct.db)?
+            }
+        }
+        Stmt::CreateView(cv) => {
+            if cv.temp
+                && cv
+                    .db
+                    .as_deref()
+                    .is_some_and(|d| !d.eq_ignore_ascii_case("temp"))
+            {
+                return Err(Error::Sql("temporary view name must be unqualified".into()));
+            }
+            if cv.temp {
+                Some(temp()?)
+            } else {
+                named(&cv.db)?
+            }
+        }
+        Stmt::CreateIndex(ci) => match &ci.db {
+            Some(_) => named(&ci.db)?,
+            None => schema.table(&ci.table).and_then(|t| t.pager.clone()),
+        },
+        Stmt::CreateTrigger(ct) => {
+            if ct.temp
+                && ct
+                    .db
+                    .as_deref()
+                    .is_some_and(|d| !d.eq_ignore_ascii_case("temp"))
+            {
+                return Err(Error::Sql(
+                    "temporary trigger may not have qualified name".into(),
+                ));
+            }
+            // A trigger on a temp table is a temp trigger.
+            let on_temp = ct.table_db.is_none()
+                && of_table(&None, &ct.table)?.is_some_and(|p| Rc::ptr_eq(&p, &temp().unwrap()));
+            if ct.temp || on_temp && ct.db.is_none() {
+                Some(temp()?)
+            } else {
+                let own_name = ct.db.as_deref().unwrap_or("main");
+                if let Some(d) = &ct.table_db {
+                    if !d.eq_ignore_ascii_case(own_name) {
+                        return Err(Error::Sql(format!(
+                            "trigger {} cannot reference objects in database {d}",
+                            ct.name
+                        )));
+                    }
+                }
+                Some(db.file_pager(own_name)?)
+            }
+        }
+        Stmt::Drop {
+            kind, db: q, name, ..
+        } => {
+            let found = match kind {
+                DropKind::Table => schema
+                    .table_in(q.as_deref(), name)?
+                    .and_then(|t| t.pager.clone()),
+                DropKind::View => schema
+                    .view_in(q.as_deref(), name)?
+                    .and_then(|v| v.pager.clone()),
+                DropKind::Index => match q {
+                    Some(d) => schema
+                        .db_or_err(d)?
+                        .index(name)
+                        .and_then(|(t, _)| t.pager.clone()),
+                    None => schema.index(name).and_then(|(t, _)| t.pager.clone()),
+                },
+                DropKind::Trigger => match q {
+                    Some(d) => schema
+                        .db_or_err(d)?
+                        .trigger(name)
+                        .and_then(|t| t.pager.clone()),
+                    None => schema
+                        .priority()
+                        .find_map(|s| s.trigger(name).and_then(|t| t.pager.clone())),
+                },
+            };
+            match found {
+                Some(p) => Some(p),
+                None => named(q)?,
+            }
+        }
+        Stmt::Insert(ast::Insert { db: q, table, .. })
+        | Stmt::Update(ast::Update { db: q, table, .. })
+        | Stmt::Delete(ast::Delete { db: q, table, .. })
+        | Stmt::AlterTable { db: q, table, .. } => {
+            let q = &q.clone().or_else(|| fixed.clone());
+            let found = if schema.table_in(q.as_deref(), table)?.is_some()
+                || schema.view_in(q.as_deref(), table)?.is_some()
+            {
+                of_table(q, table)?
+            } else {
+                None
+            };
+            if let (None, Some(d)) = (&found, q) {
+                return Err(Error::Sql(format!("no such table: {d}.{table}")));
+            }
+            found
+        }
+        _ => None,
+    };
+    Ok(found.unwrap_or_else(|| db.pager.clone()))
+}
+
 /// Before the first change: give a new database its first page, and move a
 /// file-backed database to WAL mode on disk (see DECISIONS D12).
-fn prepare_file(db: &Database) -> Result<()> {
-    let pager = &db.pager;
+fn prepare_file(pager: &Rc<crate::pager::Pager>) -> Result<()> {
     if !pager.is_writable() {
         return Err(Error::Runtime(
             "attempt to write a readonly database".into(),
@@ -213,7 +381,13 @@ fn prepare_file(db: &Database) -> Result<()> {
 /// Commit the open transaction: update the file header, then make the
 /// pages durable (and checkpoint now and then).
 pub(crate) fn commit(db: &Database) -> Result<()> {
-    let pager = &db.pager;
+    for pager in db.pagers() {
+        commit_file(&pager)?;
+    }
+    Ok(())
+}
+
+fn commit_file(pager: &crate::pager::Pager) -> Result<()> {
     if !pager.in_transaction() {
         return Ok(());
     }
@@ -241,13 +415,14 @@ fn execute(db: &Database, stmt: &Stmt, text: &str) -> Result<ResultSet> {
             kind,
             if_exists,
             name,
+            ..
         } => drop(db, *kind, *if_exists, name),
         Stmt::Insert(ins) => insert(db, ins),
         Stmt::Update(up) => update(db, up),
         Stmt::Delete(del) => delete(db, del),
         Stmt::CreateTrigger(ct) => create_trigger(db, ct, text),
         Stmt::Reindex(name) => reindex(db, name.as_deref()),
-        Stmt::AlterTable { table, action } => crate::alter::alter_table(db, table, action),
+        Stmt::AlterTable { table, action, .. } => crate::alter::alter_table(db, table, action),
         other => Err(Error::Unsupported(format!("statement {other:?}"))),
     }
 }
@@ -277,13 +452,17 @@ fn stored_sql(text: &str, kind: &str) -> Result<String> {
     if i + 2 < toks.len() && word(i, "IF") && word(i + 1, "NOT") && word(i + 2, "EXISTS") {
         i += 3;
     }
+    // SQLite stores the name without its `schema.` qualifier.
+    if i + 2 < toks.len() && matches!(&toks[i + 1].tok, Tok::Op(".")) {
+        i += 2;
+    }
     let start = toks.get(i).map_or(text.len(), |t| t.start);
     let body = text[start..].trim_end().trim_end_matches(';').trim_end();
     Ok(format!("CREATE {kind} {body}"))
 }
 
 fn name_taken(db: &Database, name: &str) -> Option<&'static str> {
-    let schema = db.schema();
+    let schema = db.target_schema();
     if schema.table(name).is_some() {
         Some("table")
     } else if schema.view(name).is_some() {
@@ -296,7 +475,7 @@ fn name_taken(db: &Database, name: &str) -> Option<&'static str> {
 }
 
 pub(crate) fn bump_schema_cookie(w: &Writer, db: &Database) -> Result<()> {
-    let p1 = db.pager.get(1)?;
+    let p1 = db.target().get(1)?;
     let cookie = u32::from_be_bytes(p1[40..44].try_into().unwrap()).wrapping_add(1);
     w.set_header_u32(40, cookie)
 }
@@ -319,13 +498,13 @@ fn schema_insert(
             Value::Int(root as i64),
             sql.map_or(Value::Null, Value::text),
         ],
-        db.pager.encoding(),
+        db.target().encoding(),
     );
     w.table_insert(1, rowid, &rec)
 }
 
 fn max_rowid(db: &Database, root: u32) -> Result<Option<i64>> {
-    let mut c = Cursor::new(db.pager.clone(), root);
+    let mut c = Cursor::new(db.target(), root);
     c.last()?;
     if c.valid() {
         Ok(Some(c.rowid()?))
@@ -335,9 +514,6 @@ fn max_rowid(db: &Database, root: u32) -> Result<Option<i64>> {
 }
 
 fn create_table(db: &Database, ct: &CreateTable, text: &str) -> Result<ResultSet> {
-    if ct.temp {
-        return Err(Error::Unsupported("TEMP tables".into()));
-    }
     if let Some(kind) = name_taken(db, &ct.name) {
         if ct.if_not_exists && kind == "table" || ct.if_not_exists && kind == "view" {
             return Ok(ResultSet::default());
@@ -350,7 +526,7 @@ fn create_table(db: &Database, ct: &CreateTable, text: &str) -> Result<ResultSet
             ct.name
         )));
     }
-    let w = Writer::new(&db.pager);
+    let w = Writer::new(&db.target());
     // CREATE TABLE ... AS SELECT: columns from the query.
     let (ct, sql, rows) = match &ct.as_select {
         Some(sel) => {
@@ -388,6 +564,7 @@ fn create_table(db: &Database, ct: &CreateTable, text: &str) -> Result<ResultSet
             let sql = format!("CREATE TABLE {}({})", quote_ident(&ct.name), defs.join(","));
             let new = CreateTable {
                 name: ct.name.clone(),
+                db: ct.db.clone(),
                 temp: false,
                 if_not_exists: false,
                 columns: cols,
@@ -412,7 +589,7 @@ fn create_table(db: &Database, ct: &CreateTable, text: &str) -> Result<ResultSet
         let name = format!("sqlite_autoindex_{}_{n}", ct.name);
         schema_insert(db, &w, "index", &name, &ct.name, ix_root, None)?;
     }
-    if table.autoincrement && db.schema().table("sqlite_sequence").is_none() {
+    if table.autoincrement && db.target_schema().table("sqlite_sequence").is_none() {
         let seq_root = w.create_tree(false)?;
         schema_insert(
             db,
@@ -428,7 +605,7 @@ fn create_table(db: &Database, ct: &CreateTable, text: &str) -> Result<ResultSet
     db.reload_schema()?;
     let mut changes = 0;
     if let Some(rows) = rows {
-        let table = db.schema().table(&ct.name).cloned().unwrap();
+        let table = db.target_schema().table(&ct.name).cloned().unwrap();
         let mut ins = Inserter::new(db, &table, OnConflict::Abort)?;
         for row in rows {
             ins.insert_row(row, None)?;
@@ -461,13 +638,19 @@ fn create_index(db: &Database, ci: &CreateIndex, text: &str) -> Result<ResultSet
         }
         return Err(Error::Sql(format!("{kind} {} already exists", ci.name)));
     }
-    let schema = db.schema();
+    let schema = db.target_schema();
     let table = match schema.table(&ci.table) {
         Some(t) => t.clone(),
         None if schema.view(&ci.table).is_some() => {
             return Err(Error::Sql("views may not be indexed".into()))
         }
-        None => return Err(Error::Sql(format!("no such table: main.{}", ci.table))),
+        None => {
+            return Err(Error::Sql(format!(
+                "no such table: {}.{}",
+                db.file_name(&db.target()),
+                ci.table
+            )))
+        }
     };
     if table.name.eq_ignore_ascii_case("sqlite_schema") || table.name.starts_with("sqlite_") {
         return Err(Error::Sql(format!(
@@ -487,21 +670,21 @@ fn create_index(db: &Database, ci: &CreateIndex, text: &str) -> Result<ResultSet
             _ => {}
         }
     }
-    let w = Writer::new(&db.pager);
+    let w = Writer::new(&db.target());
     let root = w.create_tree(true)?;
     let sql = stored_sql(text, if ci.unique { "UNIQUE INDEX" } else { "INDEX" })?;
     schema_insert(db, &w, "index", &ci.name, &table.name, root, Some(&sql))?;
     bump_schema_cookie(&w, db)?;
     db.reload_schema()?;
     // Fill the new index from the table's rows.
-    let table = db.schema().table(&ci.table).cloned().unwrap();
+    let table = db.target_schema().table(&ci.table).cloned().unwrap();
     let index = table
         .indexes
         .iter()
         .find(|i| i.name.eq_ignore_ascii_case(&ci.name))
         .cloned()
         .ok_or_else(|| Error::Sql(format!("index {} could not be read back", ci.name)))?;
-    for (rowid, row) in all_rows(db, &table)? {
+    for (rowid, row) in all_rows(&table)? {
         let ins = Inserter::new(db, &table, OnConflict::Abort)?;
         ins.check_unique_one(&index, &row, rowid)?;
         ins.add_index_entry(&index, &row, rowid)?;
@@ -509,15 +692,59 @@ fn create_index(db: &Database, ci: &CreateIndex, text: &str) -> Result<ResultSet
     Ok(ResultSet::default())
 }
 
+/// The `db.` qualifiers used in FROM clauses of `sel` (not in expressions).
+fn qualified_dbs(sel: &Select, out: &mut Vec<String>) {
+    fn body(b: &SelectBody, out: &mut Vec<String>) {
+        match b {
+            SelectBody::Core(c) => from(&c.from, out),
+            SelectBody::Values(_) => {}
+            SelectBody::Compound { left, right, .. } => {
+                body(left, out);
+                body(right, out);
+            }
+        }
+    }
+    fn from(items: &[FromItem], out: &mut Vec<String>) {
+        for i in items {
+            match &i.source {
+                TableSource::Table {
+                    schema: Some(d), ..
+                } => out.push(d.clone()),
+                TableSource::Subquery(s) => qualified_dbs(s, out),
+                TableSource::Nested(n) => from(n, out),
+                _ => {}
+            }
+        }
+    }
+    for c in &sel.with {
+        qualified_dbs(&c.select, out);
+    }
+    body(&sel.body, out);
+}
+
 fn create_view(db: &Database, cv: &CreateView, text: &str) -> Result<ResultSet> {
+    // A view stored in a file may only name objects of that file.
+    let own = db.file_name(&db.target());
+    if own != "temp" {
+        let mut dbs = Vec::new();
+        qualified_dbs(&cv.select, &mut dbs);
+        if let Some(d) = dbs.iter().find(|d| !d.eq_ignore_ascii_case(&own)) {
+            return Err(Error::Sql(format!(
+                "view {} cannot reference objects in database {d}",
+                cv.name
+            )));
+        }
+    }
     if let Some(kind) = name_taken(db, &cv.name) {
         if cv.if_not_exists && kind == "view" {
             return Ok(ResultSet::default());
         }
         return Err(Error::Sql(format!("{kind} {} already exists", cv.name)));
     }
-    // The query must make sense now (SQLite checks it the same way).
-    let rs = db.run_select(&cv.select, false)?;
+    // The query must make sense now (SQLite checks it the same way), with
+    // its names resolved where the view will resolve them.
+    let fixed = (own != "temp").then(|| own.clone());
+    let rs = crate::bind::with_fixed_db(fixed, || db.run_select(&cv.select, false))?;
     if !cv.columns.is_empty() && cv.columns.len() != rs.columns.len() {
         return Err(Error::Sql(format!(
             "expected {} columns for '{}' but got {}",
@@ -527,13 +754,7 @@ fn create_view(db: &Database, cv: &CreateView, text: &str) -> Result<ResultSet> 
         )));
     }
     let sql = stored_sql(text, "VIEW")?;
-    if cv.temp {
-        // A TEMP view belongs to this connection and is never stored.
-        db.temp_views.borrow_mut().push(sql);
-        db.reload_schema()?;
-        return Ok(ResultSet::default());
-    }
-    let w = Writer::new(&db.pager);
+    let w = Writer::new(&db.target());
     schema_insert(db, &w, "view", &cv.name, &cv.name, 0, Some(&sql))?;
     bump_schema_cookie(&w, db)?;
     db.reload_schema()?;
@@ -541,8 +762,8 @@ fn create_view(db: &Database, cv: &CreateView, text: &str) -> Result<ResultSet> 
 }
 
 fn drop(db: &Database, kind: DropKind, if_exists: bool, name: &str) -> Result<ResultSet> {
-    let schema = db.schema();
-    let w = Writer::new(&db.pager);
+    let schema = db.target_schema();
+    let w = Writer::new(&db.target());
     let lname = name.to_ascii_lowercase();
     let missing = |what: &str| {
         if if_exists {
@@ -577,7 +798,7 @@ fn drop(db: &Database, kind: DropKind, if_exists: bool, name: &str) -> Result<Re
             }
             if t.autoincrement {
                 if let Some(seq) = schema.table("sqlite_sequence").cloned() {
-                    for (rowid, row) in all_rows(db, &seq)? {
+                    for (rowid, row) in all_rows(&seq)? {
                         if row[0].to_text().eq_ignore_ascii_case(name) {
                             w.table_delete(seq.root, rowid)?;
                         }
@@ -603,18 +824,6 @@ fn drop(db: &Database, kind: DropKind, if_exists: bool, name: &str) -> Result<Re
             }
         }
         DropKind::View => {
-            let mut temps = db.temp_views.borrow_mut();
-            let before = temps.len();
-            temps.retain(|sql| {
-                !matches!(crate::sql::parser::parse_one(sql),
-                    Ok(Stmt::CreateView(v)) if v.name.eq_ignore_ascii_case(name))
-            });
-            if temps.len() != before {
-                std::mem::drop(temps);
-                db.reload_schema()?;
-                return Ok(ResultSet::default());
-            }
-            std::mem::drop(temps);
             if schema.view(name).is_none() {
                 if schema.table(name).is_some() {
                     return Err(Error::Sql(format!("use DROP TABLE to delete table {name}")));
@@ -639,6 +848,17 @@ fn drop(db: &Database, kind: DropKind, if_exists: bool, name: &str) -> Result<Re
             remove.push(row.rowid);
         }
     }
+    // TEMP triggers watching a dropped table or view of another file go
+    // with it.
+    let temp = db.file_pager("temp")?;
+    let mut temp_triggers: Vec<String> = Vec::new();
+    if matches!(kind, DropKind::Table | DropKind::View) && !Rc::ptr_eq(&db.target(), &temp) {
+        for t in db.schema().triggers.iter() {
+            if t.pager.as_ref().is_some_and(|p| Rc::ptr_eq(p, &temp)) && watches(db, t, name) {
+                temp_triggers.push(t.name.clone());
+            }
+        }
+    }
     for rowid in remove {
         w.table_delete(1, rowid)?;
     }
@@ -646,23 +866,58 @@ fn drop(db: &Database, kind: DropKind, if_exists: bool, name: &str) -> Result<Re
         w.drop_tree(root)?;
     }
     bump_schema_cookie(&w, db)?;
+    if !temp_triggers.is_empty() {
+        let ts = db.schema().db("temp").cloned().unwrap_or_default();
+        db.with_target(temp.clone(), || -> Result<()> {
+            let tw = Writer::new(&temp);
+            for r in &ts.rows {
+                if r.kind == "trigger"
+                    && temp_triggers
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case(&r.name))
+                {
+                    tw.table_delete(1, r.rowid)?;
+                }
+            }
+            bump_schema_cookie(&tw, db)
+        })?;
+    }
     db.reload_schema()?;
     Ok(ResultSet::default())
 }
 
 fn create_trigger(db: &Database, ct: &ast::CreateTrigger, text: &str) -> Result<ResultSet> {
-    if ct.temp {
-        return Err(Error::Unsupported("TEMP triggers".into()));
+    for st in &ct.body {
+        if let Stmt::Insert(ast::Insert { db: Some(_), .. })
+        | Stmt::Update(ast::Update { db: Some(_), .. })
+        | Stmt::Delete(ast::Delete { db: Some(_), .. }) = st
+        {
+            return Err(Error::Sql(
+                "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers".into(),
+            ));
+        }
     }
-    let schema = db.schema();
-    if schema.trigger(&ct.name).is_some() {
+    if db.target_schema().trigger(&ct.name).is_some() {
         if ct.if_not_exists {
             return Ok(ResultSet::default());
         }
         return Err(Error::Sql(format!("trigger {} already exists", ct.name)));
     }
-    let on_view = schema.view(&ct.table).is_some();
-    match (schema.table(&ct.table), on_view, ct.timing) {
+    // The table a trigger watches: in the trigger's own file, except that a
+    // TEMP trigger may watch a table of any file.
+    let merged = db.schema();
+    let in_temp = Rc::ptr_eq(&db.target(), &db.file_pager("temp")?);
+    let (table, view) = if in_temp {
+        (
+            merged.table_in(ct.table_db.as_deref(), &ct.table)?,
+            merged.view_in(ct.table_db.as_deref(), &ct.table)?,
+        )
+    } else {
+        let own = db.target_schema();
+        (own.table(&ct.table).cloned(), own.view(&ct.table).cloned())
+    };
+    let on_view = view.is_some();
+    match (table.as_ref(), on_view, ct.timing) {
         (Some(t), _, TriggerTiming::InsteadOf) => {
             return Err(Error::Sql(format!(
                 "cannot create INSTEAD OF trigger on table: {}",
@@ -685,14 +940,21 @@ fn create_trigger(db: &Database, ct: &ast::CreateTrigger, text: &str) -> Result<
                 ct.table
             )));
         }
-        (None, false, _) => return Err(Error::Sql(format!("no such table: main.{}", ct.table))),
+        (None, false, _) => {
+            return Err(Error::Sql(format!(
+                "no such table: {}.{}",
+                ct.table_db
+                    .clone()
+                    .unwrap_or_else(|| db.file_name(&db.target())),
+                ct.table
+            )))
+        }
     }
-    let w = Writer::new(&db.pager);
+    let w = Writer::new(&db.target());
     let sql = stored_sql(text, "TRIGGER")?;
-    let table_name = schema
-        .table(&ct.table)
+    let table_name = table
         .map(|t| t.name.clone())
-        .or_else(|| schema.view(&ct.table).map(|v| v.name.clone()))
+        .or_else(|| view.map(|v| v.name.clone()))
         .unwrap();
     schema_insert(db, &w, "trigger", &ct.name, &table_name, 0, Some(&sql))?;
     bump_schema_cookie(&w, db)?;
@@ -729,6 +991,35 @@ thread_local! {
     static FIRING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Does trigger `t` watch the object called `table` in the target file?
+/// A trigger watches objects of its own file; a TEMP trigger watches the
+/// object its table name resolves to (temp first, or the file it names).
+fn watches(db: &Database, t: &crate::schema::Trigger, table: &str) -> bool {
+    if !t.table.eq_ignore_ascii_case(table) {
+        return false;
+    }
+    let target = db.target();
+    let Some(own) = &t.pager else { return true };
+    if Rc::ptr_eq(own, &target) {
+        return true;
+    }
+    let is_temp = db.file_pager("temp").is_ok_and(|p| Rc::ptr_eq(&p, own));
+    if !is_temp {
+        return false;
+    }
+    let schema = db.schema();
+    let q = t.def.table_db.as_deref();
+    let file = match schema.table_in(q, &t.table) {
+        Ok(Some(tb)) => tb.pager.clone(),
+        _ => schema
+            .view_in(q, &t.table)
+            .ok()
+            .flatten()
+            .and_then(|v| v.pager.clone()),
+    };
+    file.is_some_and(|f| Rc::ptr_eq(&f, &target))
+}
+
 /// The triggers on `table` for this timing and event.
 fn triggers_for(
     db: &Database,
@@ -740,7 +1031,7 @@ fn triggers_for(
     db.schema()
         .triggers
         .iter()
-        .filter(|t| t.table.eq_ignore_ascii_case(table) && t.def.timing == timing)
+        .filter(|t| t.def.timing == timing && watches(db, t, table))
         .filter(|t| match (&t.def.event, event) {
             (TriggerEvent::Insert, Event::Insert) | (TriggerEvent::Delete, Event::Delete) => true,
             (TriggerEvent::Update(cols), Event::Update) => {
@@ -757,7 +1048,7 @@ fn triggers_for(
 
 fn has_triggers(db: &Database, table: &str, event: Event) -> bool {
     db.schema().triggers.iter().any(|t| {
-        t.table.eq_ignore_ascii_case(table)
+        watches(db, t, table)
             && matches!(
                 (&t.def.event, event),
                 (TriggerEvent::Insert, Event::Insert)
@@ -788,32 +1079,42 @@ fn fire(
             ));
         }
         FIRING.with(|f| f.borrow_mut().push(t.name.clone()));
-        let result = crate::bind::with_trigger_row(row.clone(), || -> Result<()> {
-            if let Some(when) = &t.def.when {
-                let rs = db.run_select(
-                    &select_of(vec![result(when.clone())], Vec::new(), None),
-                    true,
-                )?;
-                let go = rs
-                    .rows
-                    .first()
-                    .and_then(|r| r.first())
-                    .and_then(Value::truth);
-                if go != Some(true) {
-                    return Ok(());
-                }
-            }
-            for stmt in &t.def.body {
-                match stmt {
-                    Stmt::Select(sel) => {
-                        db.run_select(sel, true)?;
-                    }
-                    other => {
-                        execute(db, other, "")?;
+        // A non-TEMP trigger's body names objects of its own file.
+        let own = t
+            .pager
+            .as_ref()
+            .map(|p| db.file_name(p))
+            .filter(|n| n != "temp");
+        let result = crate::bind::with_fixed_db(own, || {
+            crate::bind::with_trigger_row(row.clone(), || -> Result<()> {
+                if let Some(when) = &t.def.when {
+                    let rs = db.run_select(
+                        &select_of(vec![result(when.clone())], Vec::new(), None),
+                        true,
+                    )?;
+                    let go = rs
+                        .rows
+                        .first()
+                        .and_then(|r| r.first())
+                        .and_then(Value::truth);
+                    if go != Some(true) {
+                        return Ok(());
                     }
                 }
-            }
-            Ok(())
+                for stmt in &t.def.body {
+                    match stmt {
+                        Stmt::Select(sel) => {
+                            db.run_select(sel, true)?;
+                        }
+                        other => {
+                            let target = statement_target(db, other)?;
+                            prepare_file(&target)?;
+                            db.with_target(target, || execute(db, other, ""))?;
+                        }
+                    }
+                }
+                Ok(())
+            })
         });
         FIRING.with(|f| f.borrow_mut().pop());
         match result {
@@ -841,10 +1142,10 @@ fn trigger_row(
 
 /// Every row of a table as (rowid, column values); rowid is 0 for
 /// WITHOUT ROWID tables.
-fn all_rows(db: &Database, table: &Table) -> Result<Vec<(i64, Vec<Value>)>> {
-    let enc = db.pager.encoding();
+fn all_rows(table: &Table) -> Result<Vec<(i64, Vec<Value>)>> {
+    let enc = table.file().encoding();
     let mut out = Vec::new();
-    let mut c = Cursor::new(db.pager.clone(), table.root);
+    let mut c = Cursor::new(table.file().clone(), table.root);
     c.first()?;
     while c.valid() {
         let rowid = if table.without_rowid { 0 } else { c.rowid()? };
@@ -859,7 +1160,7 @@ fn all_rows(db: &Database, table: &Table) -> Result<Vec<(i64, Vec<Value>)>> {
 struct Inserter<'d> {
     db: &'d Database,
     table: Rc<Table>,
-    w: Writer<'d>,
+    w: Writer,
     conflict: OnConflict,
     enc: crate::record::TextEncoding,
 }
@@ -875,9 +1176,9 @@ impl<'d> Inserter<'d> {
         Ok(Inserter {
             db,
             table: table.clone(),
-            w: Writer::new(&db.pager),
+            w: Writer::new(table.file()),
             conflict,
-            enc: db.pager.encoding(),
+            enc: table.file().encoding(),
         })
     }
 
@@ -926,7 +1227,7 @@ impl<'d> Inserter<'d> {
 
     /// The row stored for `rowid`, if any.
     fn row_at(&self, rowid: i64) -> Result<Option<Vec<Value>>> {
-        let mut c = Cursor::new(self.db.pager.clone(), self.table.root);
+        let mut c = Cursor::new(self.table.file().clone(), self.table.root);
         c.seek_rowid(rowid)?;
         if c.valid() && c.rowid()? == rowid {
             let row = crate::exec::decode_table_row(
@@ -947,7 +1248,7 @@ impl<'d> Inserter<'d> {
         let order = self.order(index);
         let n = key.len();
         let enc = self.enc;
-        let mut c = Cursor::new(self.db.pager.clone(), index.root);
+        let mut c = Cursor::new(self.table.file().clone(), index.root);
         let mut cmp = |payload: &[u8]| -> Result<Ordering> {
             let vals = decode_all(payload, enc)?;
             Ok(order_cmp(&order, &vals, key, n))
@@ -1143,10 +1444,10 @@ impl<'d> Inserter<'d> {
     }
 
     fn sequence(&self) -> Result<Option<i64>> {
-        let Some(seq) = self.db.schema().table("sqlite_sequence").cloned() else {
+        let Some(seq) = self.db.target_schema().table("sqlite_sequence").cloned() else {
             return Ok(None);
         };
-        for (_, row) in all_rows(self.db, &seq)? {
+        for (_, row) in all_rows(&seq)? {
             if row[0].to_text().eq_ignore_ascii_case(&self.table.name) {
                 return Ok(Some(row[1].to_int()));
             }
@@ -1158,11 +1459,11 @@ impl<'d> Inserter<'d> {
         if !self.table.autoincrement {
             return Ok(());
         }
-        let Some(seq) = self.db.schema().table("sqlite_sequence").cloned() else {
+        let Some(seq) = self.db.target_schema().table("sqlite_sequence").cloned() else {
             return Ok(());
         };
         let mut found = None;
-        for (rid, row) in all_rows(self.db, &seq)? {
+        for (rid, row) in all_rows(&seq)? {
             if row[0].to_text().eq_ignore_ascii_case(&self.table.name) {
                 found = Some((rid, row[1].to_int()));
             }
@@ -1365,7 +1666,7 @@ fn default_value(db: &Database, c: &crate::schema::Column) -> Result<Value> {
     }
 }
 
-fn result(expr: AExpr) -> ResultColumn {
+pub(crate) fn result(expr: AExpr) -> ResultColumn {
     ResultColumn::Expr {
         expr,
         alias: None,
@@ -1373,7 +1674,11 @@ fn result(expr: AExpr) -> ResultColumn {
     }
 }
 
-fn select_of(columns: Vec<ResultColumn>, from: Vec<FromItem>, where_: Option<AExpr>) -> Select {
+pub(crate) fn select_of(
+    columns: Vec<ResultColumn>,
+    from: Vec<FromItem>,
+    where_: Option<AExpr>,
+) -> Select {
     Select {
         with: Vec::new(),
         body: SelectBody::Core(Box::new(SelectCore {
@@ -1391,12 +1696,13 @@ fn select_of(columns: Vec<ResultColumn>, from: Vec<FromItem>, where_: Option<AEx
     }
 }
 
-fn from_table(name: &str) -> Vec<FromItem> {
+/// `FROM name`, in the file the statement changes.
+fn from_table(db: &Database, name: &str) -> Vec<FromItem> {
     vec![FromItem {
         join: JoinKind::Inner,
         natural: false,
         source: TableSource::Table {
-            schema: None,
+            schema: Some(db.file_name(&db.target())),
             name: name.to_string(),
         },
         alias: None,
@@ -1415,7 +1721,7 @@ fn col(name: &str) -> AExpr {
 }
 
 fn target_table(db: &Database, name: &str) -> Result<Rc<Table>> {
-    let schema = db.schema();
+    let schema = db.target_schema();
     match schema.table(name) {
         Some(t) if t.name.eq_ignore_ascii_case("sqlite_schema") => {
             Err(Error::Sql(format!("table {name} may not be modified")))
@@ -1627,7 +1933,7 @@ fn target_rows(
     }
     let n_extra = extra.len();
     cols.extend(extra.into_iter().map(result));
-    let sel = select_of(cols, from_table(&table.name), where_.clone());
+    let sel = select_of(cols, from_table(db, &table.name), where_.clone());
     let rs = db.run_select(&sel, true)?;
     let n = table.columns.len();
     Ok(rs
@@ -1661,11 +1967,11 @@ fn delete(db: &Database, del: &ast::Delete) -> Result<ResultSet> {
     }
     let table = target_table(db, &del.table)?;
     let ins = Inserter::new(db, &table, OnConflict::Abort)?;
-    let w = Writer::new(&db.pager);
+    let w = Writer::new(&db.target());
     let triggered = has_triggers(db, &table.name, Event::Delete);
     if del.where_.is_none() && !triggered {
         // DELETE without WHERE empties the b-trees directly.
-        let n = crate::btree::count_entries(&db.pager, table.root)?;
+        let n = crate::btree::count_entries(table.file(), table.root)?;
         w.clear_tree(table.root)?;
         for ix in &table.indexes {
             w.clear_tree(ix.root)?;
@@ -1860,7 +2166,7 @@ fn old_with_rowid(table: &Table, mut row: Vec<Value>, rowid: i64) -> Vec<Value> 
 type OldNew = (Option<Vec<Value>>, Option<Vec<Value>>);
 
 fn view_columns(db: &Database, view: &str) -> Result<Vec<String>> {
-    let sel = select_of(vec![ResultColumn::Star], from_table(view), None);
+    let sel = select_of(vec![ResultColumn::Star], from_table(db, view), None);
     Ok(db.run_select(&sel, false)?.columns)
 }
 
@@ -1874,7 +2180,7 @@ fn view_rows(
     let n = view_columns(db, view)?.len();
     let mut cols = vec![ResultColumn::Star];
     cols.extend(extra.into_iter().map(result));
-    let sel = select_of(cols, from_table(view), where_.clone());
+    let sel = select_of(cols, from_table(db, view), where_.clone());
     Ok(db
         .run_select(&sel, true)?
         .rows
@@ -1895,7 +2201,7 @@ fn instead_of(
     rows: impl FnOnce() -> Result<Vec<OldNew>>,
     columns: &[String],
 ) -> Result<Option<ResultSet>> {
-    let schema = db.schema();
+    let schema = db.target_schema();
     if schema.table(name).is_some() || schema.view(name).is_none() {
         return Ok(None);
     }

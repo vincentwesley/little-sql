@@ -131,7 +131,6 @@ impl Constraint {
 
 pub struct Binder<'a> {
     schema: &'a Schema,
-    pager: &'a Pager,
     next_sub: usize,
     next_slot: usize,
     /// Log of every cursor referenced, in binding order.
@@ -183,6 +182,26 @@ pub struct TriggerRow {
 
 thread_local! {
     static TRIGGER_ROWS: std::cell::RefCell<Vec<TriggerRow>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// The database unqualified names resolve in while a non-TEMP view's
+    /// body is bound or a non-TEMP trigger runs: SQLite fixes them to the
+    /// object's own file. None: the usual search (temp, main, attached).
+    static FIXED_DB: std::cell::RefCell<Vec<Option<String>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The database unqualified names are fixed to, if any.
+pub fn fixed_db() -> Option<String> {
+    FIXED_DB.with(|f| f.borrow().last().cloned().flatten())
+}
+
+/// Run `f` with unqualified names fixed to `db` (None: not fixed).
+pub fn with_fixed_db<T>(db: Option<String>, f: impl FnOnce() -> T) -> T {
+    FIXED_DB.with(|s| s.borrow_mut().push(db));
+    let r = f();
+    FIXED_DB.with(|s| s.borrow_mut().pop());
+    r
 }
 
 thread_local! {
@@ -265,10 +284,10 @@ pub fn bind_select(schema: &Schema, pager: &Pager, select: &ast::Select) -> Resu
 }
 
 impl<'a> Binder<'a> {
-    pub fn new(schema: &'a Schema, pager: &'a Pager) -> Binder<'a> {
+    /// `_pager` is unused: each table carries the pager of its own file.
+    pub fn new(schema: &'a Schema, _pager: &'a Pager) -> Binder<'a> {
         Binder {
             schema,
-            pager,
             next_sub: 0,
             next_slot: 0,
             refs: Vec::new(),
@@ -719,27 +738,36 @@ impl<'a> Binder<'a> {
                         return self.query_source(q, correlated, alias.unwrap_or(name), &cols);
                     }
                 }
-                if let Some(t) = self.schema.table(name) {
-                    let t = t.clone();
+                let fixed = if schema.is_none() { fixed_db() } else { None };
+                let q = schema.as_deref().or(fixed.as_deref());
+                if let Some(t) = self.schema.table_in(q, name)? {
                     if let ast::Indexed::By(ix) = &fi.indexed {
                         if !t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(ix)) {
                             return Err(Error::Sql(format!("no such index: {ix}")));
                         }
                     }
                     let (mut item, src) = self.table_source(&t, alias);
+                    // Plans show `db.table` when the query qualified the
+                    // name and gave no alias, as SQLite's do.
+                    if let (None, Some(d)) = (alias, schema) {
+                        item.name = format!("{d}.{name}");
+                    }
                     item.indexed = fi.indexed.clone();
                     self.indexed.insert(item.cursor, fi.indexed.clone());
                     return Ok((item, src));
                 }
-                if let Some(v) = self.schema.view(name) {
-                    let v = v.clone();
-                    let (q, _) = self.bind_isolated(&v.select, 0, 0)?;
+                if let Some(v) = self.schema.view_in(q, name)? {
+                    let own = self.schema.view_file(&v);
+                    let (q, _) = with_fixed_db(own, || self.bind_isolated(&v.select, 0, 0))?;
                     return self.query_source(q, false, alias.unwrap_or(&v.name), &v.columns);
                 }
                 if let Some(why) = self.schema.broken.get(&lower(name)) {
                     return Err(Error::Unsupported(format!("table {name}: {why}")));
                 }
-                Err(Error::Sql(format!("no such table: {name}")))
+                Err(Error::Sql(match schema {
+                    Some(d) => format!("no such table: {d}.{name}"),
+                    None => format!("no such table: {name}"),
+                }))
             }
             TableSource::Nested(_) => unreachable!("nested joins are flattened by the caller"),
             TableSource::Function { .. } => unreachable!("table functions are bound by the caller"),
@@ -823,6 +851,8 @@ impl<'a> Binder<'a> {
         if fi.join != JoinKind::Inner {
             return Ok(None);
         }
+        // The file a flattened view's own names resolve in.
+        let mut view_file = fixed_db();
         let (sel, name, rename, keep_scopes, keep_ctes) = match &fi.source {
             TableSource::Subquery(s) => (
                 Rc::new(s.as_ref().clone()),
@@ -831,22 +861,30 @@ impl<'a> Binder<'a> {
                 self.scopes.len(),
                 self.ctes.len(),
             ),
-            TableSource::Table { schema: None, name } => {
+            TableSource::Table { schema, name } => {
                 let lname = lower(name);
-                if self.ctes.iter().any(|c| c.name == lname)
-                    || self.work_tables.iter().any(|w| w.name == lname)
-                    || self.schema.table(name).is_some()
+                if schema.is_none()
+                    && (self.ctes.iter().any(|c| c.name == lname)
+                        || self.work_tables.iter().any(|w| w.name == lname))
                 {
                     return Ok(None);
                 }
-                match self.schema.view(name) {
-                    Some(v) => (
-                        Rc::new(v.select.clone()),
-                        fi.alias.clone().unwrap_or_else(|| v.name.clone()),
-                        v.columns.clone(),
-                        0,
-                        0,
-                    ),
+                let fixed = if schema.is_none() { fixed_db() } else { None };
+                let q = schema.as_deref().or(fixed.as_deref());
+                if self.schema.table_in(q, name)?.is_some() {
+                    return Ok(None);
+                }
+                match self.schema.view_in(q, name)? {
+                    Some(v) => {
+                        view_file = self.schema.view_file(&v);
+                        (
+                            Rc::new(v.select.clone()),
+                            fi.alias.clone().unwrap_or_else(|| v.name.clone()),
+                            v.columns.clone(),
+                            0,
+                            0,
+                        )
+                    }
                     None => return Ok(None),
                 }
             }
@@ -878,7 +916,9 @@ impl<'a> Binder<'a> {
         let saved_ctes = self.ctes.split_off(keep_ctes.min(self.ctes.len()));
         let saved_aggs = std::mem::take(&mut self.aggs);
         self.view_depth += 1;
-        let attempt = self.flatten_body(core, items, bound, &rename, &name);
+        let attempt = with_fixed_db(view_file, || {
+            self.flatten_body(core, items, bound, &rename, &name)
+        });
         self.view_depth -= 1;
         self.scopes.extend(saved_scopes);
         self.ctes.extend(saved_ctes);
@@ -2336,7 +2376,7 @@ impl<'a> Binder<'a> {
             }
             ItemKind::Table(t) => t,
         };
-        let n = (table.row_estimate(self.pager) as f64).max(1.0);
+        let n = (table.row_estimate() as f64).max(1.0);
         let mut best: (f64, Access) = (if filtered { (n / 4.0).max(1.0) } else { n }, Access::Scan);
         let rowid_slot = table.columns.len();
         let is_rowid =
@@ -2440,8 +2480,11 @@ impl<'a> Binder<'a> {
             let covering = index.primary || covers(index);
             // A lookup through a non-covering index also reads the table.
             let est = if covering { est } else { est * 1.01 };
+            // SQLite searches an index rather than scanning the table even
+            // when the estimates tie (a filtered scan still reads every
+            // row; the extra table lookups do not change that).
             let better =
-                est < best.0 || (est == best.0 && matches!(best.1, Access::Scan) && n > 1.0);
+                est < best.0 || (matches!(best.1, Access::Scan) && est <= best.0 * 1.01 && n > 1.0);
             if better {
                 best = (
                     est,
@@ -2489,6 +2532,8 @@ impl<'a> Binder<'a> {
                 .indexes
                 .iter()
                 .filter(|i| allowed(i) && i.usable && !i.cols.is_empty() && covers(i))
+                // Only when the index is narrower than the table rows.
+                .filter(|i| i.cols.len() < table.columns.len())
                 .min_by_key(|i| (i.cols.len(), std::cmp::Reverse(i.root)));
             if let Some(index) = narrowest {
                 best.1 = Access::Index(IndexAccess {
@@ -2724,14 +2769,47 @@ impl<'a> Binder<'a> {
             } else {
                 vec![step]
             };
-            let mut best: Option<(f64, usize, Option<Access>, Option<HashProbe>)> = None;
-            for i in candidates {
-                let (est, access, hash) = self.best_access(&items[i], i, &placed, &conjs);
-                if best.as_ref().is_none_or(|b| est < b.0) {
-                    best = Some((est, i, access, hash));
+            let mut scored: Vec<(f64, usize, Option<Access>, Option<HashProbe>)> = candidates
+                .iter()
+                .map(|&i| {
+                    let (est, access, hash) = self.best_access(&items[i], i, &placed, &conjs);
+                    (est, i, access, hash)
+                })
+                .collect();
+            let min = scored.iter().map(|c| c.0).fold(f64::INFINITY, f64::min);
+            // Among candidates that tie for the cheapest first step, prefer
+            // one after which the next table can use a real index rather
+            // than an automatic one (SQLite counts building that index).
+            let tied: Vec<usize> = (0..scored.len()).filter(|k| scored[*k].0 == min).collect();
+            let mut pick = tied[0];
+            if reorder && tied.len() > 1 && candidates.len() > 1 {
+                let needs_auto = |me: &mut Self, placed: &mut Vec<bool>, i: usize| -> bool {
+                    placed[i] = true;
+                    let next = candidates
+                        .iter()
+                        .filter(|j| **j != i)
+                        .filter(|j| {
+                            items[**j]
+                                .deps
+                                .iter()
+                                .all(|c| local.get(c).is_none_or(|k| placed[*k]))
+                        })
+                        .map(|j| me.best_access(&items[*j], *j, placed, &conjs))
+                        .min_by(|a, b| a.0.total_cmp(&b.0));
+                    placed[i] = false;
+                    next.is_some_and(|n| n.2.is_some() || matches!(n.1, Some(Access::Hash(_))))
+                };
+                if needs_auto(self, &mut placed, scored[pick].1) {
+                    if let Some(k) = tied[1..]
+                        .iter()
+                        .copied()
+                        .find(|k| !needs_auto(self, &mut placed, scored[*k].1))
+                    {
+                        pick = k;
+                    }
                 }
             }
-            let (_, i, access, hash) = best.unwrap();
+            let (_, i, access, hash) = scored.swap_remove(pick);
             placed[i] = true;
             order.push((i, access, hash));
         }

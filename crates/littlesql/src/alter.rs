@@ -20,7 +20,7 @@ use crate::sql::lexer::{tokenize, Tok, Token};
 use crate::value::Value;
 
 pub(crate) fn alter_table(db: &Database, table: &str, action: &AlterAction) -> Result<ResultSet> {
-    let schema = db.schema();
+    let schema = db.target_schema();
     let Some(t) = schema.table(table).cloned() else {
         if schema.view(table).is_some() {
             return Err(Error::Sql(format!("cannot alter {table}: it is a view")));
@@ -30,7 +30,7 @@ pub(crate) fn alter_table(db: &Database, table: &str, action: &AlterAction) -> R
     if t.name.to_ascii_lowercase().starts_with("sqlite_") {
         return Err(Error::Sql(format!("table {} may not be altered", t.name)));
     }
-    let w = Writer::new(&db.pager);
+    let w = Writer::new(&db.target());
     match action {
         AlterAction::RenameTable(new) => rename_table(db, &w, &t.name, new)?,
         AlterAction::RenameColumn { from, to } => rename_column(db, &w, &t, from, to)?,
@@ -39,8 +39,12 @@ pub(crate) fn alter_table(db: &Database, table: &str, action: &AlterAction) -> R
     }
     crate::write::bump_schema_cookie(&w, db)?;
     db.reload_schema()?;
-    // Every view and trigger must still make sense.
-    let schema = db.schema();
+    // Every view and trigger must still make sense (SQLite does not check
+    // after ADD COLUMN, which cannot break them).
+    if matches!(action, AlterAction::AddColumn { .. }) {
+        return Ok(ResultSet::default());
+    }
+    let schema = db.target_schema();
     for r in &schema.rows {
         if let Some(why) = schema.broken.get(&r.name.to_ascii_lowercase()) {
             return Err(Error::Sql(format!("error in {} {}: {why}", r.kind, r.name)));
@@ -179,13 +183,13 @@ fn update_row(
             Value::Int(r.root as i64),
             sql.map_or(Value::Null, Value::text),
         ],
-        db.pager.encoding(),
+        db.target().encoding(),
     );
     w.table_insert(1, r.rowid, &rec)
 }
 
 fn rename_table(db: &Database, w: &Writer, old: &str, new: &str) -> Result<()> {
-    let schema = db.schema();
+    let schema = db.target_schema();
     if schema.table(new).is_some() || schema.view(new).is_some() || schema.index(new).is_some() {
         return Err(Error::Sql(format!(
             "there is already another table or index with this name: {new}"
@@ -226,11 +230,11 @@ fn rename_table(db: &Database, w: &Writer, old: &str, new: &str) -> Result<()> {
     }
     // AUTOINCREMENT's counter follows the table.
     if let Some(seq) = schema.table("sqlite_sequence").cloned() {
-        let mut c = crate::btree::Cursor::new(db.pager.clone(), seq.root);
+        let mut c = crate::btree::Cursor::new(db.target(), seq.root);
         c.first()?;
         let mut renames = Vec::new();
         while c.valid() {
-            let vals = crate::record::decode_all(c.payload()?.as_slice(), db.pager.encoding())?;
+            let vals = crate::record::decode_all(c.payload()?.as_slice(), db.target().encoding())?;
             if vals
                 .first()
                 .is_some_and(|v| v.to_text().eq_ignore_ascii_case(old))
@@ -244,7 +248,7 @@ fn rename_table(db: &Database, w: &Writer, old: &str, new: &str) -> Result<()> {
             w.table_insert(
                 seq.root,
                 rowid,
-                &encode_record_enc(&vals, db.pager.encoding()),
+                &encode_record_enc(&vals, db.target().encoding()),
             )?;
         }
     }
@@ -259,7 +263,7 @@ fn column_refs(
     table: &str,
     col: &str,
 ) -> Vec<usize> {
-    let schema = db.schema();
+    let schema = db.target_schema();
     let own_table = row.kind == "table" && row.name.eq_ignore_ascii_case(table);
     let own_index = row.kind == "index" && row.tbl_name.eq_ignore_ascii_case(table);
     let own_trigger = row.kind == "trigger" && row.tbl_name.eq_ignore_ascii_case(table);
@@ -418,7 +422,7 @@ fn rename_column(
     if t.column_index(to).is_some() {
         return Err(Error::Sql(format!("duplicate column name: {to}")));
     }
-    let schema = db.schema();
+    let schema = db.target_schema();
     for r in &schema.rows {
         let Some(sql) = &r.sql else { continue };
         let toks = tokenize(sql)?;
@@ -485,7 +489,7 @@ fn add_column(
             ));
         }
     }
-    let rows = crate::btree::count_entries(&db.pager, t.root)?;
+    let rows = crate::btree::count_entries(t.file(), t.root)?;
     let null_default = matches!(
         &def.default,
         None | Some(crate::sql::ast::Expr::Literal(Value::Null))
@@ -496,7 +500,7 @@ fn add_column(
         ));
     }
     // Splice the definition in before the table's closing parenthesis.
-    let schema = db.schema();
+    let schema = db.target_schema();
     let r = schema
         .rows
         .iter()
@@ -557,7 +561,7 @@ fn drop_column(db: &Database, w: &Writer, t: &crate::schema::Table, col: &str) -
     if t.columns.len() == 1 {
         return fail("no other columns exist");
     }
-    let schema = db.schema();
+    let schema = db.target_schema();
     for r in &schema.rows {
         let Some(sql) = &r.sql else { continue };
         if r.kind == "table" && r.name.eq_ignore_ascii_case(&t.name) {
@@ -620,8 +624,8 @@ fn drop_column(db: &Database, w: &Writer, t: &crate::schema::Table, col: &str) -
     let new_sql = format!("{}{}", &sql[..from], &sql[to..]);
     update_row(db, w, r, &r.name, &r.tbl_name, Some(&new_sql))?;
     // Rewrite every row without the column.
-    let enc = db.pager.encoding();
-    let mut c = crate::btree::Cursor::new(db.pager.clone(), t.root);
+    let enc = db.target().encoding();
+    let mut c = crate::btree::Cursor::new(t.file().clone(), t.root);
     c.first()?;
     let mut rows = Vec::new();
     while c.valid() {

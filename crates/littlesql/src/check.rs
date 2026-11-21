@@ -16,7 +16,6 @@ use crate::btree::{
     be16, be32, parse_cell, read_payload, Cursor, PageRef, INTERIOR_INDEX, INTERIOR_TABLE,
     LEAF_INDEX, LEAF_TABLE,
 };
-use crate::db::Database;
 use crate::error::Result;
 use crate::pager::Pager;
 use crate::record::decode_all;
@@ -364,8 +363,10 @@ fn index_order(index: &Index, table: &Table) -> impl Fn(&[Value], &[Value]) -> O
 }
 
 /// Returns a list of problems; empty means the database is consistent.
-pub fn integrity_check(db: &Database) -> Result<Vec<String>> {
-    let pager = &db.pager;
+pub fn integrity_check(
+    pager: &std::rc::Rc<Pager>,
+    schema: &crate::schema::Schema,
+) -> Result<Vec<String>> {
     let n = pager.page_count();
     if n == 0 {
         return Ok(Vec::new());
@@ -378,7 +379,6 @@ pub fn integrity_check(db: &Database) -> Result<Vec<String>> {
     };
     let p1 = pager.get(1)?;
     c.freelist(be32(&p1, 32), be32(&p1, 36));
-    let schema = db.schema();
     let none = |_: &[Value], _: &[Value]| Ordering::Equal;
     let mut depth = None;
     c.tree(1, 0, false, &none, None, None, "sqlite_schema", &mut depth);

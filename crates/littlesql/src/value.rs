@@ -349,8 +349,7 @@ pub fn numeric_prefix(s: &str) -> (Value, bool) {
             return (Value::Int(v), full);
         }
     }
-    let text = text.strip_prefix('+').unwrap_or(text);
-    (Value::Real(text.parse::<f64>().unwrap_or(0.0)), full)
+    (Value::Real(crate::fp::atof(text)), full)
 }
 
 /// Parse the longest integer prefix, saturating on overflow.
@@ -389,10 +388,13 @@ pub fn fmt_real(f: f64) -> String {
     if f.is_infinite() {
         return if f > 0.0 { "Inf".into() } else { "-Inf".into() };
     }
-    let s = format!("{:.14e}", f.abs());
-    let (mant, exp) = s.split_once('e').unwrap();
-    let exp: i32 = exp.parse().unwrap();
-    let mut digits: String = mant.chars().filter(|c| *c != '.').collect();
+    // SQLite's "%!.15g": long double digits rounded to 15 (fp.rs).
+    let (d, exp) = if f == 0.0 {
+        (vec![0u8], 0)
+    } else {
+        crate::func::round_digits_pub(crate::fp::decode(f.abs()), 15)
+    };
+    let mut digits: String = d.iter().map(|x| (b'0' + x) as char).collect();
     while digits.len() > 1 && digits.ends_with('0') {
         digits.pop();
     }

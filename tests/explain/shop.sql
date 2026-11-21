@@ -33,3 +33,12 @@ SELECT x.name FROM (SELECT name, credit FROM customers WHERE credit > 100) AS x 
 SELECT * FROM pending_orders WHERE customer_id = 17;
 SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.customer_id = 42;
 SELECT l.sku, p.title FROM lines l JOIN products p ON p.sku = l.sku WHERE l.sku = 'SKU-003';
+SELECT * FROM customers c, orders o WHERE o.customer_id = c.id AND c.city = 'Bedok';
+SELECT * FROM orders o, customers c WHERE o.customer_id = c.id;
+SELECT * FROM lines l, products p WHERE l.sku = p.sku AND p.category = 'x';
+SELECT * FROM customers c, lines l WHERE c.id = l.qty;
+SELECT * FROM products WHERE price > 10;
+SELECT * FROM products WHERE category = 'a' AND price > 10;
+SELECT * FROM customers WHERE city > 'B' ORDER BY city;
+SELECT * FROM orders WHERE customer_id = 3 ORDER BY placed;
+SELECT * FROM orders WHERE customer_id > 3;

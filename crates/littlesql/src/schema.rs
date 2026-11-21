@@ -87,6 +87,8 @@ pub struct Table {
     pub checks: Vec<(String, ast::Expr)>,
     pub sql: String,
     row_estimate: Cell<Option<u64>>,
+    /// The database file the table lives in (main, temp or attached).
+    pub pager: Option<Rc<Pager>>,
 }
 
 impl Table {
@@ -96,12 +98,18 @@ impl Table {
             .position(|c| c.name.eq_ignore_ascii_case(name))
     }
 
+    /// The pager of the file the table lives in.
+    pub fn file(&self) -> &Rc<Pager> {
+        self.pager.as_ref().expect("a loaded table knows its file")
+    }
+
     /// Estimated number of rows, computed on first use.
-    pub fn row_estimate(&self, pager: &Pager) -> u64 {
+    pub fn row_estimate(&self) -> u64 {
         if let Some(n) = self.row_estimate.get() {
             return n;
         }
-        let n = estimate_rows(pager, self.root);
+        let _ = estimate_rows;
+        let n = 1_048_576;
         self.row_estimate.set(Some(n));
         n
     }
@@ -113,6 +121,7 @@ pub struct View {
     pub columns: Vec<String>,
     pub select: ast::Select,
     pub sql: String,
+    pub pager: Option<Rc<Pager>>,
 }
 
 /// A trigger, parsed from its CREATE TRIGGER text.
@@ -121,6 +130,8 @@ pub struct Trigger {
     pub name: String,
     pub table: String,
     pub def: ast::CreateTrigger,
+    /// The file the trigger is stored in.
+    pub pager: Option<Rc<Pager>>,
 }
 
 /// One row of `sqlite_schema`.
@@ -144,6 +155,12 @@ pub struct Schema {
     pub broken: HashMap<String, String>,
     pub rows: Vec<SchemaRow>,
     pub triggers: Vec<Rc<Trigger>>,
+    /// The file this schema describes (None for a merged schema).
+    pub pager: Option<Rc<Pager>>,
+    /// For the merged schema a connection binds against: each file's own
+    /// schema by name, in `PRAGMA database_list` order (main, temp, then
+    /// attached files). Empty for a single file's schema.
+    pub dbs: Vec<(String, Rc<Schema>)>,
 }
 
 fn lower(s: &str) -> String {
@@ -281,6 +298,7 @@ pub fn table_from_ast(ct: &CreateTable, name: &str, root: u32, sql: &str) -> Res
         autoincrement: ct.columns.iter().any(|c| c.autoincrement),
         sql: sql.to_string(),
         row_estimate: Cell::new(None),
+        pager: None,
     };
     // Primary key columns, from a column constraint or a table constraint.
     let mut pk_cols: Vec<IndexCol> = Vec::new();
@@ -351,7 +369,10 @@ pub fn table_from_ast(ct: &CreateTable, name: &str, root: u32, sql: &str) -> Res
 impl Schema {
     /// Read and parse `sqlite_schema`.
     pub fn load(pager: &Rc<Pager>) -> Result<Schema> {
-        let mut schema = Schema::default();
+        let mut schema = Schema {
+            pager: Some(pager.clone()),
+            ..Schema::default()
+        };
         if pager.page_count() == 0 {
             schema.add_schema_table();
             return Ok(schema);
@@ -385,7 +406,8 @@ impl Schema {
     fn add_schema_table(&mut self) {
         let sql = "CREATE TABLE sqlite_schema(type text, name text, tbl_name text, rootpage integer, sql text)";
         if let Ok(Stmt::CreateTable(ct)) = parse_one(sql) {
-            if let Ok(t) = table_from_ast(&ct, "sqlite_schema", 1, sql) {
+            if let Ok(mut t) = table_from_ast(&ct, "sqlite_schema", 1, sql) {
+                t.pager = self.pager.clone();
                 let t = Rc::new(t);
                 self.tables.insert("sqlite_schema".into(), t.clone());
                 self.tables.insert("sqlite_master".into(), t);
@@ -543,6 +565,7 @@ impl Schema {
                     primary: true,
                 }));
             }
+            t.pager = self.pager.clone();
             self.tables.insert(k, Rc::new(t));
         }
         for r in rows.iter().filter(|r| r.kind == "view") {
@@ -556,6 +579,7 @@ impl Schema {
                             columns: cv.columns,
                             select: cv.select,
                             sql: sql.clone(),
+                            pager: self.pager.clone(),
                         }),
                     );
                 }
@@ -575,28 +599,120 @@ impl Schema {
                     name: r.name.clone(),
                     table: r.tbl_name.clone(),
                     def,
+                    pager: self.pager.clone(),
                 }));
             }
         }
     }
 
-    /// Add a view that lives only in this connection (CREATE TEMP VIEW).
-    pub fn add_temp_view(&mut self, sql: &str) -> Result<()> {
-        match parse_one(sql)? {
-            Stmt::CreateView(cv) => {
-                self.views.insert(
-                    lower(&cv.name),
-                    Rc::new(View {
-                        name: cv.name.clone(),
-                        columns: cv.columns,
-                        select: cv.select,
-                        sql: sql.to_string(),
-                    }),
-                );
-                Ok(())
+    /// The schema a connection binds against: unqualified names resolve
+    /// to `temp` first, then `main`, then attached files in the order they
+    /// were attached, as in SQLite. `files` is in `database_list` order.
+    pub fn merge(files: &[(String, Rc<Schema>)]) -> Schema {
+        let mut m = Schema {
+            dbs: files.to_vec(),
+            ..Schema::default()
+        };
+        let order = files
+            .iter()
+            .position(|(n, _)| n == "temp")
+            .into_iter()
+            .chain((0..files.len()).filter(|i| files[*i].0 != "temp"));
+        for i in order {
+            let (name, s) = &files[i];
+            for (k, t) in &s.tables {
+                m.tables.entry(k.clone()).or_insert_with(|| t.clone());
             }
-            _ => Err(Error::Sql("not a view definition".into())),
+            for (k, v) in &s.views {
+                m.views.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            for (k, v) in &s.broken {
+                m.broken.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            if name == "temp" {
+                if let Some(t) = s.tables.get("sqlite_schema") {
+                    m.tables.insert("sqlite_temp_schema".into(), t.clone());
+                    m.tables.insert("sqlite_temp_master".into(), t.clone());
+                }
+            }
         }
+        // `sqlite_schema` is always main's.
+        if let Some((_, main)) = files.iter().find(|(n, _)| n == "main") {
+            for k in ["sqlite_schema", "sqlite_master"] {
+                if let Some(t) = main.tables.get(k) {
+                    m.tables.insert(k.into(), t.clone());
+                }
+            }
+            m.rows = main.rows.clone();
+            m.pager = main.pager.clone();
+        }
+        for (_, s) in files {
+            m.triggers.extend(s.triggers.iter().cloned());
+        }
+        m
+    }
+
+    /// For a merged schema: the file a view's own names resolve in, or
+    /// None for a TEMP view (which uses the usual search).
+    pub fn view_file(&self, v: &View) -> Option<String> {
+        let p = v.pager.as_ref()?;
+        let (name, _) = self
+            .dbs
+            .iter()
+            .find(|(_, s)| s.pager.as_ref().is_some_and(|q| Rc::ptr_eq(p, q)))?;
+        (name != "temp").then(|| name.clone())
+    }
+
+    /// The schema of the file called `db` (`main`, `temp` or an attached
+    /// name), for a merged schema.
+    pub fn db(&self, db: &str) -> Option<&Rc<Schema>> {
+        self.dbs
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(db))
+            .map(|(_, s)| s)
+    }
+
+    /// The schema a `db.` qualifier names, or an error for an unknown name.
+    pub fn db_or_err(&self, db: &str) -> Result<&Rc<Schema>> {
+        self.db(db)
+            .ok_or_else(|| Error::Sql(format!("unknown database {db}")))
+    }
+
+    /// A table by optionally qualified name.
+    pub fn table_in(&self, db: Option<&str>, name: &str) -> Result<Option<Rc<Table>>> {
+        Ok(match db {
+            None => self.table(name).cloned(),
+            Some(d) => {
+                // An unknown database simply has no such table.
+                let Some(s) = self.db(d) else { return Ok(None) };
+                let l = lower(name);
+                // `temp.sqlite_master` is the temp file's schema table.
+                let l = match l.as_str() {
+                    "sqlite_temp_master" | "sqlite_temp_schema"
+                        if d.eq_ignore_ascii_case("temp") =>
+                    {
+                        "sqlite_schema".to_string()
+                    }
+                    _ => l,
+                };
+                s.tables.get(&l).cloned()
+            }
+        })
+    }
+
+    /// A view by optionally qualified name.
+    pub fn view_in(&self, db: Option<&str>, name: &str) -> Result<Option<Rc<View>>> {
+        Ok(match db {
+            None => self.view(name).cloned(),
+            Some(d) => self.db(d).and_then(|s| s.view(name).cloned()),
+        })
+    }
+
+    /// The files of a merged schema in name-resolution order.
+    pub fn priority(&self) -> impl Iterator<Item = &Rc<Schema>> {
+        let temp = self.dbs.iter().filter(|(n, _)| n == "temp");
+        let rest = self.dbs.iter().filter(|(n, _)| n != "temp");
+        temp.chain(rest).map(|(_, s)| s)
     }
 
     pub fn trigger(&self, name: &str) -> Option<&Rc<Trigger>> {
@@ -615,6 +731,9 @@ impl Schema {
 
     /// Find an index by name, with its table.
     pub fn index(&self, name: &str) -> Option<(Rc<Table>, Rc<Index>)> {
+        if !self.dbs.is_empty() {
+            return self.priority().find_map(|s| s.index(name));
+        }
         let t = self.tables.get(self.index_tables.get(&lower(name))?)?;
         let i = t
             .indexes

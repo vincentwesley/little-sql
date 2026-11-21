@@ -148,8 +148,9 @@ sample choice is explained in `tests/slt/MANIFEST.md`.
 
 ## D16. The planner uses SQLite's no-statistics heuristics
 
-Without ANALYZE data SQLite assumes an equality on the first column of an
-index leaves about 10 rows, each further equality halves that, and each
+Without ANALYZE data SQLite assumes a table holds about a million rows
+(see D39), an equality on the first column of an index leaves about 10
+rows, each further equality halves that, and each
 range bound keeps a quarter. Little SQL uses the same rules, prefers a
 covering index for a full scan, walks an index (or the rowid, backwards if
 needed) instead of sorting when that gives the ORDER BY or GROUP BY order,
@@ -434,3 +435,58 @@ ROW / GROUP / TIES` removes rows from the frame of aggregates and of
 evaluated per row rather than incrementally. Reason: completes the window
 function grammar SQLite 3.45 accepts, verified against sqlite3 on
 NULLs, mixed types, DESC and NULLS FIRST orderings.
+
+## D37. Several database files: each object knows its file
+
+TEMP objects and ATTACH need more than one file per connection. Rather
+than thread a database number through the whole engine, every table, view
+and trigger records the pager of the file it was loaded from, and cursors
+and the b-tree writer use that pager. The connection keeps its files in
+`PRAGMA database_list` order (main, then temp, which is an in-memory file
+created when the connection opens, then attached files), and binding uses
+a merged schema in which unqualified names resolve temp first, then main,
+then attached files in attach order, as in SQLite; `db.name` looks in one
+file. A write statement first picks its target file (from a `db.`
+qualifier, `TEMP`, or the file of the object it names), and the existing
+DDL and DML code writes there; existence checks look only in that file,
+so a TEMP table may shadow a main one. Transactions and savepoints span
+every file (each pager keeps its own savepoint, and COMMIT commits each
+file that changed; like SQLite with WAL files, there is no atomic commit
+across files). SQLite's resolution rules are copied where tests showed
+them: names inside a non-TEMP view or trigger resolve in that object's own
+file; a non-TEMP view or trigger may not name another file; dropping a
+table drops TEMP triggers on it; ATTACH works inside a transaction and
+DETACH only refuses a file with uncommitted changes. *Why:* the smallest
+change that gives SQLite's behaviour, and every rule is checked by the
+shell scripts in `tests/shell` (acceptance A7.3).
+
+## D38. Real numbers are converted with SQLite's long double arithmetic
+
+SQLite 3.45 on x86-64 turns text into doubles (`sqlite3AtoF`) and doubles
+into digits (`sqlite3FpDecode`, used by printf, by real-to-text and by
+`.dump`) with 80-bit long double arithmetic, which is not always correctly
+rounded: about one random literal in 2,000 is stored as a different double
+than a correctly rounding parser produces, and printf prints 18 or 19 real
+digits where an exact conversion would print more. `fp.rs` emulates the
+long double steps bit for bit (64-bit mantissa products rounded to nearest
+even, powers of ten rounded the way the C compiler rounds them, the final
+rounding to double) and reproduces 3.45's rounding rules, including its
+quirk that `%.0f` and `%.0g` truncate instead of rounding. Checked against
+sqlite3 on 7,000 random printf / text / round / CAST cases and 4,000 random
+literals through `.dump`: all identical (before: 449 printf differences).
+*Why:* stored values and printed text must be the ones sqlite3 gives, and
+a correctly rounded conversion is, here, the wrong answer.
+
+## D39. Planner: SQLite's table-size assumption and two tie rules
+
+Without ANALYZE, SQLite assumes every table holds about a million rows
+(`nRowLogEst` 200) whatever its real size. Little SQL used the real size,
+so small tables were scanned where SQLite searches an index. It now
+assumes the same million rows, prefers an index search to a scan when the
+estimates tie (a range on an indexed column), scans through a covering
+index only when the index is narrower than the table, and, when two
+tables tie for the outer loop, prefers the one that lets the next table
+use a real index instead of an automatic one. On 30 extra plans over
+empty, tiny and real tables, differences from sqlite3 fell from 16 to 4
+(the rest are SQLite's Bloom filters and automatic covering indexes); the
+24 that match joined the planner suite, now 57 plans, all identical.

@@ -3,9 +3,9 @@
 Updated after every milestone so a new session can continue from here.
 This is the final state at the end of the first build (M0–M10).
 
-## Status (2026-11-20)
+## Status (2026-11-21)
 
-All milestones in PLAN.md are done. `scripts/acceptance.sh` passes all 19
+All milestones in PLAN.md are done. `scripts/acceptance.sh` passes all 20
 checks, verified from a fresh clone of `claude/nice-brown-acniv0` (1 min
 45 s on a 4-core VM). The whole project is in one pull request:
 [vincentwesley/little-sql#1](https://github.com/vincentwesley/little-sql/pull/1).
@@ -16,8 +16,9 @@ checks, verified from a fresh clone of `claude/nice-brown-acniv0` (1 min
 | sqllogictest full corpus (622 files), read mode | 5,729,099 | 0 | 100.00 % |
 | sqllogictest CI sample (49 files), native mode | 323,361 | 0 | 100.00 % |
 | sqllogictest CI sample (49 files), read mode | 240,267 | 0 | 100.00 % |
-| Differential tests vs sqlite3 3.45.1 (21 files, 5 fixtures) | 443 | 0 | 100.00 % |
-| Planner: plans identical to sqlite3's `EXPLAIN QUERY PLAN` | 33 | 0 | — |
+| Differential tests vs sqlite3 3.45.1 (21 files, 6 fixtures) | 443 | 0 | 100.00 % |
+| Planner: plans identical to sqlite3's `EXPLAIN QUERY PLAN` | 57 | 0 | — |
+| Shell scripts identical to sqlite3 (`tests/shell`) | 7 | 0 | — |
 
 Reference: sqlite3 3.45.1 (DECISIONS D25). Numbers come from
 `docs/results/*.json` via `node scripts/publish-results.mjs`; never edit them
@@ -34,13 +35,14 @@ by hand.
 - `crates/littlesql-cli` — the `littlesql` shell.
 - `crates/littlesql-wasm` + `playground/` — WebAssembly build and static site.
 - `crates/slt` — sqllogictest and differential runners.
-- `tests/` — differential suite + fixtures, planner suite, write workloads,
+- `tests/` — differential suite + fixtures, planner suite, shell scripts,
+  write workloads,
   sqllogictest sample list (`tests/slt/SAMPLE`, `MANIFEST.md`, `FLOOR`).
 - `scripts/` — `acceptance.sh`, `fetch-sqllogictest.sh`, `slt-full.sh`,
   `build-demo-db.sh`, `build-playground.sh`, `playground-smoke.mjs`,
   `publish-results.mjs`, `write-check.sh`, `crash-check.sh`, `bench.sh`.
 - `data/` — the HDB resale CSV (2022 onwards, Singapore Open Data Licence).
-- `docs/` — PLAN, DECISIONS (D1–D36), RESEARCH, ACCEPTANCE, results/.
+- `docs/` — PLAN, DECISIONS (D1–D39), RESEARCH, ACCEPTANCE, results/.
 
 ## How to continue
 
@@ -51,31 +53,6 @@ by hand.
 - After any change that can move a score: `scripts/slt-full.sh`,
   `scripts/acceptance.sh`, `node scripts/publish-results.mjs`,
   `scripts/build-playground.sh`, and commit `docs/results/` with README.
-
-## Next: TEMP tables and ATTACH (design, not started)
-
-The engine assumes one file: `Database` owns one `Pager`, a `Table` holds
-only its root page, and the binder, executor and writer all reach that one
-pager. A second schema needs, in order:
-
-1. `Database` holds a list of attached files (`main`, `temp`, then
-   ATTACHed names), each with its own `Pager` and `Schema`; `temp` is an
-   in-memory pager created on first use.
-2. `Table` / `Index` gain a database number; cursors and the writer pick
-   the pager by it (`exec.rs` scan paths, `btree_write.rs` via `write.rs`).
-3. The binder resolves `schema.name` (`TableSource::Table { schema, .. }`
-   already parses it) and unqualified names in SQLite's order: temp, main,
-   then attached files in attach order. The current TEMP VIEW special case
-   (`temp_views`) moves into the temp schema.
-4. Transactions: BEGIN/COMMIT/ROLLBACK and savepoints take a savepoint on
-   every pager that was written; COMMIT commits each (no cross-file
-   atomicity, as in SQLite with WAL files).
-5. `ATTACH 'file' AS name`, `DETACH name`, `PRAGMA database_list`, and
-   `sqlite_temp_schema`; then lift the "TEMP tables" / "TEMP triggers"
-   refusals in `write.rs`.
-
-Verify with differential tests that create TEMP tables, shadow a main
-table of the same name, and join across an ATTACHed fixture.
 
 ## Known issues
 
@@ -93,7 +70,11 @@ table of the same name, and join across an ATTACHed fixture.
 - json_each's `id` and `fullkey` can differ from SQLite's for JSON5
   spellings (`0x1F`, `'quotes'`, `\x41`), which SQLite sizes as written
   (D33); standard JSON matches exactly.
-- `EXPLAIN QUERY PLAN` shows nothing for the window-function step.
+- `EXPLAIN QUERY PLAN` shows nothing for the window-function step, and
+  shows `AUTOMATIC HASH INDEX` where SQLite shows a Bloom filter plus an
+  automatic covering index.
+- ATTACH needs a file system, so in the playground (WebAssembly) only
+  `ATTACH ':memory:'` works.
 
 ## Done and verified
 
@@ -143,6 +124,20 @@ sqllogictest corpus in native mode; 443 / 443 differential tests.
   frames with `RANGE n PRECEDING / FOLLOWING` and `EXCLUDE` (D36). Each
   has a differential test file (`json_table`, `json_edit`, `json5`,
   `window_frames`).
+- Several files (DECISIONS D37): TEMP tables, indexes, views and triggers,
+  ATTACH / DETACH, `db.name` qualifiers, transactions across files,
+  `PRAGMA database_list`, per-file pragmas, and SQLite's name-resolution
+  rules for views and triggers. The shell gained `.dump` and multi-file
+  `.tables` / `.schema` / `.indexes` / `.databases`. Checked by whole-script
+  comparisons with sqlite3 (`tests/shell`, `scripts/shell-check.sh`,
+  acceptance A7.3), including the `.dump` and integrity check of every
+  file the scripts write.
+- Real-number conversions use SQLite's long double arithmetic (`fp.rs`,
+  D38): literals, CAST, printf, real-to-text and `.dump` give sqlite3's
+  exact digits (7,000 random printf cases and 4,000 random literals, all
+  identical).
+- Planner (D39): SQLite's million-row table assumption and tie rules; the
+  planner suite grew from 33 to 57 plans, all identical to sqlite3's.
 - M10 Final review: fresh-clone acceptance (19/19), README read-through
   and CLI / playground run as a stranger (fixed: a new empty database
   reported corruption on `.tables`; README test commands), one pull
@@ -153,11 +148,11 @@ sqllogictest corpus in native mode; 443 / 443 differential tests.
 - **Hosting the playground.** Optional in the brief, and it needs the
   repository owner to enable GitHub Pages (or choose another host); see
   NEEDS-VIN. CI keeps the built site as a downloadable artifact.
-- **`jsonb_*` functions** (which return binary JSON), **TEMP tables and
-  triggers**, **virtual tables** other than `json_each` / `json_tree`,
-  **ATTACH**: not exercised by the corpus; each is rejected with a clear
-  "not supported" error rather than approximated. Most useful next: TEMP
-  tables / ATTACH (a second schema).
+- **`jsonb_*` functions** (which return binary JSON) and **virtual tables**
+  other than `json_each` / `json_tree`: not exercised by the corpus; each is
+  rejected with a clear "not supported" error rather than approximated.
+  Most useful next: upsert (`ON CONFLICT ... DO`) and `RETURNING`, then
+  `jsonb_*` (needs SQLite's exact JSONB encoding choices).
 - **Multi-process access** (file locks, `-shm`): out of scope by design
   (DECISIONS D13).
 - **SQLite-grade speed**: would need a bytecode VM and three-sibling

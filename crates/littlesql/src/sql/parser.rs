@@ -249,6 +249,15 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `[schema.]name`, keeping the schema.
+    fn qualified(&mut self) -> Result<(Option<String>, String)> {
+        let first = self.ident()?;
+        if self.eat_op(".") {
+            return Ok((Some(first), self.ident()?));
+        }
+        Ok((None, first))
+    }
+
     /// `[schema.]name`, discarding the schema.
     fn qualified_name(&mut self) -> Result<String> {
         let first = self.ident()?;
@@ -334,10 +343,12 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
+            let (db, name) = self.qualified()?;
             return Ok(Stmt::Drop {
                 kind,
                 if_exists,
-                name: self.qualified_name()?,
+                db,
+                name,
             });
         }
         if self.is_kw("INSERT") || self.is_kw("REPLACE") {
@@ -348,13 +359,13 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("DELETE") {
             self.expect_kw("FROM")?;
-            let table = self.qualified_name()?;
+            let (db, table) = self.qualified()?;
             let where_ = if self.eat_kw("WHERE") {
                 Some(self.expr()?)
             } else {
                 None
             };
-            return Ok(Stmt::Delete(Delete { table, where_ }));
+            return Ok(Stmt::Delete(Delete { db, table, where_ }));
         }
         if self.eat_kw("BEGIN") {
             let _ = self.eat_kw("DEFERRED") || self.eat_kw("IMMEDIATE") || self.eat_kw("EXCLUSIVE");
@@ -375,7 +386,7 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("ALTER") {
             self.expect_kw("TABLE")?;
-            let table = self.qualified_name()?;
+            let (db, table) = self.qualified()?;
             let action = if self.eat_kw("RENAME") {
                 if self.eat_kw("TO") {
                     AlterAction::RenameTable(self.ident()?)
@@ -403,7 +414,7 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(self.unexpected());
             };
-            return Ok(Stmt::AlterTable { table, action });
+            return Ok(Stmt::AlterTable { db, table, action });
         }
         if self.eat_kw("SAVEPOINT") {
             return Ok(Stmt::Savepoint(self.ident()?));
@@ -413,7 +424,7 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::Release(self.ident()?));
         }
         if self.eat_kw("PRAGMA") {
-            let name = self.qualified_name()?;
+            let (db, name) = self.qualified()?;
             let value = if self.eat_op("=") {
                 Some(self.pragma_value()?)
             } else if self.eat_op("(") {
@@ -423,7 +434,7 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            return Ok(Stmt::Pragma { name, value });
+            return Ok(Stmt::Pragma { db, name, value });
         }
         if self.eat_kw("REINDEX") {
             let name = if self.at_eof() || self.is_op(";") {
@@ -441,10 +452,32 @@ impl<'a> Parser<'a> {
                 return Ok(Stmt::Noop(name));
             }
         }
-        for (kw, what) in [("ATTACH", "ATTACH"), ("DETACH", "DETACH")] {
-            if self.is_kw(kw) {
-                return self.unsupported(what);
+        if self.eat_kw("ATTACH") {
+            self.eat_kw("DATABASE");
+            let file = self.expr()?;
+            self.expect_kw("AS")?;
+            let name = match self.expr()? {
+                Expr::Name {
+                    table: None, name, ..
+                } => name,
+                Expr::Literal(Value::Text(t)) => t.to_string(),
+                _ => return self.unsupported("ATTACH with a computed name"),
+            };
+            if self.eat_kw("KEY") {
+                return self.unsupported("ATTACH ... KEY");
             }
+            return Ok(Stmt::Attach { file, name });
+        }
+        if self.eat_kw("DETACH") {
+            self.eat_kw("DATABASE");
+            let name = match self.expr()? {
+                Expr::Name {
+                    table: None, name, ..
+                } => name,
+                Expr::Literal(Value::Text(t)) => t.to_string(),
+                _ => return self.unsupported("DETACH with a computed name"),
+            };
+            return Ok(Stmt::Detach(name));
         }
         Err(self.unexpected())
     }
@@ -474,12 +507,16 @@ impl<'a> Parser<'a> {
         let temp = self.eat_kw("TEMP") || self.eat_kw("TEMPORARY");
         if self.eat_kw("TABLE") {
             let if_not_exists = self.if_not_exists()?;
-            let name = self.qualified_name()?;
-            return self.create_table_body(name, temp, if_not_exists);
+            let (db, name) = self.qualified()?;
+            let mut st = self.create_table_body(name, temp, if_not_exists)?;
+            if let Stmt::CreateTable(ct) = &mut st {
+                ct.db = db;
+            }
+            return Ok(st);
         }
         if self.eat_kw("VIEW") {
             let if_not_exists = self.if_not_exists()?;
-            let name = self.qualified_name()?;
+            let (db, name) = self.qualified()?;
             let mut columns = Vec::new();
             if self.eat_op("(") {
                 loop {
@@ -494,6 +531,7 @@ impl<'a> Parser<'a> {
             let select = self.select()?;
             return Ok(Stmt::CreateView(CreateView {
                 name,
+                db,
                 temp,
                 if_not_exists,
                 columns,
@@ -503,7 +541,7 @@ impl<'a> Parser<'a> {
         let unique = self.eat_kw("UNIQUE");
         if self.eat_kw("INDEX") {
             let if_not_exists = self.if_not_exists()?;
-            let name = self.qualified_name()?;
+            let (db, name) = self.qualified()?;
             self.expect_kw("ON")?;
             let table = self.ident()?;
             self.expect_op("(")?;
@@ -517,6 +555,7 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::CreateIndex(CreateIndex {
                 name,
+                db,
                 table,
                 unique,
                 if_not_exists,
@@ -549,7 +588,7 @@ impl<'a> Parser<'a> {
 
     fn create_trigger(&mut self, temp: bool) -> Result<Stmt> {
         let if_not_exists = self.if_not_exists()?;
-        let name = self.qualified_name()?;
+        let (db, name) = self.qualified()?;
         let timing = if self.eat_kw("BEFORE") {
             TriggerTiming::Before
         } else if self.eat_kw("AFTER") {
@@ -579,7 +618,7 @@ impl<'a> Parser<'a> {
             return Err(self.unexpected());
         };
         self.expect_kw("ON")?;
-        let table = self.qualified_name()?;
+        let (table_db, table) = self.qualified()?;
         if self.eat_kw("FOR") {
             self.expect_kw("EACH")?;
             self.expect_kw("ROW")?;
@@ -620,6 +659,8 @@ impl<'a> Parser<'a> {
         }
         Ok(Stmt::CreateTrigger(CreateTrigger {
             name,
+            db,
+            table_db,
             temp,
             if_not_exists,
             timing,
@@ -732,6 +773,7 @@ impl<'a> Parser<'a> {
     fn create_table_body(&mut self, name: String, temp: bool, if_not_exists: bool) -> Result<Stmt> {
         let mut ct = CreateTable {
             name,
+            db: None,
             temp,
             if_not_exists,
             columns: Vec::new(),
@@ -906,7 +948,7 @@ impl<'a> Parser<'a> {
             self.on_conflict()?
         };
         self.expect_kw("INTO")?;
-        let table = self.qualified_name()?;
+        let (db, table) = self.qualified()?;
         if self.eat_kw("AS") {
             self.ident()?;
         }
@@ -933,6 +975,7 @@ impl<'a> Parser<'a> {
             return self.unsupported("RETURNING");
         }
         Ok(Stmt::Insert(Insert {
+            db,
             table,
             columns,
             source,
@@ -942,7 +985,7 @@ impl<'a> Parser<'a> {
 
     fn update(&mut self) -> Result<Stmt> {
         let on_conflict = self.on_conflict()?;
-        let table = self.qualified_name()?;
+        let (db, table) = self.qualified()?;
         self.expect_kw("SET")?;
         let mut sets = Vec::new();
         loop {
@@ -965,6 +1008,7 @@ impl<'a> Parser<'a> {
             return self.unsupported("RETURNING");
         }
         Ok(Stmt::Update(Update {
+            db,
             table,
             sets,
             where_,
@@ -1495,7 +1539,7 @@ impl<'a> Parser<'a> {
                 return Value::Int(i);
             }
         }
-        Value::Real(text.parse::<f64>().unwrap_or(0.0))
+        Value::Real(crate::fp::atof(text))
     }
 
     fn prefix(&mut self) -> Result<Expr> {

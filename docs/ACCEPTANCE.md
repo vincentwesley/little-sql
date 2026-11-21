@@ -27,6 +27,7 @@ the playground smoke test) and `node`.
 | A5.3 | M5 | Published numbers are current | `node scripts/publish-results.mjs --check`: the fresh reports in `results/` equal the committed copies in `docs/results/`, and the README table and `playground/dist/results.json` equal those |
 | A7.1 | M7 | Native mode runs | `slt run --mode native --min-rate <FLOOR> corpus/test` |
 | A7.2 | M7 | Written files are valid SQLite | `scripts/write-check.sh`: files written by Little SQL pass `sqlite3 FILE "PRAGMA integrity_check"` and have the same content |
+| A7.3 | M7 | Whole shell scripts match sqlite3 | `scripts/shell-check.sh`: every `tests/shell/*.sql` (TEMP objects, ATTACH, shell listings, `.dump`, real-number formatting) prints exactly what sqlite3 prints, and every database file it leaves has sqlite3's `.dump` and passes its integrity check |
 | A8.1 | M8 | Transactions and crash recovery | `scripts/crash-check.sh`: rollback restores state; a WAL left without checkpoint is recovered by both Little SQL and sqlite3 with identical content |
 | A9.1 | M9 | Benchmarks run | `scripts/bench.sh --quick` prints a table of timings against sqlite3 |
 

@@ -19,6 +19,8 @@ pub enum Stmt {
     Drop {
         kind: DropKind,
         if_exists: bool,
+        /// `schema.` before the name, if written.
+        db: Option<String>,
         name: String,
     },
     Insert(Insert),
@@ -29,12 +31,21 @@ pub enum Stmt {
     Rollback,
     Savepoint(String),
     AlterTable {
+        db: Option<String>,
         table: String,
         action: AlterAction,
     },
+    /// `ATTACH [DATABASE] file AS name`
+    Attach {
+        file: Expr,
+        name: String,
+    },
+    /// `DETACH [DATABASE] name`
+    Detach(String),
     Release(String),
     RollbackTo(String),
     Pragma {
+        db: Option<String>,
         name: String,
         value: Option<String>,
     },
@@ -69,6 +80,10 @@ pub enum TriggerEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateTrigger {
     pub name: String,
+    /// `schema.` before the trigger's name.
+    pub db: Option<String>,
+    /// `schema.` before the table's name (TEMP triggers only).
+    pub table_db: Option<String>,
     pub temp: bool,
     pub if_not_exists: bool,
     pub timing: TriggerTiming,
@@ -412,6 +427,7 @@ pub enum TableConstraint {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateTable {
     pub name: String,
+    pub db: Option<String>,
     pub temp: bool,
     pub if_not_exists: bool,
     pub columns: Vec<ColumnDef>,
@@ -423,6 +439,7 @@ pub struct CreateTable {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateIndex {
     pub name: String,
+    pub db: Option<String>,
     pub table: String,
     pub unique: bool,
     pub if_not_exists: bool,
@@ -433,6 +450,7 @@ pub struct CreateIndex {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateView {
     pub name: String,
+    pub db: Option<String>,
     pub temp: bool,
     pub if_not_exists: bool,
     pub columns: Vec<String>,
@@ -454,6 +472,7 @@ pub enum InsertSource {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Insert {
+    pub db: Option<String>,
     pub table: String,
     pub columns: Vec<String>,
     pub source: InsertSource,
@@ -462,6 +481,7 @@ pub struct Insert {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Update {
+    pub db: Option<String>,
     pub table: String,
     pub sets: Vec<(String, Expr)>,
     pub where_: Option<Expr>,
@@ -470,6 +490,7 @@ pub struct Update {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Delete {
+    pub db: Option<String>,
     pub table: String,
     pub where_: Option<Expr>,
 }

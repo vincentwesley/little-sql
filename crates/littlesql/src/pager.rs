@@ -86,6 +86,12 @@ pub struct PagerStats {
     pub cache_hits: Cell<u64>,
 }
 
+impl std::fmt::Debug for Pager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Pager({} pages)", self.page_count())
+    }
+}
+
 pub struct Pager {
     db: RefCell<Box<dyn Storage>>,
     wal: RefCell<Option<Wal>>,

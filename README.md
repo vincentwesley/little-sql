@@ -101,8 +101,10 @@ Rust.
 
 `EXPLAIN` (without `QUERY PLAN`) runs the query and shows the same tree with
 how many times each loop ran and how many rows it visited. `.eqp on` prints
-that tree after every query; `.stats on` prints pages read. `.help` lists
-every command, and `littlesql -help` every option.
+that tree after every query; `.stats on` prints pages read. `.dump` writes
+the database as SQL text, byte for byte as sqlite3 does; `.tables`,
+`.schema`, `.indexes` and `.databases` cover TEMP and attached files.
+`.help` lists every command, and `littlesql -help` every option.
 
 ## The playground
 
@@ -140,6 +142,13 @@ push and keeps it as a downloadable artifact.
   `BEFORE`, `AFTER`, `INSTEAD OF` on views, `UPDATE OF`, `WHEN`, and
   `RAISE(IGNORE | ABORT | FAIL | ROLLBACK, ...)`. `PRAGMA integrity_check` checks
   the whole file structurally.
+- **Several files:** `TEMP` tables, indexes, views and triggers (they shadow
+  main objects of the same name), `ATTACH` / `DETACH` of other database
+  files (or `':memory:'`), `db.name` everywhere a name goes, joins and
+  transactions across files, `PRAGMA database_list` and per-file pragmas
+  such as `PRAGMA aux.table_info(t)`. Name resolution follows SQLite's
+  rules, including that a view or trigger stored in a file only sees that
+  file.
 - **Queries:** `SELECT` with joins (inner, left, cross, natural, `USING`,
   simple right joins), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` (with
   `NULLS FIRST/LAST`), `LIMIT`/`OFFSET`, `DISTINCT`, compound queries
@@ -159,7 +168,9 @@ push and keeps it as a downloadable artifact.
   `json_error_position`; JSON5 input and JSONB blobs are read too).
 - **Semantics:** SQLite's type affinity, comparison and collation rules
   (`BINARY`, `NOCASE`, `RTRIM`), integer overflow to real, three-valued
-  logic, and its exact number formatting.
+  logic, and its exact number handling: text is converted to reals and
+  reals to text (`printf`, `CAST`, `round`, `.dump`) with the same long
+  double arithmetic SQLite 3.45 uses, so even the last digits agree.
 - **Functions:** the core scalar functions (string, numeric, `printf`,
   `like`/`glob`, math), the aggregates (`count`, `sum`, `total`, `avg`, `min`,
   `max`, `group_concat`, with `DISTINCT` and `FILTER`), and the date and time
@@ -169,14 +180,14 @@ push and keeps it as a downloadable artifact.
   indexes, index order used instead of sorting (forwards or backwards),
   streaming `GROUP BY` over sorted input, automatic hash indexes for joins
   without a usable index, greedy join ordering, and `INDEXED BY` /
-  `NOT INDEXED`. On the planner test set its `EXPLAIN QUERY PLAN` output is
-  identical to SQLite's.
+  `NOT INDEXED`, all under SQLite's no-statistics assumptions. On the
+  planner test set (57 queries over real, tiny and empty tables) its
+  `EXPLAIN QUERY PLAN` output is identical to SQLite's.
 
 ## Not supported (yet)
 
 - The `jsonb_*` functions that return binary JSON (JSONB input is read),
-  virtual tables other than `json_each` / `json_tree`, `ATTACH`, TEMP
-  tables.
+  and virtual tables other than `json_each` / `json_tree`.
 - Expression and partial indexes: tables with them are readable (the
   planner ignores those indexes) but Little SQL refuses to write to them.
 - Foreign keys are parsed but not enforced, which is also SQLite's default.
@@ -241,6 +252,7 @@ scripts/fetch-sqllogictest.sh                          # the CI sample (66 MB)
 ./target/release/slt run --mode native corpus/test     # sqllogictest, native mode
 ./target/release/slt run corpus/test                   # sqllogictest, read mode
 ./target/release/slt diff tests/differential           # differential tests
+scripts/shell-check.sh                                 # whole scripts vs sqlite3
 scripts/acceptance.sh                                  # every acceptance check
 ```
 

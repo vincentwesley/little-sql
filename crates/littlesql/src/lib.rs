@@ -16,6 +16,7 @@
 //! [`exec`] (the plan and its interpreter), and [`db`] (the public handle).
 
 pub mod alter;
+pub mod attach;
 pub mod bind;
 pub mod btree;
 pub mod btree_write;
@@ -23,6 +24,7 @@ pub mod datetime;
 pub mod db;
 pub mod error;
 pub mod exec;
+pub mod fp;
 pub mod func;
 pub mod json;
 pub mod pager;

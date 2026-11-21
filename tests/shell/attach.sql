@@ -1,0 +1,25 @@
+-- ATTACH basics: qualified names, temp shadowing, database_list, DETACH and re-ATTACH.
+create table t(a);
+insert into t values(1),(2);
+create temp table t(a, b);
+insert into t values(10, 20);
+select * from t;
+select * from main.t;
+select * from temp.t;
+attach 'aux1.db' as aux;
+create table aux.u(x primary key, y);
+insert into aux.u values(1,'one'),(2,'two');
+select main.t.a, u.y from main.t join u on u.x = main.t.a;
+pragma database_list;
+select type, name, tbl_name from temp.sqlite_master;
+select type, name from sqlite_temp_master;
+select type, name from aux.sqlite_master;
+create index aux.ux on u(y);
+select name from aux.sqlite_master where type='index';
+drop table temp.t;
+select * from t;
+detach aux;
+select * from u;
+attach 'aux1.db' as aux;
+select * from aux.u;
+pragma aux.integrity_check;

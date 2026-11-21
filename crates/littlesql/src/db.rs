@@ -14,6 +14,23 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+/// A column's type as `PRAGMA table_info` shows it: SQLite spells the six
+/// type names it knows (those STRICT tables accept) in upper case.
+fn table_info_type(t: &str) -> String {
+    match t.to_ascii_uppercase().as_str() {
+        u @ ("ANY" | "BLOB" | "INT" | "INTEGER" | "REAL" | "TEXT") => u.to_string(),
+        _ => t.to_string(),
+    }
+}
+
+/// The absolute form of a path, as `PRAGMA database_list` reports it.
+fn absolute(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
 /// The outcome of one statement.
 #[derive(Debug, Default, Clone)]
 pub struct ResultSet {
@@ -57,16 +74,37 @@ pub struct Database {
     /// True between BEGIN and COMMIT/ROLLBACK.
     pub(crate) explicit_txn: std::cell::Cell<bool>,
     /// Open savepoints, outermost first, each with the state to return to.
-    pub(crate) savepoints: RefCell<Vec<(String, crate::pager::Savepoint, Vec<String>)>>,
+    pub(crate) savepoints: RefCell<Vec<(String, Savepoints)>>,
     /// The transaction was started by SAVEPOINT (not BEGIN), so releasing
     /// the outermost savepoint commits it.
     pub(crate) savepoint_txn: std::cell::Cell<bool>,
-    /// CREATE TEMP VIEW definitions: they belong to this connection only and
-    /// are never written to the file.
-    pub(crate) temp_views: RefCell<Vec<String>>,
+    /// Every file of the connection in `PRAGMA database_list` order: main,
+    /// temp (an in-memory file only this connection sees), then attached
+    /// files.
+    pub(crate) files: RefCell<Vec<DbFile>>,
+    /// The file the statement now running changes (see DECISIONS D37).
+    pub(crate) target: RefCell<Option<Rc<Pager>>>,
     pub(crate) limits: std::cell::Cell<Limits>,
-    wal_path: Option<PathBuf>,
     mem: Option<MemStorage>,
+}
+
+/// A savepoint of every file of the connection.
+pub(crate) type Savepoints = Vec<(Rc<Pager>, crate::pager::Savepoint)>;
+
+/// One file of a connection.
+pub(crate) struct DbFile {
+    pub name: String,
+    pub pager: Rc<Pager>,
+    /// The file on disk ("" for memory), as `PRAGMA database_list` shows.
+    pub path: String,
+    pub wal_path: Option<PathBuf>,
+}
+
+fn temp_pager() -> Rc<Pager> {
+    Rc::new(
+        Pager::open(Box::new(MemStorage::new(Vec::new())), None, true)
+            .expect("an empty database always opens"),
+    )
 }
 
 fn wal_path_for(path: &Path) -> PathBuf {
@@ -80,20 +118,92 @@ impl Database {
         pager: Pager,
         wal_path: Option<PathBuf>,
         mem: Option<MemStorage>,
+        path: String,
     ) -> Result<Database> {
         let pager = Rc::new(pager);
-        let schema = Rc::new(Schema::load(&pager)?);
-        Ok(Database {
+        let files = vec![
+            DbFile {
+                name: "main".into(),
+                pager: pager.clone(),
+                path,
+                wal_path: wal_path.clone(),
+            },
+            DbFile {
+                name: "temp".into(),
+                pager: temp_pager(),
+                path: String::new(),
+                wal_path: None,
+            },
+        ];
+        let db = Database {
             pager,
-            schema: RefCell::new(schema),
+            schema: RefCell::new(Rc::new(Schema::default())),
             explicit_txn: std::cell::Cell::new(false),
             savepoints: RefCell::new(Vec::new()),
             savepoint_txn: std::cell::Cell::new(false),
-            temp_views: RefCell::new(Vec::new()),
+            files: RefCell::new(files),
+            target: RefCell::new(None),
             limits: Default::default(),
-            wal_path,
             mem,
-        })
+        };
+        db.reload_schema()?;
+        Ok(db)
+    }
+
+    /// The file the running statement changes (main when none was chosen).
+    pub(crate) fn target(&self) -> Rc<Pager> {
+        self.target
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| self.pager.clone())
+    }
+
+    /// Run `f` with `pager` as the file being changed.
+    pub(crate) fn with_target<T>(&self, pager: Rc<Pager>, f: impl FnOnce() -> T) -> T {
+        let saved = self.target.replace(Some(pager));
+        let r = f();
+        *self.target.borrow_mut() = saved;
+        r
+    }
+
+    /// The schema of the target file alone.
+    pub(crate) fn target_schema(&self) -> Rc<Schema> {
+        let t = self.target();
+        let schema = self.schema();
+        schema
+            .dbs
+            .iter()
+            .find(|(_, s)| s.pager.as_ref().is_some_and(|p| Rc::ptr_eq(p, &t)))
+            .map(|(_, s)| s.clone())
+            .unwrap_or(schema)
+    }
+
+    /// The name of the file a pager belongs to.
+    pub(crate) fn file_name(&self, pager: &Rc<Pager>) -> String {
+        self.files
+            .borrow()
+            .iter()
+            .find(|f| Rc::ptr_eq(&f.pager, pager))
+            .map_or_else(|| "main".into(), |f| f.name.clone())
+    }
+
+    /// The pager of the file called `name` (an error if there is none).
+    pub(crate) fn file_pager(&self, name: &str) -> Result<Rc<Pager>> {
+        self.files
+            .borrow()
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(name))
+            .map(|f| f.pager.clone())
+            .ok_or_else(|| Error::Sql(format!("unknown database {name}")))
+    }
+
+    /// Every file's pager, in `database_list` order.
+    pub(crate) fn pagers(&self) -> Vec<Rc<Pager>> {
+        self.files
+            .borrow()
+            .iter()
+            .map(|f| f.pager.clone())
+            .collect()
     }
 
     /// Open a database file for reading and writing, creating it if it does
@@ -121,6 +231,7 @@ impl Database {
             Pager::open(Box::new(db), Some(Box::new(wal)), true)?,
             Some(wal_path),
             None,
+            absolute(path),
         )
     }
 
@@ -133,7 +244,12 @@ impl Database {
             Ok(w) => Some(Box::new(w)),
             Err(_) => None,
         };
-        Database::from_pager(Pager::open(Box::new(db), wal, false)?, None, None)
+        Database::from_pager(
+            Pager::open(Box::new(db), wal, false)?,
+            None,
+            None,
+            absolute(path),
+        )
     }
 
     /// A new, empty in-memory database.
@@ -145,7 +261,7 @@ impl Database {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Database> {
         let mem = MemStorage::new(bytes);
         let pager = Pager::open(Box::new(mem.clone()), None, true)?;
-        Database::from_pager(pager, None, Some(mem))
+        Database::from_pager(pager, None, Some(mem), String::new())
     }
 
     /// The current image of an in-memory database.
@@ -166,12 +282,13 @@ impl Database {
         &self.pager
     }
 
+    /// Re-read every file's schema and rebuild the merged one.
     pub(crate) fn reload_schema(&self) -> Result<()> {
-        let mut schema = Schema::load(&self.pager)?;
-        for sql in self.temp_views.borrow().iter() {
-            schema.add_temp_view(sql)?;
+        let mut parts = Vec::new();
+        for f in self.files.borrow().iter() {
+            parts.push((f.name.clone(), Rc::new(Schema::load(&f.pager)?)));
         }
-        *self.schema.borrow_mut() = Rc::new(schema);
+        *self.schema.borrow_mut() = Rc::new(Schema::merge(&parts));
         Ok(())
     }
 
@@ -282,13 +399,17 @@ impl Database {
                     is_explain: true,
                 })
             }
-            Stmt::Pragma { name, value } => self.pragma(name, value.as_deref()),
+            Stmt::Pragma { db, name, value } => self.pragma(db.as_deref(), name, value.as_deref()),
             Stmt::Noop(_) => Ok(ResultSet::default()),
             other => crate::write::run_write(self, other, text),
         }
     }
 
-    fn pragma(&self, name: &str, value: Option<&str>) -> Result<ResultSet> {
+    fn pragma(&self, db: Option<&str>, name: &str, value: Option<&str>) -> Result<ResultSet> {
+        let pager = match db {
+            Some(d) => self.file_pager(d)?,
+            None => self.pager.clone(),
+        };
         let one = |col: &str, v: Value| ResultSet {
             columns: vec![col.to_string()],
             rows: vec![vec![v]],
@@ -296,23 +417,22 @@ impl Database {
         };
         let schema = self.schema();
         match name.to_ascii_lowercase().as_str() {
-            "page_size" => Ok(one("page_size", Value::Int(self.pager.page_size() as i64))),
-            "page_count" => Ok(one(
-                "page_count",
-                Value::Int(self.pager.page_count() as i64),
-            )),
+            "page_size" => Ok(one("page_size", Value::Int(pager.page_size() as i64))),
+            "page_count" => Ok(one("page_count", Value::Int(pager.page_count() as i64))),
             "encoding" => Ok(one(
                 "encoding",
-                Value::text(match self.pager.encoding() {
+                Value::text(match pager.encoding() {
                     crate::record::TextEncoding::Utf8 => "UTF-8",
                     crate::record::TextEncoding::Utf16Le => "UTF-16le",
                     crate::record::TextEncoding::Utf16Be => "UTF-16be",
                 }),
             )),
             "journal_mode" => {
-                let mode = if self.mem.is_some() {
+                let mode = if self.mem.is_some() && Rc::ptr_eq(&pager, &self.pager)
+                    || !pager.has_wal() && !Rc::ptr_eq(&pager, &self.pager)
+                {
                     "memory"
-                } else if self.pager.page_count() > 0 && self.pager.get(1)?[18] == 2 {
+                } else if pager.page_count() > 0 && pager.get(1)?[18] == 2 {
                     "wal"
                 } else {
                     "delete"
@@ -320,7 +440,7 @@ impl Database {
                 Ok(one("journal_mode", Value::text(mode)))
             }
             "wal_checkpoint" => {
-                let n = self.pager.checkpoint()?;
+                let n = pager.checkpoint()?;
                 Ok(ResultSet {
                     columns: ["busy", "log", "checkpointed"].map(String::from).to_vec(),
                     rows: vec![vec![
@@ -332,7 +452,14 @@ impl Database {
                 })
             }
             "integrity_check" | "quick_check" => {
-                let problems = crate::check::integrity_check(self)?;
+                let own = self.schema();
+                let file_schema = own
+                    .dbs
+                    .iter()
+                    .find(|(_, s)| s.pager.as_ref().is_some_and(|p| Rc::ptr_eq(p, &pager)))
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or_else(|| own.clone());
+                let problems = crate::check::integrity_check(&pager, &file_schema)?;
                 let rows = if problems.is_empty() {
                     vec![vec![Value::text("ok")]]
                 } else {
@@ -345,7 +472,10 @@ impl Database {
                 })
             }
             "table_info" => {
-                let t = value.and_then(|v| schema.table(v).cloned());
+                let t = match value {
+                    Some(v) => schema.table_in(db, v)?,
+                    None => None,
+                };
                 let mut rows = Vec::new();
                 if let Some(t) = t {
                     for (i, c) in t.columns.iter().enumerate() {
@@ -359,7 +489,7 @@ impl Database {
                         rows.push(vec![
                             Value::Int(i as i64),
                             Value::text(&c.name),
-                            Value::text(&c.decl_type),
+                            Value::text(table_info_type(&c.decl_type)),
                             Value::Int(c.not_null as i64),
                             c.default
                                 .as_ref()
@@ -378,7 +508,10 @@ impl Database {
             }
             "index_list" => {
                 let mut rows = Vec::new();
-                if let Some(t) = value.and_then(|v| schema.table(v).cloned()) {
+                if let Some(t) = match value {
+                    Some(v) => schema.table_in(db, v)?,
+                    None => None,
+                } {
                     for (i, ix) in t.indexes.iter().enumerate() {
                         rows.push(vec![
                             Value::Int(i as i64),
@@ -397,6 +530,25 @@ impl Database {
                     ..Default::default()
                 })
             }
+            "database_list" => {
+                let mut rows = Vec::new();
+                for (i, f) in self.files.borrow().iter().enumerate() {
+                    // temp is listed once it holds something.
+                    if f.name == "temp" && f.pager.page_count() == 0 {
+                        continue;
+                    }
+                    rows.push(vec![
+                        Value::Int(i as i64),
+                        Value::text(&f.name),
+                        Value::text(&f.path),
+                    ]);
+                }
+                Ok(ResultSet {
+                    columns: ["seq", "name", "file"].map(String::from).to_vec(),
+                    rows,
+                    ..Default::default()
+                })
+            }
             // Settings that have no effect here are accepted silently so
             // that scripts written for sqlite3 keep working.
             _ => Ok(ResultSet::default()),
@@ -405,19 +557,8 @@ impl Database {
 
     /// Checkpoint and tidy up. Called automatically when the handle drops.
     pub fn close(&self) -> Result<()> {
-        if !self.pager.is_writable() || !self.pager.has_wal() {
-            return Ok(());
-        }
-        if self.pager.in_transaction() {
-            self.pager.rollback();
-        }
-        if self.pager.wal_frames() > 0 {
-            self.pager.checkpoint()?;
-        }
-        if let Some(p) = &self.wal_path {
-            if p.metadata().map(|m| m.len() == 0).unwrap_or(false) {
-                let _ = std::fs::remove_file(p);
-            }
+        for f in self.files.borrow().iter() {
+            crate::attach::close_file(f)?;
         }
         Ok(())
     }

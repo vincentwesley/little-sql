@@ -46,7 +46,6 @@ struct Group {
 }
 
 pub struct Exec<'a> {
-    pager: Rc<Pager>,
     used: &'a [Vec<bool>],
     enc: TextEncoding,
     rows: Vec<Row>,
@@ -378,7 +377,6 @@ impl<'a> Exec<'a> {
         crate::value::set_text_encoding(pager.encoding());
         Exec {
             enc: pager.encoding(),
-            pager,
             used: &plan.used,
             rows: vec![empty_row.clone(); n],
             aggs: vec![Vec::new(); plan.n_agg_slots],
@@ -1559,7 +1557,7 @@ impl<'a> Exec<'a> {
         let enc = self.enc;
         match access {
             Access::Scan => {
-                let mut c = Cursor::new(self.pager.clone(), table.root);
+                let mut c = Cursor::new(table.file().clone(), table.root);
                 if reverse {
                     c.last()?;
                 } else {
@@ -1596,7 +1594,7 @@ impl<'a> Exec<'a> {
                 if reverse {
                     targets.reverse();
                 }
-                let mut c = Cursor::new(self.pager.clone(), table.root);
+                let mut c = Cursor::new(table.file().clone(), table.root);
                 for target in targets {
                     c.seek_rowid(target)?;
                     if c.valid() && c.rowid()? == target {
@@ -1667,7 +1665,7 @@ impl<'a> Exec<'a> {
                 if start > end {
                     return Ok(true);
                 }
-                let mut c = Cursor::new(self.pager.clone(), table.root);
+                let mut c = Cursor::new(table.file().clone(), table.root);
                 if reverse {
                     c.seek_rowid(end)?;
                     if !c.valid() {
@@ -1705,7 +1703,7 @@ impl<'a> Exec<'a> {
                     Some(t) => t.clone(),
                     None => {
                         let mut rows = Vec::new();
-                        let mut c = Cursor::new(self.pager.clone(), table.root);
+                        let mut c = Cursor::new(table.file().clone(), table.root);
                         c.first()?;
                         while c.valid() {
                             let rowid = if table.without_rowid { 0 } else { c.rowid()? };
@@ -1868,7 +1866,7 @@ impl<'a> Exec<'a> {
         if let Some(v) = start {
             seek_key.push(v.clone());
         }
-        let mut icur = Cursor::new(self.pager.clone(), index.root);
+        let mut icur = Cursor::new(table.file().clone(), index.root);
         if reverse {
             if seek_key.is_empty() {
                 icur.last()?;
@@ -1893,7 +1891,7 @@ impl<'a> Exec<'a> {
             icur.seek(&mut |payload| compare_entry(payload, &seek_key, index, enc))?;
         }
         let pk = table.pk_index.clone();
-        let mut tcur = Cursor::new(self.pager.clone(), table.root);
+        let mut tcur = Cursor::new(table.file().clone(), table.root);
         let ncols = table.columns.len();
         let nkey = index.cols.len();
         while icur.valid() {

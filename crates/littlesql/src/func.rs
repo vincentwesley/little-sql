@@ -337,24 +337,13 @@ fn f_round(a: &[Value]) -> Result<Value> {
     }
     // SQLite prints with "%!.*f" and parses the text back.
     let text = fmt_float(r.abs(), 'f', n, true, false);
-    let v: f64 = text.parse().unwrap_or(r);
+    let v: f64 = crate::fp::atof(&text);
     Ok(Value::Real(if r < 0.0 { -v } else { v }))
 }
 
-/// The decimal digits of a finite, non-negative `x` and its decimal
-/// exponent: x = 0.d1d2d3... * 10^(exp+1). Exact to 40 digits.
-fn decimal_digits(x: f64) -> (Vec<u8>, i32) {
-    if x == 0.0 {
-        return (vec![0], 0);
-    }
-    let s = format!("{x:.39e}");
-    let (m, e) = s.split_once('e').unwrap();
-    let digits = m
-        .bytes()
-        .filter(u8::is_ascii_digit)
-        .map(|b| b - b'0')
-        .collect();
-    (digits, e.parse().unwrap())
+/// Round digits from `fp::decode` to `n` significant digits.
+pub(crate) fn round_digits_pub((d, exp): (Vec<u8>, i32), n: i64) -> (Vec<u8>, i32) {
+    round_digits(d, exp, n)
 }
 
 /// Keep `n` significant digits, rounding half up as SQLite's printf does.
@@ -394,9 +383,50 @@ fn round_digits(mut d: Vec<u8>, mut exp: i32, n: i64) -> (Vec<u8>, i32) {
     (d, exp)
 }
 
-/// Format a finite, non-negative number like SQLite's printf conversions
-/// `%f`, `%e` and `%g`. SQLite keeps at most 16 significant digits (26 with
-/// the `!` flag) and fills the rest with zeros.
+/// SQLite 3.45's rounding step in `sqlite3FpDecode`: `round` digits
+/// (negative: that many after the decimal point; 0: none at all, which is
+/// why `%.0f` truncates), capped at `max`; `point` is the position of
+/// the decimal point counted from the first digit.
+fn fp_round(mut d: Vec<u8>, mut point: i32, round: i32, max: i32) -> (Vec<u8>, i32) {
+    let mut r = round;
+    if r < 0 {
+        r = point - r;
+        if r == 0 && d[0] >= 5 {
+            r = 1;
+            d.insert(0, 0);
+            point += 1;
+        }
+    }
+    if r > 0 && ((r as usize) < d.len() || d.len() > max as usize) {
+        let n = r.min(max) as usize;
+        let up = d[n] >= 5;
+        d.truncate(n);
+        if up {
+            let mut i = n;
+            loop {
+                if i == 0 {
+                    d.insert(0, 1);
+                    point += 1;
+                    break;
+                }
+                i -= 1;
+                if d[i] == 9 {
+                    d[i] = 0;
+                } else {
+                    d[i] += 1;
+                    break;
+                }
+            }
+        }
+    }
+    while d.len() > 1 && *d.last().unwrap() == 0 {
+        d.pop();
+    }
+    (d, point)
+}
+
+/// Format a finite, non-negative number like SQLite 3.45's printf
+/// conversions `%f`, `%e` and `%g`, digits from `fp::decode`.
 pub(crate) fn fmt_float(x: f64, conv: char, prec: usize, bang: bool, alt: bool) -> String {
     if x.is_infinite() {
         return "Inf".into();
@@ -404,91 +434,100 @@ pub(crate) fn fmt_float(x: f64, conv: char, prec: usize, bang: bool, alt: bool) 
     if x.is_nan() {
         return "NaN".into();
     }
-    let cap: i64 = if bang { 26 } else { 16 };
-    let (d0, e0) = decimal_digits(x);
-    let digit = |d: &[u8], i: i64| -> char {
+    let max = if bang { 26 } else { 16 };
+    let (d0, point0) = if x == 0.0 {
+        (vec![0u8], 1)
+    } else {
+        let (d, first) = crate::fp::decode(x);
+        (d, first + 1)
+    };
+    let p = prec as i32;
+    let round = match conv {
+        'f' => -p,
+        'e' | 'E' => p + 1,
+        // %.0g, like %.0f, asks for no rounding at all (3.45 behaviour).
+        _ => p,
+    };
+    let (d, point) = if x == 0.0 {
+        (d0, point0)
+    } else {
+        fp_round(d0, point0, round, max)
+    };
+    let digit = |i: i64| -> char {
         if i >= 0 && (i as usize) < d.len() {
             (b'0' + d[i as usize]) as char
         } else {
             '0'
         }
     };
-    let fixed = |d: &[u8], exp: i32, prec: usize| -> String {
-        let mut out = String::new();
+    let exp = if x == 0.0 { 0 } else { point - 1 };
+    // %g picks %e or %f from the exponent, with the precision in
+    // significant digits.
+    let (form, prec) = match conv {
+        'g' | 'G' => {
+            let g = p.max(1);
+            if exp < -4 || exp >= g {
+                ('e', (g - 1) as usize)
+            } else {
+                ('f', (g - 1 - exp).max(0) as usize)
+            }
+        }
+        'e' | 'E' => ('e', prec),
+        _ => ('f', prec),
+    };
+    let show_point = prec > 0 || alt || bang;
+    let mut out = String::new();
+    if form == 'f' {
         if exp < 0 {
             out.push('0');
         } else {
             for i in 0..=exp as i64 {
-                out.push(digit(d, i));
+                out.push(digit(i));
             }
         }
-        if prec > 0 || alt {
+        if show_point {
             out.push('.');
         }
         for k in 0..prec as i64 {
-            out.push(digit(d, exp as i64 + 1 + k));
+            out.push(digit(exp as i64 + 1 + k));
         }
-        out
-    };
-    let exp_form = |d: &[u8], exp: i32, frac: usize| -> String {
-        let mut out = String::new();
-        out.push(digit(d, 0));
-        if frac > 0 || alt {
+    } else {
+        out.push(digit(0));
+        if show_point {
             out.push('.');
         }
-        for k in 1..=frac as i64 {
-            out.push(digit(d, k));
+        for k in 1..=prec as i64 {
+            out.push(digit(k));
         }
-        out.push('e');
-        out.push(if exp < 0 { '-' } else { '+' });
-        out.push_str(&format!("{:02}", exp.abs()));
-        out
+    }
+    // Trailing zeros go for %g (unless `#`) and, with `!`, for %f and %e;
+    // a bare point then goes too, or with `!` keeps one zero.
+    let rtz = if matches!(conv, 'g' | 'G') {
+        !alt
+    } else {
+        bang
     };
-    match conv {
-        'f' => {
-            let n = (e0 as i64 + 1 + prec as i64).min(cap);
-            let (d, exp) = round_digits(d0, e0, n);
-            fixed(&d, exp, prec)
+    if rtz && show_point {
+        while out.ends_with('0') && out.contains('.') {
+            out.pop();
         }
-        'e' | 'E' => {
-            let n = (prec as i64 + 1).min(cap);
-            let (d, exp) = round_digits(d0, e0, n);
-            let s = exp_form(&d, exp, prec);
-            if conv == 'E' {
-                s.to_uppercase()
+        if out.ends_with('.') {
+            if bang {
+                out.push('0');
             } else {
-                s
-            }
-        }
-        _ => {
-            let p = if prec == 0 { 1 } else { prec };
-            let n = (p as i64).min(cap);
-            let (d, exp) = round_digits(d0, e0, n);
-            let mut s = if exp < -4 || exp >= p as i32 {
-                exp_form(&d, exp, p - 1)
-            } else {
-                fixed(&d, exp, (p as i32 - 1 - exp).max(0) as usize)
-            };
-            if !alt {
-                // Drop trailing zeros of the fraction, and a bare point.
-                let (mant, tail) = match s.find('e') {
-                    Some(i) => (s[..i].to_string(), s[i..].to_string()),
-                    None => (s.clone(), String::new()),
-                };
-                let mant = if mant.contains('.') {
-                    mant.trim_end_matches('0').trim_end_matches('.').to_string()
-                } else {
-                    mant
-                };
-                s = mant + &tail;
-            }
-            if conv == 'G' {
-                s.to_uppercase()
-            } else {
-                s
+                out.pop();
             }
         }
     }
+    if form == 'e' {
+        out.push('e');
+        out.push(if exp < 0 { '-' } else { '+' });
+        out.push_str(&format!("{:02}", exp.abs()));
+    }
+    if conv.is_ascii_uppercase() {
+        out = out.to_uppercase();
+    }
+    out
 }
 
 fn f_typeof(a: &[Value]) -> Result<Value> {
