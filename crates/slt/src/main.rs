@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! slt run  [--mode read|native] [--suite NAME] [--jobs N] [--json FILE]
-//!          [--failures FILE] [--timeout-ms N] [--min-rate PCT] PATH...
+//!          [--failures FILE] [--timeout-ms N] [--min-rate PCT] [--only LIST] PATH...
 //! slt diff [--json FILE] [--failures FILE] DIR
 //! ```
 
@@ -21,7 +21,7 @@ use std::time::Instant;
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  slt run  [--mode read|native] [--suite NAME] [--jobs N] [--json FILE] [--failures FILE]\n           [--timeout-ms N] [--min-rate PCT] PATH...\n  slt diff [--json FILE] [--failures FILE] DIR"
+        "usage:\n  slt run  [--mode read|native] [--suite NAME] [--jobs N] [--json FILE] [--failures FILE]\n           [--timeout-ms N] [--min-rate PCT] [--only LIST] PATH...\n  slt diff [--json FILE] [--failures FILE] DIR"
     );
     std::process::exit(2);
 }
@@ -127,6 +127,21 @@ fn main() {
                 .get("jobs")
                 .and_then(|j| j.parse().ok())
                 .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
+            // `--only LIST`: keep just the files a list names (paths
+            // relative to the directory given, `#` comments allowed), so a
+            // directory holding the full corpus can still run the sample.
+            let only: Option<std::collections::HashSet<PathBuf>> =
+                args.flags.get("only").map(|f| {
+                    let text = std::fs::read_to_string(f).unwrap_or_else(|e| {
+                        eprintln!("cannot read {f}: {e}");
+                        std::process::exit(2);
+                    });
+                    text.lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .map(PathBuf::from)
+                        .collect()
+                });
             let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
             for p in &args.paths {
                 let p = PathBuf::from(p);
@@ -135,6 +150,9 @@ fn main() {
                     collect(&p, "test", &mut found);
                     for f in found {
                         let rel = f.strip_prefix(&p).unwrap_or(&f).to_path_buf();
+                        if only.as_ref().is_some_and(|o| !o.contains(&rel)) {
+                            continue;
+                        }
                         files.push((f, rel));
                     }
                 } else {

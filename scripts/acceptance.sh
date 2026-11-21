@@ -135,7 +135,7 @@ if want M2; then
   a21() {
     "$SLT" run --mode read --quiet 1 --suite "sqllogictest sample" \
       --json results/slt-read.json --failures results/slt-read-failures.txt \
-      --min-rate "$floor" corpus/test
+      --min-rate "$floor" --only tests/slt/SAMPLE corpus/test
   }
   check A2.1 "sqllogictest sample, read mode, at or above the floor" a21
   check A2.2 "Results written" test -s results/slt-read.json
@@ -198,7 +198,7 @@ if want M7; then
   a71() {
     "$SLT" run --mode native --quiet 1 --suite "sqllogictest sample" \
       --json results/slt-native.json --failures results/slt-native-failures.txt \
-      --min-rate "$floor_native" corpus/test
+      --min-rate "$floor_native" --only tests/slt/SAMPLE corpus/test
   }
   check A7.1 "sqllogictest sample, native mode, at or above the floor" a71
   check A7.2 "Files written by Little SQL pass sqlite3's integrity check" scripts/write-check.sh

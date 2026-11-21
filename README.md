@@ -22,8 +22,8 @@ run the same queries through the `sqlite3` tool and compare the answers.
 |-------|-------:|-------:|----------:|
 | sqllogictest, full corpus (622 files), native mode | 5,939,879 | 0 | 100.00 % |
 | sqllogictest, full corpus (622 files), read mode | 5,729,099 | 0 | 100.00 % |
-| sqllogictest, CI sample (622 files), native mode | 5,939,879 | 0 | 100.00 % |
-| sqllogictest, CI sample (622 files), read mode | 5,729,099 | 0 | 100.00 % |
+| sqllogictest, CI sample (49 files), native mode | 323,361 | 0 | 100.00 % |
+| sqllogictest, CI sample (49 files), read mode | 240,267 | 0 | 100.00 % |
 | Differential tests against sqlite3 3.45.1 | 443 | 0 | 100.00 % |
 <!-- results:end -->
 
