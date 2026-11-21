@@ -257,7 +257,12 @@ node scripts/publish-results.mjs     # updates this README's table
 
 ## Licence and credits
 
-MIT, see [LICENSE](LICENSE).
+Designed and built by Vin, Vin's Atelier (https://vwesley.dev). Logo by
+@portus_workstation / @wason25_pz (Instagram); the logo is all rights
+reserved and not covered by the MIT licence (see [NOTICE.md](NOTICE.md)).
+
+MIT (see [LICENSE](LICENSE)). Provided "as is", without warranty of any
+kind; use at your own risk.
 
 The demo database contains information from Resale flat prices based on
 registration date from Jan-2017 onwards, accessed on 12 November 2026 from
