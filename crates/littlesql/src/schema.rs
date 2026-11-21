@@ -56,6 +56,12 @@ pub struct Index {
     /// True for the primary key of a WITHOUT ROWID table, whose "index" is
     /// the table b-tree itself.
     pub primary: bool,
+    /// Key expressions, one per key column (None: the plain column); empty
+    /// when every key is a plain column. An expression's `IndexCol::col`
+    /// is `usize::MAX`.
+    pub exprs: Vec<Option<ast::Expr>>,
+    /// A partial index's WHERE.
+    pub where_: Option<ast::Expr>,
 }
 
 impl Index {
@@ -89,6 +95,8 @@ pub struct Table {
     row_estimate: Cell<Option<u64>>,
     /// The database file the table lives in (main, temp or attached).
     pub pager: Option<Rc<Pager>>,
+    /// A STRICT table: each column's value must have its declared type.
+    pub strict: bool,
 }
 
 impl Table {
@@ -299,7 +307,30 @@ pub fn table_from_ast(ct: &CreateTable, name: &str, root: u32, sql: &str) -> Res
         sql: sql.to_string(),
         row_estimate: Cell::new(None),
         pager: None,
+        strict: ct.strict,
     };
+    if ct.strict {
+        for c in table.columns.iter_mut() {
+            let t = c.decl_type.to_ascii_uppercase();
+            match t.as_str() {
+                "INT" | "INTEGER" | "REAL" | "TEXT" | "BLOB" => {}
+                // ANY keeps values exactly as given.
+                "ANY" => c.affinity = Affinity::Blob,
+                "" => {
+                    return Err(Error::Sql(format!(
+                        "missing datatype for {name}.{}",
+                        c.name
+                    )))
+                }
+                _ => {
+                    return Err(Error::Sql(format!(
+                        "unknown datatype for {name}.{}: \"{}\"",
+                        c.name, c.decl_type
+                    )))
+                }
+            }
+        }
+    }
     // Primary key columns, from a column constraint or a table constraint.
     let mut pk_cols: Vec<IndexCol> = Vec::new();
     let mut pk_desc = false;
@@ -460,23 +491,44 @@ impl Schema {
                     let idx = match parse_one(sql) {
                         Ok(Stmt::CreateIndex(ci)) => {
                             let mut cols = Vec::new();
+                            let mut exprs = Vec::new();
                             let mut usable = !ci.partial;
                             for c in &ci.columns {
                                 let col = c.name.as_ref().and_then(|n| table.column_index(n));
                                 let coll = c.collation.as_ref().map(|n| Collation::from_name(n));
-                                match (col, coll) {
-                                    (Some(col), None) => cols.push(IndexCol {
-                                        col,
-                                        collation: table.columns[col].collation,
-                                        desc: c.desc,
-                                    }),
-                                    (Some(col), Some(Some(collation))) => cols.push(IndexCol {
-                                        col,
-                                        collation,
-                                        desc: c.desc,
-                                    }),
+                                match (col, coll, &c.expr) {
+                                    (Some(col), None, _) => {
+                                        cols.push(IndexCol {
+                                            col,
+                                            collation: table.columns[col].collation,
+                                            desc: c.desc,
+                                        });
+                                        exprs.push(None);
+                                    }
+                                    (Some(col), Some(Some(collation)), _) => {
+                                        cols.push(IndexCol {
+                                            col,
+                                            collation,
+                                            desc: c.desc,
+                                        });
+                                        exprs.push(None);
+                                    }
+                                    // An expression key: the planner does not
+                                    // use these indexes; writes keep them.
+                                    (None, coll, Some(e)) => {
+                                        usable = false;
+                                        cols.push(IndexCol {
+                                            col: usize::MAX,
+                                            collation: coll.flatten().unwrap_or(Collation::Binary),
+                                            desc: c.desc,
+                                        });
+                                        exprs.push(Some(e.clone()));
+                                    }
                                     _ => usable = false,
                                 }
+                            }
+                            if exprs.iter().all(Option::is_none) {
+                                exprs.clear();
                             }
                             Index {
                                 name: r.name.clone(),
@@ -488,6 +540,8 @@ impl Schema {
                                 sql: Some(sql.clone()),
                                 extra: Vec::new(),
                                 primary: false,
+                                exprs,
+                                where_: ci.where_.clone(),
                             }
                         }
                         _ => Index {
@@ -500,6 +554,8 @@ impl Schema {
                             sql: Some(sql.clone()),
                             extra: Vec::new(),
                             primary: false,
+                            exprs: Vec::new(),
+                            where_: None,
                         },
                     };
                     table.indexes.push(Rc::new(idx));
@@ -525,6 +581,8 @@ impl Schema {
                     sql: None,
                     extra: Vec::new(),
                     primary: false,
+                    exprs: Vec::new(),
+                    where_: None,
                 }));
             }
         }
@@ -550,6 +608,8 @@ impl Schema {
                             sql: ix.sql.clone(),
                             extra,
                             primary: false,
+                            exprs: ix.exprs.clone(),
+                            where_: ix.where_.clone(),
                         })
                     })
                     .collect();
@@ -563,6 +623,8 @@ impl Schema {
                     sql: None,
                     extra: t.storage_order[t.pk.len()..].to_vec(),
                     primary: true,
+                    exprs: Vec::new(),
+                    where_: None,
                 }));
             }
             t.pager = self.pager.clone();

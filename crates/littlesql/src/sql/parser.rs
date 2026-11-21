@@ -315,7 +315,13 @@ impl<'a> Parser<'a> {
                 return Ok(stmt);
             }
             if self.is_kw("UPDATE") || self.is_kw("DELETE") {
-                return self.unsupported("WITH before UPDATE or DELETE");
+                let mut stmt = self.statement()?;
+                match &mut stmt {
+                    Stmt::Update(u) => u.with = with,
+                    Stmt::Delete(d) => d.with = with,
+                    _ => {}
+                }
+                return Ok(stmt);
             }
             self.pos = save;
         }
@@ -365,7 +371,14 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            return Ok(Stmt::Delete(Delete { db, table, where_ }));
+            let returning = self.returning()?;
+            return Ok(Stmt::Delete(Delete {
+                db,
+                table,
+                with: Vec::new(),
+                where_,
+                returning,
+            }));
         }
         if self.eat_kw("BEGIN") {
             let _ = self.eat_kw("DEFERRED") || self.eat_kw("IMMEDIATE") || self.eat_kw("EXCLUSIVE");
@@ -547,12 +560,12 @@ impl<'a> Parser<'a> {
             self.expect_op("(")?;
             let columns = self.indexed_columns()?;
             self.expect_op(")")?;
-            let partial = if self.eat_kw("WHERE") {
-                self.expr()?;
-                true
+            let where_ = if self.eat_kw("WHERE") {
+                Some(self.expr()?)
             } else {
-                false
+                None
             };
+            let partial = where_.is_some();
             return Ok(Stmt::CreateIndex(CreateIndex {
                 name,
                 db,
@@ -561,6 +574,7 @@ impl<'a> Parser<'a> {
                 if_not_exists,
                 columns,
                 partial,
+                where_,
             }));
         }
         if self.eat_kw("TRIGGER") {
@@ -671,22 +685,71 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    /// The result columns of a SELECT or a RETURNING clause.
+    fn result_columns(&mut self) -> Result<Vec<ResultColumn>> {
+        let mut columns = Vec::new();
+        loop {
+            if self.eat_op("*") {
+                columns.push(ResultColumn::Star);
+            } else if matches!(self.peek(), Tok::Word(_) | Tok::Quoted { .. })
+                && matches!(self.peek_at(1), Tok::Op("."))
+                && matches!(self.peek_at(2), Tok::Op("*"))
+            {
+                let t = self.ident()?;
+                self.pos += 2;
+                columns.push(ResultColumn::TableStar(t));
+            } else {
+                let start = self.toks[self.pos].start;
+                let expr = self.expr()?;
+                let text = self.sql[start..self.toks[self.pos - 1].end].to_string();
+                let alias = self.opt_alias()?;
+                columns.push(ResultColumn::Expr { expr, alias, text });
+            }
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        Ok(columns)
+    }
+
+    fn returning(&mut self) -> Result<Vec<ResultColumn>> {
+        if self.eat_kw("RETURNING") {
+            self.result_columns()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// `SET col = expr, ...` (also `(a, b) = (x, y)` is not supported).
+    fn set_list(&mut self) -> Result<Vec<(String, Expr)>> {
+        let mut sets = Vec::new();
+        loop {
+            let col = self.ident()?;
+            self.expect_op("=")?;
+            sets.push((col, self.expr()?));
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        Ok(sets)
+    }
+
     fn indexed_columns(&mut self) -> Result<Vec<IndexedColumn>> {
         let mut cols = Vec::new();
         loop {
             let e = self.expr()?;
-            let (name, collation) = match e {
+            let (name, collation, expr) = match e {
                 Expr::Name {
                     table: None, name, ..
-                } => (Some(name), None),
-                Expr::Literal(Value::Text(s)) => (Some(s.to_string()), None),
+                } => (Some(name), None, None),
+                Expr::Literal(Value::Text(s)) => (Some(s.to_string()), None, None),
                 Expr::Collate { expr, collation } => match *expr {
                     Expr::Name {
                         table: None, name, ..
-                    } => (Some(name), Some(collation)),
-                    _ => (None, Some(collation)),
+                    } => (Some(name), Some(collation), None),
+                    other => (None, Some(collation), Some(other)),
                 },
-                _ => (None, None),
+                other => (None, None, Some(other)),
             };
             let desc = if self.eat_kw("DESC") {
                 true
@@ -696,6 +759,7 @@ impl<'a> Parser<'a> {
             };
             cols.push(IndexedColumn {
                 name,
+                expr,
                 collation,
                 desc,
             });
@@ -774,6 +838,7 @@ impl<'a> Parser<'a> {
         let mut ct = CreateTable {
             name,
             db: None,
+            strict: false,
             temp,
             if_not_exists,
             columns: Vec::new(),
@@ -844,7 +909,9 @@ impl<'a> Parser<'a> {
                     Tok::Word(w) if w.eq_ignore_ascii_case("ROWID") => ct.without_rowid = true,
                     _ => return Err(self.unexpected()),
                 }
-            } else if !self.eat_kw("STRICT") {
+            } else if self.eat_kw("STRICT") {
+                ct.strict = true;
+            } else {
                 break;
             }
             if !self.eat_op(",") {
@@ -968,15 +1035,47 @@ impl<'a> Parser<'a> {
         } else {
             InsertSource::Select(Box::new(self.select()?))
         };
-        if self.is_kw("ON") {
-            return self.unsupported("upsert (ON CONFLICT)");
+        let mut upsert = Vec::new();
+        while self.eat_kw("ON") {
+            self.expect_kw("CONFLICT")?;
+            let mut target = Vec::new();
+            if self.eat_op("(") {
+                for c in self.indexed_columns()? {
+                    match c.name {
+                        Some(n) if c.collation.is_none() => target.push(n),
+                        _ => {
+                            return self
+                                .unsupported("an ON CONFLICT target with expressions or COLLATE")
+                        }
+                    }
+                }
+                self.expect_op(")")?;
+                if self.eat_kw("WHERE") {
+                    return self.unsupported("an ON CONFLICT target with WHERE (partial indexes)");
+                }
+            }
+            self.expect_kw("DO")?;
+            let action = if self.eat_kw("NOTHING") {
+                UpsertAction::Nothing
+            } else {
+                self.expect_kw("UPDATE")?;
+                self.expect_kw("SET")?;
+                let sets = self.set_list()?;
+                let where_ = if self.eat_kw("WHERE") {
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                UpsertAction::Update { sets, where_ }
+            };
+            upsert.push(Upsert { target, action });
         }
-        if self.is_kw("RETURNING") {
-            return self.unsupported("RETURNING");
-        }
+        let returning = self.returning()?;
         Ok(Stmt::Insert(Insert {
             db,
             table,
+            upsert,
+            returning,
             columns,
             source,
             on_conflict,
@@ -986,30 +1085,31 @@ impl<'a> Parser<'a> {
     fn update(&mut self) -> Result<Stmt> {
         let on_conflict = self.on_conflict()?;
         let (db, table) = self.qualified()?;
+        let alias = if self.eat_kw("AS") {
+            Some(self.ident()?)
+        } else {
+            None
+        };
         self.expect_kw("SET")?;
-        let mut sets = Vec::new();
-        loop {
-            let col = self.ident()?;
-            self.expect_op("=")?;
-            sets.push((col, self.expr()?));
-            if !self.eat_op(",") {
-                break;
-            }
-        }
-        if self.is_kw("FROM") {
-            return self.unsupported("UPDATE ... FROM");
-        }
+        let sets = self.set_list()?;
+        let from = if self.eat_kw("FROM") {
+            self.parse_from_list()?
+        } else {
+            Vec::new()
+        };
         let where_ = if self.eat_kw("WHERE") {
             Some(self.expr()?)
         } else {
             None
         };
-        if self.is_kw("RETURNING") {
-            return self.unsupported("RETURNING");
-        }
+        let returning = self.returning()?;
         Ok(Stmt::Update(Update {
             db,
             table,
+            alias,
+            with: Vec::new(),
+            from,
+            returning,
             sets,
             where_,
             on_conflict,
@@ -1142,28 +1242,7 @@ impl<'a> Parser<'a> {
             self.eat_kw("ALL");
             false
         };
-        let mut columns = Vec::new();
-        loop {
-            if self.eat_op("*") {
-                columns.push(ResultColumn::Star);
-            } else if matches!(self.peek(), Tok::Word(_) | Tok::Quoted { .. })
-                && matches!(self.peek_at(1), Tok::Op("."))
-                && matches!(self.peek_at(2), Tok::Op("*"))
-            {
-                let t = self.ident()?;
-                self.pos += 2;
-                columns.push(ResultColumn::TableStar(t));
-            } else {
-                let start = self.toks[self.pos].start;
-                let expr = self.expr()?;
-                let text = self.sql[start..self.toks[self.pos - 1].end].to_string();
-                let alias = self.opt_alias()?;
-                columns.push(ResultColumn::Expr { expr, alias, text });
-            }
-            if !self.eat_op(",") {
-                break;
-            }
-        }
+        let columns = self.result_columns()?;
         let from = if self.eat_kw("FROM") {
             self.parse_from_list()?
         } else {

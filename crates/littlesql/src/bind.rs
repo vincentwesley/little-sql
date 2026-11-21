@@ -248,6 +248,64 @@ pub fn with_trigger_row<T>(row: TriggerRow, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// A row a statement makes visible by name without a FROM clause: the
+/// `excluded` row and the existing row of an upsert's DO UPDATE, and the
+/// changed row of RETURNING.
+#[derive(Clone)]
+pub struct RowContext {
+    /// The qualifier that names it (`excluded`, or the table's name).
+    pub name: String,
+    pub columns: Vec<String>,
+    pub values: Vec<Value>,
+    pub rowid: Option<i64>,
+    /// Whether bare column names (no qualifier) also find it.
+    pub bare: bool,
+}
+
+thread_local! {
+    static ROW_CONTEXTS: std::cell::RefCell<Vec<RowContext>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with `rows` visible to the SQL it binds.
+pub fn with_row_contexts<T>(rows: Vec<RowContext>, f: impl FnOnce() -> T) -> T {
+    let n = rows.len();
+    ROW_CONTEXTS.with(|r| r.borrow_mut().extend(rows));
+    let out = f();
+    ROW_CONTEXTS.with(|r| {
+        let mut r = r.borrow_mut();
+        let keep = r.len() - n;
+        r.truncate(keep);
+    });
+    out
+}
+
+/// A column of a row context, by qualified or (if allowed) bare name.
+fn context_value(table: Option<&str>, name: &str) -> Option<Expr> {
+    ROW_CONTEXTS.with(|r| {
+        let r = r.borrow();
+        for ctx in r.iter().rev() {
+            let applies = match table {
+                Some(t) => ctx.name.eq_ignore_ascii_case(t),
+                None => ctx.bare,
+            };
+            if !applies {
+                continue;
+            }
+            if let Some(i) = ctx
+                .columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(name))
+            {
+                return Some(Expr::Lit(ctx.values[i].clone()));
+            }
+            if let (Some(id), true) = (ctx.rowid, is_rowid_name(name)) {
+                return Some(Expr::Lit(Value::Int(id)));
+            }
+        }
+        None
+    })
+}
+
 fn trigger_value(table: &str, name: &str) -> Option<Result<Expr>> {
     let which_new = if table.eq_ignore_ascii_case("new") {
         true
@@ -1660,6 +1718,9 @@ impl<'a> Binder<'a> {
                     return r;
                 }
             }
+        }
+        if let Some(v) = context_value(table, name) {
+            return Ok(v);
         }
         if dq && table.is_none() {
             return Ok(Expr::Lit(Value::text(name)));

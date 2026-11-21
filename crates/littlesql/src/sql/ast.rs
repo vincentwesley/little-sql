@@ -375,6 +375,64 @@ pub enum Expr {
     },
 }
 
+/// Call `f` on each direct sub-expression of `e` (not inside subqueries).
+pub fn for_each_child(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    match e {
+        Expr::Literal(_) | Expr::Name { .. } | Expr::Param { .. } => {}
+        Expr::Subquery(_) | Expr::Exists(_) => {}
+        Expr::Unary(_, a) | Expr::IsNull { expr: a, .. } | Expr::Cast { expr: a, .. } => f(a),
+        Expr::Collate { expr: a, .. } | Expr::InTable { expr: a, .. } => f(a),
+        Expr::InSelect { expr: a, .. } => f(a),
+        Expr::Binary(_, a, b) => {
+            f(a);
+            f(b);
+        }
+        Expr::Between { expr, lo, hi, .. } => {
+            f(expr);
+            f(lo);
+            f(hi);
+        }
+        Expr::InList { expr, list, .. } => {
+            f(expr);
+            list.iter().for_each(&mut *f);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            f(expr);
+            f(pattern);
+            if let Some(x) = escape {
+                f(x);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(x) = operand {
+                f(x);
+            }
+            for (w, t) in whens {
+                f(w);
+                f(t);
+            }
+            if let Some(x) = else_ {
+                f(x);
+            }
+        }
+        Expr::Function { args, filter, .. } => {
+            args.iter().for_each(&mut *f);
+            if let Some(x) = filter {
+                f(x);
+            }
+        }
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Value) -> bool {
         self.type_name() == other.type_name()
@@ -410,6 +468,8 @@ pub struct Check {
 pub struct IndexedColumn {
     /// Column name, or `None` when the index key is an expression.
     pub name: Option<String>,
+    /// The key expression when it is not a plain column.
+    pub expr: Option<Expr>,
     pub collation: Option<String>,
     pub desc: bool,
 }
@@ -428,6 +488,8 @@ pub enum TableConstraint {
 pub struct CreateTable {
     pub name: String,
     pub db: Option<String>,
+    /// `STRICT`: values must match the declared types.
+    pub strict: bool,
     pub temp: bool,
     pub if_not_exists: bool,
     pub columns: Vec<ColumnDef>,
@@ -445,6 +507,8 @@ pub struct CreateIndex {
     pub if_not_exists: bool,
     pub columns: Vec<IndexedColumn>,
     pub partial: bool,
+    /// A partial index's WHERE.
+    pub where_: Option<Expr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -464,6 +528,23 @@ pub enum OnConflict {
     Replace,
 }
 
+/// `ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`
+#[derive(Clone, Debug, PartialEq)]
+pub struct Upsert {
+    /// The conflict target's columns (empty: any constraint).
+    pub target: Vec<String>,
+    pub action: UpsertAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpsertAction {
+    Nothing,
+    Update {
+        sets: Vec<(String, Expr)>,
+        where_: Option<Expr>,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum InsertSource {
     Select(Box<Select>),
@@ -474,6 +555,10 @@ pub enum InsertSource {
 pub struct Insert {
     pub db: Option<String>,
     pub table: String,
+    /// `ON CONFLICT ...` clauses, in order.
+    pub upsert: Vec<Upsert>,
+    /// `RETURNING ...` (empty: none).
+    pub returning: Vec<ResultColumn>,
     pub columns: Vec<String>,
     pub source: InsertSource,
     pub on_conflict: OnConflict,
@@ -483,6 +568,13 @@ pub struct Insert {
 pub struct Update {
     pub db: Option<String>,
     pub table: String,
+    /// `UPDATE t AS alias`
+    pub alias: Option<String>,
+    /// A leading `WITH`.
+    pub with: Vec<Cte>,
+    /// `UPDATE ... FROM ...`: more tables joined to the target.
+    pub from: Vec<FromItem>,
+    pub returning: Vec<ResultColumn>,
     pub sets: Vec<(String, Expr)>,
     pub where_: Option<Expr>,
     pub on_conflict: OnConflict,
@@ -492,6 +584,9 @@ pub struct Update {
 pub struct Delete {
     pub db: Option<String>,
     pub table: String,
+    /// A leading `WITH`.
+    pub with: Vec<Cte>,
+    pub returning: Vec<ResultColumn>,
     pub where_: Option<Expr>,
 }
 

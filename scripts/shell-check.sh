@@ -17,7 +17,7 @@ fail=0
 n=0
 # Drop sqlite3's "  SQL" / "    ^--- error here" pair after an error.
 strip_carets() {
-  awk '/\^--- error here$/ { has = 0; next }
+  awk '/(\^--- error here|error here ---\^)$/ { has = 0; next }
        { if (has) print held; held = $0; has = 1 }
        END { if (has) print held }'
 }

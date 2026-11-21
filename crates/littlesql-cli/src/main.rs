@@ -198,7 +198,25 @@ impl Shell {
             pos = start + text.trim().len();
             let line = first_line + sql[..start].matches('\n').count();
             let t0 = Instant::now();
-            match self.db.query_with(&text, &self.params()) {
+            // An engine bug must not take the shell down: report it as an
+            // error and carry on (the statement's transaction rolls back).
+            let params = self.params();
+            let db = &self.db;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                db.query_with(&text, &params)
+            }))
+            .unwrap_or_else(|p| {
+                let msg = p
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                self.db.rollback_uncommitted();
+                Err(littlesql::Error::Runtime(format!(
+                    "internal error (please report it): {msg}"
+                )))
+            });
+            match outcome {
                 Ok(rs) => {
                     self.print_result(&rs);
                     if self.stats {
@@ -858,6 +876,8 @@ fn split_args(line: &str) -> Vec<String> {
 }
 
 fn main() {
+    // Engine panics are caught per statement and reported as errors.
+    std::panic::set_hook(Box::new(|_| {}));
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut positional = Vec::new();
     let mut readonly = false;

@@ -555,6 +555,18 @@ impl Database {
         }
     }
 
+    /// Discard every change not yet committed, in every file, and end any
+    /// transaction (for a caller recovering from an internal error).
+    pub fn rollback_uncommitted(&self) {
+        for p in self.pagers() {
+            p.rollback();
+        }
+        self.explicit_txn.set(false);
+        self.savepoints.borrow_mut().clear();
+        self.savepoint_txn.set(false);
+        let _ = self.reload_schema();
+    }
+
     /// Checkpoint and tidy up. Called automatically when the handle drops.
     pub fn close(&self) -> Result<()> {
         for f in self.files.borrow().iter() {

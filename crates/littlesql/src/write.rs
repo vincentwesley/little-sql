@@ -146,9 +146,11 @@ pub(crate) fn run_write(db: &Database, stmt: &Stmt, text: &str) -> Result<Result
                     return Err(e);
                 }
             }
+            // total_changes() also counts what trigger bodies changed
+            // (added as they ran); changes() only this statement's rows.
             let mut c = crate::func::counters();
             c.changes = rs.changes as i64;
-            c.total_changes = before.total_changes + rs.changes as i64;
+            c.total_changes += rs.changes as i64;
             crate::func::set_counters(c);
             Ok(rs)
         }
@@ -565,6 +567,7 @@ fn create_table(db: &Database, ct: &CreateTable, text: &str) -> Result<ResultSet
             let new = CreateTable {
                 name: ct.name.clone(),
                 db: ct.db.clone(),
+                strict: false,
                 temp: false,
                 if_not_exists: false,
                 columns: cols,
@@ -658,17 +661,25 @@ fn create_index(db: &Database, ci: &CreateIndex, text: &str) -> Result<ResultSet
             table.name
         )));
     }
-    if ci.partial {
-        return Err(Error::Unsupported("partial indexes".into()));
-    }
     for c in &ci.columns {
         match &c.name {
-            None => return Err(Error::Unsupported("indexes on expressions".into())),
+            None => {}
             Some(n) if table.column_index(n).is_none() => {
                 return Err(Error::Sql(format!("no such column: {n}")))
             }
             _ => {}
         }
+    }
+    // Key expressions and the WHERE of a partial index may use only the
+    // table's columns and deterministic functions (checked by binding
+    // them against an empty row).
+    let exprs: Vec<&AExpr> = ci.columns.iter().filter_map(|c| c.expr.as_ref()).collect();
+    for (e, what) in exprs.iter().map(|e| (*e, "index expressions")).chain(
+        ci.where_
+            .as_ref()
+            .map(|w| (w, "partial index WHERE clauses")),
+    ) {
+        check_index_expr(db, &table, e, what)?;
     }
     let w = Writer::new(&db.target());
     let root = w.create_tree(true)?;
@@ -720,6 +731,48 @@ fn qualified_dbs(sel: &Select, out: &mut Vec<String>) {
         qualified_dbs(&c.select, out);
     }
     body(&sel.body, out);
+}
+
+/// An index expression or partial-index WHERE must name only the table's
+/// columns, use no subqueries and only deterministic functions.
+fn check_index_expr(db: &Database, table: &Table, e: &AExpr, what: &str) -> Result<()> {
+    fn walk(e: &AExpr, what: &str) -> Result<()> {
+        match e {
+            AExpr::Subquery(_) | AExpr::Exists(_) | AExpr::InSelect { .. } => {
+                return Err(Error::Sql(format!("subqueries prohibited in {what}")));
+            }
+            AExpr::Function { name, .. }
+                if matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "random" | "randomblob" | "changes" | "total_changes" | "last_insert_rowid"
+                ) =>
+            {
+                return Err(Error::Sql(format!(
+                    "non-deterministic functions prohibited in {what}"
+                )));
+            }
+            _ => {}
+        }
+        let mut res = Ok(());
+        crate::sql::ast::for_each_child(e, &mut |c| {
+            if res.is_ok() {
+                res = walk(c, what);
+            }
+        });
+        res
+    }
+    walk(e, what)?;
+    let ctx = crate::bind::RowContext {
+        name: table.name.clone(),
+        columns: table.columns.iter().map(|c| c.name.clone()).collect(),
+        values: vec![Value::Null; table.columns.len()],
+        rowid: Some(0),
+        bare: true,
+    };
+    crate::bind::with_row_contexts(vec![ctx], || {
+        db.run_select(&select_of(vec![result(e.clone())], Vec::new(), None), false)
+    })?;
+    Ok(())
 }
 
 fn create_view(db: &Database, cv: &CreateView, text: &str) -> Result<ResultSet> {
@@ -1109,7 +1162,10 @@ fn fire(
                         other => {
                             let target = statement_target(db, other)?;
                             prepare_file(&target)?;
-                            db.with_target(target, || execute(db, other, ""))?;
+                            let rs = db.with_target(target, || execute(db, other, ""))?;
+                            let mut c = crate::func::counters();
+                            c.total_changes += rs.changes as i64;
+                            crate::func::set_counters(c);
                         }
                     }
                 }
@@ -1163,23 +1219,195 @@ struct Inserter<'d> {
     w: Writer,
     conflict: OnConflict,
     enc: crate::record::TextEncoding,
+    /// An INSERT's ON CONFLICT clauses.
+    upsert: Vec<ast::Upsert>,
+}
+
+/// The outcome of inserting one row.
+enum Inserted {
+    Row(i64, Vec<Value>),
+    Skipped,
+    Upsert {
+        clause: usize,
+        rowid: i64,
+        old: Vec<Value>,
+        excluded: Vec<Value>,
+    },
+}
+
+fn same_con(a: &Con, b: &Con) -> bool {
+    match (a, b) {
+        (Con::Rowid, Con::Rowid) | (Con::PrimaryKey, Con::PrimaryKey) => true,
+        (Con::Index(x), Con::Index(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+/// A uniqueness constraint a new row is checked against.
+#[derive(Clone)]
+enum Con {
+    Rowid,
+    PrimaryKey,
+    Index(Rc<Index>),
+}
+
+/// What to do with a row after its uniqueness checks.
+enum Resolution {
+    Store,
+    Skip,
+    /// An upsert's DO UPDATE applies to an existing row (clause, its rowid
+    /// or 0, its values).
+    Upsert(usize, i64, Vec<Value>),
+}
+
+/// The columns of a constraint, for matching an upsert target.
+fn con_columns(table: &Table, con: &Con) -> Vec<usize> {
+    match con {
+        Con::Rowid => table.ipk.into_iter().collect(),
+        Con::PrimaryKey => table.pk.iter().map(|c| c.col).collect(),
+        Con::Index(ix) => ix.cols.iter().map(|c| c.col).collect(),
+    }
+}
+
+/// Does an upsert target (column names) name exactly this constraint?
+fn target_matches(table: &Table, target: &[String], con: &Con) -> bool {
+    if target.is_empty() {
+        return true;
+    }
+    let mut want: Vec<Option<usize>> = target.iter().map(|n| table.column_index(n)).collect();
+    // `rowid` names the rowid of a table without an INTEGER PRIMARY KEY.
+    if matches!(con, Con::Rowid) && table.ipk.is_none() {
+        return target.len() == 1 && is_rowid_word(&target[0]);
+    }
+    let mut have: Vec<Option<usize>> = con_columns(table, con).into_iter().map(Some).collect();
+    if have.is_empty() {
+        return false;
+    }
+    want.sort();
+    want.dedup();
+    have.sort();
+    want == have
+}
+
+fn is_rowid_word(n: &str) -> bool {
+    ["rowid", "_rowid_", "oid"]
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(n))
 }
 
 impl<'d> Inserter<'d> {
     fn new(db: &'d Database, table: &Rc<Table>, conflict: OnConflict) -> Result<Inserter<'d>> {
-        if table.indexes.iter().any(|i| !i.usable) {
-            return Err(Error::Unsupported(format!(
-                "writing to table {}, which has an expression or partial index",
-                table.name
-            )));
-        }
         Ok(Inserter {
             db,
             table: table.clone(),
             w: Writer::new(table.file()),
             conflict,
             enc: table.file().encoding(),
+            upsert: Vec::new(),
         })
+    }
+
+    /// The uniqueness constraints in checking order: those an upsert names
+    /// first (as SQLite does), then the rest in their usual order.
+    fn constraints(&self) -> Vec<Con> {
+        let mut all = Vec::new();
+        if self.table.without_rowid {
+            all.push(Con::PrimaryKey);
+        } else {
+            all.push(Con::Rowid);
+        }
+        for ix in self.table.indexes.iter().filter(|i| i.unique) {
+            all.push(Con::Index(ix.clone()));
+        }
+        if self.upsert.is_empty() {
+            return all;
+        }
+        let mut first: Vec<Con> = Vec::new();
+        for u in self.upsert.iter().filter(|u| !u.target.is_empty()) {
+            for (i, c) in all.iter().enumerate() {
+                if target_matches(&self.table, &u.target, c)
+                    && !first.iter().any(|f| same_con(f, c))
+                {
+                    first.push(all[i].clone());
+                }
+            }
+        }
+        let rest: Vec<Con> = all
+            .into_iter()
+            .filter(|c| !first.iter().any(|f| same_con(f, c)))
+            .collect();
+        first.extend(rest);
+        first
+    }
+
+    /// The existing row a new row would collide with on `con`.
+    fn conflict_on(
+        &self,
+        con: &Con,
+        row: &[Value],
+        rowid: i64,
+    ) -> Result<Option<(i64, Vec<Value>)>> {
+        Ok(match con {
+            Con::Rowid => self.row_at(rowid)?.map(|old| (rowid, old)),
+            Con::PrimaryKey => {
+                let pk = self.table.pk_index.clone().unwrap();
+                let key: Vec<Value> = pk.cols.iter().map(|c| row[c.col].clone()).collect();
+                self.find_entry(&pk, &key)?
+                    .map(|found| (0, self.wr_row(&found)))
+            }
+            Con::Index(ix) => {
+                let me = if self.table.without_rowid { 0 } else { rowid };
+                self.unique_conflict(ix, row, me, false)?
+            }
+        })
+    }
+
+    fn con_error(&self, con: &Con) -> Error {
+        match con {
+            Con::Rowid => {
+                let col = match self.table.ipk {
+                    Some(i) => format!("{}.{}", self.table.name, self.table.columns[i].name),
+                    None => format!("{}.rowid", self.table.name),
+                };
+                Error::Constraint(format!("UNIQUE constraint failed: {col}"))
+            }
+            Con::PrimaryKey => {
+                let pk = self.table.pk_index.clone().unwrap();
+                let cols: Vec<String> = pk
+                    .cols
+                    .iter()
+                    .map(|c| format!("{}.{}", self.table.name, self.table.columns[c.col].name))
+                    .collect();
+                Error::Constraint(format!("UNIQUE constraint failed: {}", cols.join(", ")))
+            }
+            Con::Index(ix) => self.unique_error(ix),
+        }
+    }
+
+    /// Check every uniqueness constraint for `row` (about to be stored with
+    /// `rowid`), applying the statement's conflict action or an upsert.
+    fn resolve(&self, row: &[Value], rowid: i64) -> Result<Resolution> {
+        for con in self.constraints() {
+            let Some((other, old)) = self.conflict_on(&con, row, rowid)? else {
+                continue;
+            };
+            if let Some(i) = self
+                .upsert
+                .iter()
+                .position(|u| target_matches(&self.table, &u.target, &con))
+            {
+                return Ok(match self.upsert[i].action {
+                    ast::UpsertAction::Nothing => Resolution::Skip,
+                    ast::UpsertAction::Update { .. } => Resolution::Upsert(i, other, old),
+                });
+            }
+            match self.conflict {
+                OnConflict::Ignore => return Ok(Resolution::Skip),
+                OnConflict::Replace => self.delete_row(other, &old)?,
+                OnConflict::Abort => return Err(self.con_error(&con)),
+            }
+        }
+        Ok(Resolution::Store)
     }
 
     fn order(&self, index: &Index) -> KeyOrder {
@@ -1196,20 +1424,62 @@ impl<'d> Inserter<'d> {
         KeyOrder { fields }
     }
 
-    /// The index entry for a row: key columns, then the rowid (or the
-    /// primary key columns not already in the key).
-    fn entry(&self, index: &Index, row: &[Value], rowid: i64) -> Vec<Value> {
-        let mut v: Vec<Value> = index.cols.iter().map(|c| row[c.col].clone()).collect();
+    /// The key of `row` in `index`: its columns, or the values of its key
+    /// expressions. None when a partial index leaves the row out.
+    fn index_key(&self, index: &Index, row: &[Value], rowid: i64) -> Result<Option<Vec<Value>>> {
+        if index.exprs.is_empty() && index.where_.is_none() {
+            return Ok(Some(
+                index.cols.iter().map(|c| row[c.col].clone()).collect(),
+            ));
+        }
+        let mut exprs = vec![result(
+            index
+                .where_
+                .clone()
+                .unwrap_or(AExpr::Literal(Value::Int(1))),
+        )];
+        for (i, c) in index.cols.iter().enumerate() {
+            exprs.push(result(match index.exprs.get(i).cloned().flatten() {
+                Some(e) => e,
+                None => col(&self.table.columns[c.col].name),
+            }));
+        }
+        let ctx = crate::bind::RowContext {
+            name: self.table.name.clone(),
+            columns: self.table.columns.iter().map(|c| c.name.clone()).collect(),
+            values: row.to_vec(),
+            rowid: (!self.table.without_rowid).then_some(rowid),
+            bare: true,
+        };
+        let rs = crate::bind::with_row_contexts(vec![ctx], || {
+            self.db
+                .run_select(&select_of(exprs, Vec::new(), None), true)
+        })?;
+        let mut vals = rs.rows.into_iter().next().unwrap_or_default();
+        if vals.is_empty() || vals.remove(0).truth() != Some(true) {
+            return Ok(None);
+        }
+        Ok(Some(vals))
+    }
+
+    /// The index entry for a row: key, then the rowid (or the primary key
+    /// columns not already in the key). None: not in a partial index.
+    fn entry(&self, index: &Index, row: &[Value], rowid: i64) -> Result<Option<Vec<Value>>> {
+        let Some(mut v) = self.index_key(index, row, rowid)? else {
+            return Ok(None);
+        };
         if self.table.without_rowid {
             v.extend(index.extra.iter().map(|c| row[*c].clone()));
         } else {
             v.push(Value::Int(rowid));
         }
-        v
+        Ok(Some(v))
     }
 
     fn add_index_entry(&self, index: &Index, row: &[Value], rowid: i64) -> Result<()> {
-        let entry = self.entry(index, row, rowid);
+        let Some(entry) = self.entry(index, row, rowid)? else {
+            return Ok(());
+        };
         let rec = encode_record_enc(&entry, self.enc);
         let n = entry.len();
         self.w
@@ -1217,7 +1487,9 @@ impl<'d> Inserter<'d> {
     }
 
     fn remove_index_entry(&self, index: &Index, row: &[Value], rowid: i64) -> Result<()> {
-        let entry = self.entry(index, row, rowid);
+        let Some(entry) = self.entry(index, row, rowid)? else {
+            return Ok(());
+        };
         let rec = encode_record_enc(&entry, self.enc);
         let n = entry.len();
         self.w
@@ -1267,13 +1539,20 @@ impl<'d> Inserter<'d> {
 
     /// The row (rowid, values) that a UNIQUE index says `row` collides
     /// with, other than `rowid` itself.
+    /// The existing row with the same key as `row` in a unique index.
+    /// With `exclude_self`, an entry for `row` itself (same rowid or
+    /// primary key) does not count.
     fn unique_conflict(
         &self,
         index: &Index,
         row: &[Value],
         rowid: i64,
+        exclude_self: bool,
     ) -> Result<Option<(i64, Vec<Value>)>> {
-        let key: Vec<Value> = index.cols.iter().map(|c| row[c.col].clone()).collect();
+        let me = if self.table.without_rowid { 0 } else { rowid };
+        let Some(key) = self.index_key(index, row, me)? else {
+            return Ok(None);
+        };
         if key.iter().any(Value::is_null) {
             return Ok(None);
         }
@@ -1284,7 +1563,9 @@ impl<'d> Inserter<'d> {
             let pk = self.table.pk_index.clone().unwrap();
             let mut full = vec![Value::Null; self.table.columns.len()];
             for (i, c) in index.cols.iter().enumerate() {
-                full[c.col] = entry[i].clone();
+                if c.col != usize::MAX {
+                    full[c.col] = entry[i].clone();
+                }
             }
             for (j, c) in index.extra.iter().enumerate() {
                 full[*c] = entry[index.cols.len() + j].clone();
@@ -1293,7 +1574,7 @@ impl<'d> Inserter<'d> {
                 .cols
                 .iter()
                 .all(|c| full[c.col].compare(&row[c.col], c.collation) == Ordering::Equal);
-            if same && !index.primary {
+            if same && !index.primary && exclude_self {
                 return Ok(None);
             }
             let pkey: Vec<Value> = pk.cols.iter().map(|c| full[c.col].clone()).collect();
@@ -1303,7 +1584,7 @@ impl<'d> Inserter<'d> {
         let Some(Value::Int(other)) = entry.last().cloned() else {
             return Ok(None);
         };
-        if other == rowid {
+        if other == rowid && exclude_self {
             return Ok(None);
         }
         Ok(self.row_at(other)?.map(|r| (other, r)))
@@ -1319,6 +1600,10 @@ impl<'d> Inserter<'d> {
     }
 
     fn unique_error(&self, index: &Index) -> Error {
+        // SQLite names an index on expressions instead of its columns.
+        if index.exprs.iter().any(Option::is_some) {
+            return Error::Constraint(format!("UNIQUE constraint failed: index '{}'", index.name));
+        }
         let cols: Vec<String> = index
             .cols
             .iter()
@@ -1328,7 +1613,7 @@ impl<'d> Inserter<'d> {
     }
 
     fn check_unique_one(&self, index: &Index, row: &[Value], rowid: i64) -> Result<()> {
-        if index.unique && self.unique_conflict(index, row, rowid)?.is_some() {
+        if index.unique && self.unique_conflict(index, row, rowid, true)?.is_some() {
             return Err(self.unique_error(index));
         }
         Ok(())
@@ -1340,6 +1625,26 @@ impl<'d> Inserter<'d> {
         for (i, c) in self.table.columns.iter().enumerate() {
             let v = std::mem::replace(&mut row[i], Value::Null);
             row[i] = v.apply_affinity(c.affinity);
+            if self.table.strict {
+                let decl = c.decl_type.to_ascii_uppercase();
+                let ok = matches!(
+                    (&row[i], decl.as_str()),
+                    (Value::Null, _)
+                        | (_, "ANY")
+                        | (Value::Int(_), "INT" | "INTEGER")
+                        | (Value::Real(_), "REAL")
+                        | (Value::Text(_), "TEXT")
+                        | (Value::Blob(_), "BLOB")
+                );
+                if !ok {
+                    return Err(Error::Constraint(format!(
+                        "cannot store {} value in {decl} column {}.{}",
+                        row[i].type_name().to_ascii_uppercase(),
+                        self.table.name,
+                        c.name
+                    )));
+                }
+            }
         }
         for (i, c) in self.table.columns.iter().enumerate() {
             let pk_not_null = self.table.without_rowid && self.table.pk.iter().any(|k| k.col == i);
@@ -1505,68 +1810,11 @@ impl<'d> Inserter<'d> {
     /// Resolve every uniqueness conflict for `row` (about to be stored with
     /// `rowid`): an error, a skip (Ok(false)), or deleting the old rows.
     fn resolve_conflicts(&self, row: &[Value], rowid: i64) -> Result<bool> {
-        // The rowid itself.
-        if !self.table.without_rowid {
-            if let Some(old) = self.row_at(rowid)? {
-                match self.conflict {
-                    OnConflict::Ignore => return Ok(false),
-                    OnConflict::Replace => self.delete_row(rowid, &old)?,
-                    OnConflict::Abort => {
-                        let col = match self.table.ipk {
-                            Some(i) => {
-                                format!("{}.{}", self.table.name, self.table.columns[i].name)
-                            }
-                            None => format!("{}.rowid", self.table.name),
-                        };
-                        return Err(Error::Constraint(format!(
-                            "UNIQUE constraint failed: {col}"
-                        )));
-                    }
-                }
-            }
-        }
-        // A WITHOUT ROWID primary key.
-        if self.table.without_rowid {
-            let pk = self.table.pk_index.clone().unwrap();
-            let key: Vec<Value> = pk.cols.iter().map(|c| row[c.col].clone()).collect();
-            if let Some(found) = self.find_entry(&pk, &key)? {
-                let old = self.wr_row(&found);
-                {
-                    match self.conflict {
-                        OnConflict::Ignore => return Ok(false),
-                        OnConflict::Replace => self.delete_row(0, &old)?,
-                        OnConflict::Abort => {
-                            let cols: Vec<String> = pk
-                                .cols
-                                .iter()
-                                .map(|c| {
-                                    format!(
-                                        "{}.{}",
-                                        self.table.name, self.table.columns[c.col].name
-                                    )
-                                })
-                                .collect();
-                            return Err(Error::Constraint(format!(
-                                "UNIQUE constraint failed: {}",
-                                cols.join(", ")
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-        // UNIQUE indexes.
-        for ix in self.table.indexes.iter().filter(|i| i.unique) {
-            let me = if self.table.without_rowid { 0 } else { rowid };
-            if let Some((other, old)) = self.unique_conflict(ix, row, me)? {
-                match self.conflict {
-                    OnConflict::Ignore => return Ok(false),
-                    OnConflict::Replace => self.delete_row(other, &old)?,
-                    OnConflict::Abort => return Err(self.unique_error(ix)),
-                }
-            }
-        }
-        Ok(true)
+        Ok(match self.resolve(row, rowid)? {
+            Resolution::Store => true,
+            Resolution::Skip => false,
+            Resolution::Upsert(..) => unreachable!("upsert clauses belong to INSERT"),
+        })
     }
 
     /// Store a new row (values in column order, before affinity).
@@ -1600,6 +1848,40 @@ impl<'d> Inserter<'d> {
             self.bump_sequence(rowid)?;
         }
         Ok(Some((rowid, row)))
+    }
+
+    /// Insert a row, or report the upsert that its conflict calls for.
+    fn insert_or_upsert(&mut self, row: Vec<Value>, given_rowid: Option<i64>) -> Result<Inserted> {
+        // `excluded` is the row as proposed: defaults filled in, no
+        // affinity yet (what SQLite shows).
+        let proposed = row.clone();
+        let Some(mut row) = self.prepare(row)? else {
+            return Ok(Inserted::Skipped);
+        };
+        let rowid = if self.table.without_rowid {
+            0
+        } else {
+            self.new_rowid(&row, given_rowid)?
+        };
+        match self.resolve(&row, rowid)? {
+            Resolution::Skip => Ok(Inserted::Skipped),
+            Resolution::Upsert(clause, other, old) => Ok(Inserted::Upsert {
+                clause,
+                rowid: other,
+                old,
+                excluded: proposed,
+            }),
+            Resolution::Store => {
+                if let Some(ipk) = self.table.ipk {
+                    row[ipk] = Value::Int(rowid);
+                }
+                self.store(&row, rowid)?;
+                if !self.table.without_rowid {
+                    self.bump_sequence(rowid)?;
+                }
+                Ok(Inserted::Row(rowid, row))
+            }
+        }
     }
 
     /// Write the table record and index entries of a row.
@@ -1834,6 +2116,19 @@ fn insert(db: &Database, ins: &ast::Insert) -> Result<ResultSet> {
         });
     }
     let mut ins_ = Inserter::new(db, &table, ins.on_conflict)?;
+    // Every ON CONFLICT target must name a PRIMARY KEY or UNIQUE constraint.
+    let cons = ins_.constraints();
+    for u in &ins.upsert {
+        if !u.target.is_empty() && !cons.iter().any(|c| target_matches(&table, &u.target, c)) {
+            return Err(Error::Sql(
+                "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint".into(),
+            ));
+        }
+    }
+    ins_.upsert = ins.upsert.clone();
+    let upd = Inserter::new(db, &table, OnConflict::Abort)?;
+    let upd_triggered = !ins.upsert.is_empty() && has_triggers(db, &table.name, Event::Update);
+    let mut ret = Returning::new(db, &table, &ins.returning)?;
     let mut changes = 0;
     let mut last = None;
     for vals in rows {
@@ -1873,9 +2168,77 @@ fn insert(db: &Database, ins: &ast::Insert) -> Result<ResultSet> {
                 continue;
             }
         }
-        if let Some((rowid, stored)) = ins_.insert_row_full(row, given_rowid)? {
+        let (rowid, stored) = match ins_.insert_or_upsert(row, given_rowid)? {
+            Inserted::Row(r, v) => (r, v),
+            Inserted::Skipped => continue,
+            Inserted::Upsert {
+                clause,
+                rowid,
+                old,
+                excluded,
+            } => {
+                let ast::UpsertAction::Update { sets, where_ } = &ins.upsert[clause].action else {
+                    continue;
+                };
+                // Bare names are the existing row; `excluded.x` the new one.
+                let names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+                let ctx = vec![
+                    crate::bind::RowContext {
+                        name: table.name.clone(),
+                        columns: names.clone(),
+                        values: old.clone(),
+                        rowid: (!table.without_rowid).then_some(rowid),
+                        bare: true,
+                    },
+                    crate::bind::RowContext {
+                        name: "excluded".into(),
+                        columns: names,
+                        values: excluded,
+                        rowid: None,
+                        bare: false,
+                    },
+                ];
+                let mut exprs = vec![result(
+                    where_.clone().unwrap_or(AExpr::Literal(Value::Int(1))),
+                )];
+                exprs.extend(sets.iter().map(|(_, e)| result(e.clone())));
+                let rs = crate::bind::with_row_contexts(ctx, || {
+                    db.run_select(&select_of(exprs, Vec::new(), None), true)
+                })?;
+                let mut vals = rs.rows.into_iter().next().unwrap_or_default();
+                if vals.is_empty() || vals.remove(0).truth() != Some(true) {
+                    continue;
+                }
+                let mut targets = Vec::new();
+                for (name, _) in sets {
+                    match table.column_index(name) {
+                        Some(i) => targets.push(Some(i)),
+                        None if !table.without_rowid && is_rowid_word(name) => targets.push(None),
+                        None => return Err(Error::Sql(format!("no such column: {name}"))),
+                    }
+                }
+                let set_names: Vec<String> = sets.iter().map(|(n, _)| n.clone()).collect();
+                if let Some((r, v)) = apply_update(
+                    db,
+                    &upd,
+                    &table,
+                    upd_triggered,
+                    &set_names,
+                    &targets,
+                    rowid,
+                    old,
+                    vals,
+                )? {
+                    changes += 1;
+                    ret.add(db, &table, r, &v)?;
+                }
+                continue;
+            }
+        };
+        {
             changes += 1;
             last = Some(rowid);
+            ret.add(db, &table, rowid, &stored)?;
             if triggered {
                 let after = trigger_row(&table, Some((rowid, &stored)), None);
                 fire(
@@ -1896,21 +2259,26 @@ fn insert(db: &Database, ins: &ast::Insert) -> Result<ResultSet> {
             crate::func::set_counters(c);
         }
     }
-    Ok(ResultSet {
-        changes,
-        ..Default::default()
-    })
+    Ok(ret.finish(changes))
 }
 
 /// A target row of an UPDATE or DELETE: rowid, old row, extra values.
 type TargetRow = (i64, Vec<Value>, Vec<Value>);
 
-fn target_rows(
+/// The rows of `table` a statement changes, joined with `from` (UPDATE
+/// ... FROM) under the name `alias`. With a join, each target row comes
+/// once, with the extra values of its last matching row (as SQLite).
+#[allow(clippy::too_many_arguments)]
+fn target_rows_from(
     db: &Database,
     table: &Table,
+    alias: Option<&str>,
+    with: &[ast::Cte],
+    from: &[FromItem],
     where_: &Option<AExpr>,
     extra: Vec<AExpr>,
 ) -> Result<Vec<TargetRow>> {
+    let qual = alias.unwrap_or(&table.name).to_string();
     let mut cols = Vec::new();
     let rowid = if table.without_rowid {
         None
@@ -1921,22 +2289,30 @@ fn target_rows(
                 table.name
             ))
         })?;
-        cols.push(result(col(name)));
+        cols.push(result(AExpr::Name {
+            table: Some(qual.clone()),
+            name: name.to_string(),
+            dq: false,
+        }));
         Some(())
     };
     for c in &table.columns {
         cols.push(result(AExpr::Name {
-            table: Some(table.name.clone()),
+            table: Some(qual.clone()),
             name: c.name.clone(),
             dq: false,
         }));
     }
     let n_extra = extra.len();
     cols.extend(extra.into_iter().map(result));
-    let sel = select_of(cols, from_table(db, &table.name), where_.clone());
+    let mut items = from_table(db, &table.name);
+    items[0].alias = alias.map(str::to_string);
+    items.extend(from.iter().cloned());
+    let mut sel = select_of(cols, items, where_.clone());
+    sel.with = with.to_vec();
     let rs = db.run_select(&sel, true)?;
     let n = table.columns.len();
-    Ok(rs
+    let rows: Vec<TargetRow> = rs
         .rows
         .into_iter()
         .map(|mut r| {
@@ -1949,7 +2325,34 @@ fn target_rows(
             debug_assert_eq!(ex.len(), n_extra);
             (id, r, ex)
         })
-        .collect())
+        .collect();
+    if from.is_empty() {
+        return Ok(rows);
+    }
+    // One update per target row: keep its first position, last values.
+    let key = |r: &TargetRow| -> Vec<u8> {
+        let mut k = Vec::new();
+        if table.without_rowid {
+            for c in &table.pk {
+                crate::value::hash_key(&r.1[c.col], c.collation, &mut k);
+            }
+        } else {
+            k.extend_from_slice(&r.0.to_be_bytes());
+        }
+        k
+    };
+    let mut pos: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    let mut out: Vec<TargetRow> = Vec::new();
+    for r in rows {
+        match pos.get(&key(&r)) {
+            Some(&i) => out[i].2 = r.2,
+            None => {
+                pos.insert(key(&r), out.len());
+                out.push(r);
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn delete(db: &Database, del: &ast::Delete) -> Result<ResultSet> {
@@ -1969,7 +2372,8 @@ fn delete(db: &Database, del: &ast::Delete) -> Result<ResultSet> {
     let ins = Inserter::new(db, &table, OnConflict::Abort)?;
     let w = Writer::new(&db.target());
     let triggered = has_triggers(db, &table.name, Event::Delete);
-    if del.where_.is_none() && !triggered {
+    let mut ret = Returning::new(db, &table, &del.returning)?;
+    if del.where_.is_none() && !triggered && del.returning.is_empty() && del.with.is_empty() {
         // DELETE without WHERE empties the b-trees directly.
         let n = crate::btree::count_entries(table.file(), table.root)?;
         w.clear_tree(table.root)?;
@@ -1981,7 +2385,7 @@ fn delete(db: &Database, del: &ast::Delete) -> Result<ResultSet> {
             ..Default::default()
         });
     }
-    let rows = target_rows(db, &table, &del.where_, Vec::new())?;
+    let rows = target_rows_from(db, &table, None, &del.with, &[], &del.where_, Vec::new())?;
     for (rowid, row, _) in &rows {
         if triggered {
             let tr = trigger_row(&table, None, Some((*rowid, row)));
@@ -2006,6 +2410,7 @@ fn delete(db: &Database, del: &ast::Delete) -> Result<ResultSet> {
             } else {
                 ins.delete_row(*rowid, row)?;
             }
+            ret.add(db, &table, *rowid, row)?;
             fire(
                 db,
                 &table.name,
@@ -2016,12 +2421,10 @@ fn delete(db: &Database, del: &ast::Delete) -> Result<ResultSet> {
             )?;
         } else {
             ins.delete_row(*rowid, row)?;
+            ret.add(db, &table, *rowid, row)?;
         }
     }
-    Ok(ResultSet {
-        changes: rows.len() as u64,
-        ..Default::default()
-    })
+    Ok(ret.finish(rows.len() as u64))
 }
 
 fn update(db: &Database, up: &ast::Update) -> Result<ResultSet> {
@@ -2067,90 +2470,193 @@ fn update(db: &Database, up: &ast::Update) -> Result<ResultSet> {
             None => return Err(Error::Sql(format!("no such column: {name}"))),
         }
     }
-    let rows = target_rows(
+    let rows = target_rows_from(
         db,
         &table,
+        up.alias.as_deref(),
+        &up.with,
+        &up.from,
         &up.where_,
         sets.iter().map(|(_, e)| e.clone()).collect(),
     )?;
     let ins = Inserter::new(db, &table, up.on_conflict)?;
+    let targets: Vec<Option<usize>> = sets.iter().map(|(t, _)| *t).collect();
     let mut changes = 0;
+    let mut ret = Returning::new(db, &table, &up.returning)?;
     for (rowid, old, newvals) in rows {
-        let mut row = old.clone();
-        let mut new_rowid = rowid;
-        for ((target, _), v) in sets.iter().zip(newvals) {
-            match target {
-                Some(i) => row[*i] = v,
-                None => match v.apply_affinity(Affinity::Integer) {
-                    Value::Int(r) => new_rowid = r,
-                    _ => return Err(Error::Constraint("datatype mismatch".into())),
-                },
-            }
-        }
-        if let Some(ipk) = table.ipk {
-            if sets.iter().any(|(t, _)| *t == Some(ipk)) {
-                match row[ipk].clone().apply_affinity(Affinity::Integer) {
-                    Value::Int(r) => new_rowid = r,
-                    Value::Null => new_rowid = rowid,
-                    _ => return Err(Error::Constraint("datatype mismatch".into())),
-                }
-            } else if new_rowid != rowid {
-                row[ipk] = Value::Int(new_rowid);
-            }
-        }
-        let Some(mut row) = ins.prepare(row)? else {
-            continue;
-        };
-        if let Some(ipk) = table.ipk {
-            row[ipk] = Value::Int(new_rowid);
-        }
-        // The row may have been removed by an earlier REPLACE.
-        let still_there = if table.without_rowid {
-            true
-        } else {
-            ins.row_at(rowid)?.is_some()
-        };
-        if !still_there {
-            continue;
-        }
-        if triggered {
-            let tr = trigger_row(&table, Some((new_rowid, &row)), Some((rowid, &old)));
-            if !fire(
-                db,
-                &table.name,
-                TriggerTiming::Before,
-                Event::Update,
-                &set_names,
-                &tr,
-            )? {
-                continue;
-            }
-        }
-        // Take the old row out first so it never conflicts with itself.
-        ins.delete_row(rowid, &old)?;
-        if !ins.resolve_conflicts(&row, new_rowid)? {
-            // OR IGNORE: put the old row back unchanged.
-            ins.store(&old_with_rowid(&table, old, rowid), rowid)?;
-            continue;
-        }
-        ins.store(&row, new_rowid)?;
-        changes += 1;
-        if triggered {
-            let tr = trigger_row(&table, Some((new_rowid, &row)), Some((rowid, &old)));
-            fire(
-                db,
-                &table.name,
-                TriggerTiming::After,
-                Event::Update,
-                &set_names,
-                &tr,
-            )?;
+        if let Some((new_rowid, row)) = apply_update(
+            db, &ins, &table, triggered, &set_names, &targets, rowid, old, newvals,
+        )? {
+            changes += 1;
+            ret.add(db, &table, new_rowid, &row)?;
         }
     }
-    Ok(ResultSet {
-        changes,
-        ..Default::default()
-    })
+    Ok(ret.finish(changes))
+}
+
+/// Change one row of an UPDATE (or of an upsert's DO UPDATE): `targets`
+/// says which column each of `newvals` sets (None: the rowid). Returns the
+/// row as stored, or None when it was skipped.
+#[allow(clippy::too_many_arguments)]
+fn apply_update(
+    db: &Database,
+    ins: &Inserter,
+    table: &Rc<Table>,
+    triggered: bool,
+    set_names: &[String],
+    targets: &[Option<usize>],
+    rowid: i64,
+    old: Vec<Value>,
+    newvals: Vec<Value>,
+) -> Result<Option<(i64, Vec<Value>)>> {
+    let mut row = old.clone();
+    let mut new_rowid = rowid;
+    for (target, v) in targets.iter().zip(newvals) {
+        match target {
+            Some(i) => row[*i] = v,
+            None => match v.apply_affinity(Affinity::Integer) {
+                Value::Int(r) => new_rowid = r,
+                _ => return Err(Error::Constraint("datatype mismatch".into())),
+            },
+        }
+    }
+    if let Some(ipk) = table.ipk {
+        if targets.contains(&Some(ipk)) {
+            match row[ipk].clone().apply_affinity(Affinity::Integer) {
+                Value::Int(r) => new_rowid = r,
+                Value::Null => new_rowid = rowid,
+                _ => return Err(Error::Constraint("datatype mismatch".into())),
+            }
+        } else if new_rowid != rowid {
+            row[ipk] = Value::Int(new_rowid);
+        }
+    }
+    let Some(mut row) = ins.prepare(row)? else {
+        return Ok(None);
+    };
+    if let Some(ipk) = table.ipk {
+        row[ipk] = Value::Int(new_rowid);
+    }
+    // The row may have been removed by an earlier REPLACE.
+    let still_there = if table.without_rowid {
+        true
+    } else {
+        ins.row_at(rowid)?.is_some()
+    };
+    if !still_there {
+        return Ok(None);
+    }
+    if triggered {
+        let tr = trigger_row(table, Some((new_rowid, &row)), Some((rowid, &old)));
+        if !fire(
+            db,
+            &table.name,
+            TriggerTiming::Before,
+            Event::Update,
+            set_names,
+            &tr,
+        )? {
+            return Ok(None);
+        }
+    }
+    // Take the old row out first so it never conflicts with itself.
+    ins.delete_row(rowid, &old)?;
+    if !ins.resolve_conflicts(&row, new_rowid)? {
+        // OR IGNORE: put the old row back unchanged.
+        ins.store(&old_with_rowid(table, old, rowid), rowid)?;
+        return Ok(None);
+    }
+    ins.store(&row, new_rowid)?;
+    if triggered {
+        let tr = trigger_row(table, Some((new_rowid, &row)), Some((rowid, &old)));
+        fire(
+            db,
+            &table.name,
+            TriggerTiming::After,
+            Event::Update,
+            set_names,
+            &tr,
+        )?;
+    }
+    Ok(Some((new_rowid, row)))
+}
+
+/// RETURNING: one result row per changed row, evaluated against it.
+struct Returning {
+    cols: Vec<ResultColumn>,
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+}
+
+impl Returning {
+    fn new(db: &Database, table: &Table, cols: &[ResultColumn]) -> Result<Returning> {
+        // `*` means the table's columns.
+        let mut out = Vec::new();
+        for c in cols {
+            match c {
+                ResultColumn::Star => {
+                    out.extend(table.columns.iter().map(|c| result(col(&c.name))))
+                }
+                ResultColumn::TableStar(t) if t.eq_ignore_ascii_case(&table.name) => {
+                    out.extend(table.columns.iter().map(|c| result(col(&c.name))))
+                }
+                ResultColumn::TableStar(t) => {
+                    return Err(Error::Sql(format!("no such table: {t}")));
+                }
+                other => out.push(other.clone()),
+            }
+        }
+        let mut r = Returning {
+            cols: out,
+            columns: Vec::new(),
+            rows: Vec::new(),
+        };
+        if !r.cols.is_empty() {
+            // Check the expressions and learn the column names now.
+            let nulls = vec![Value::Null; table.columns.len()];
+            let rs = r.eval(db, table, 0, &nulls, false)?;
+            r.columns = rs.columns;
+        }
+        Ok(r)
+    }
+
+    fn eval(
+        &self,
+        db: &Database,
+        table: &Table,
+        rowid: i64,
+        row: &[Value],
+        run: bool,
+    ) -> Result<ResultSet> {
+        let ctx = crate::bind::RowContext {
+            name: table.name.clone(),
+            columns: table.columns.iter().map(|c| c.name.clone()).collect(),
+            values: row.to_vec(),
+            rowid: (!table.without_rowid).then_some(rowid),
+            bare: true,
+        };
+        crate::bind::with_row_contexts(vec![ctx], || {
+            db.run_select(&select_of(self.cols.clone(), Vec::new(), None), run)
+        })
+    }
+
+    fn add(&mut self, db: &Database, table: &Table, rowid: i64, row: &[Value]) -> Result<()> {
+        if self.cols.is_empty() {
+            return Ok(());
+        }
+        let rs = self.eval(db, table, rowid, row, true)?;
+        self.rows.extend(rs.rows);
+        Ok(())
+    }
+
+    fn finish(self, changes: u64) -> ResultSet {
+        ResultSet {
+            columns: self.columns,
+            rows: self.rows,
+            changes,
+            ..Default::default()
+        }
+    }
 }
 
 fn old_with_rowid(table: &Table, mut row: Vec<Value>, rowid: i64) -> Vec<Value> {
