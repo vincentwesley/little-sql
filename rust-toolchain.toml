@@ -1,0 +1,5 @@
+# Pinned so that local builds and CI run the same compiler and lints.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

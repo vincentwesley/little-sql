@@ -1,0 +1,607 @@
+//! The abstract syntax tree produced by the parser.
+
+use crate::value::Value;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Stmt {
+    Select(Select),
+    Explain {
+        query_plan: bool,
+        stmt: Box<Stmt>,
+    },
+    CreateTable(CreateTable),
+    CreateIndex(CreateIndex),
+    CreateView(CreateView),
+    CreateTrigger(CreateTrigger),
+    /// `REINDEX [name]`: nothing to rebuild (indexes are always current),
+    /// but a name must exist.
+    Reindex(Option<String>),
+    Drop {
+        kind: DropKind,
+        if_exists: bool,
+        /// `schema.` before the name, if written.
+        db: Option<String>,
+        name: String,
+    },
+    Insert(Insert),
+    Update(Update),
+    Delete(Delete),
+    Begin,
+    Commit,
+    Rollback,
+    Savepoint(String),
+    AlterTable {
+        db: Option<String>,
+        table: String,
+        action: AlterAction,
+    },
+    /// `ATTACH [DATABASE] file AS name`
+    Attach {
+        file: Expr,
+        name: String,
+    },
+    /// `DETACH [DATABASE] name`
+    Detach(String),
+    Release(String),
+    RollbackTo(String),
+    Pragma {
+        db: Option<String>,
+        name: String,
+        value: Option<String>,
+    },
+    /// Statements that are accepted and do nothing (ANALYZE, REINDEX,
+    /// VACUUM).
+    Noop(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DropKind {
+    Table,
+    Index,
+    View,
+    Trigger,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+    InsteadOf,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TriggerEvent {
+    Insert,
+    Delete,
+    /// `UPDATE [OF col, ...]`; an empty list means any column.
+    Update(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateTrigger {
+    pub name: String,
+    /// `schema.` before the trigger's name.
+    pub db: Option<String>,
+    /// `schema.` before the table's name (TEMP triggers only).
+    pub table_db: Option<String>,
+    pub temp: bool,
+    pub if_not_exists: bool,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    pub table: String,
+    pub when: Option<Expr>,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Select {
+    pub with: Vec<Cte>,
+    pub body: SelectBody,
+    pub order_by: Vec<OrderTerm>,
+    pub limit: Option<Expr>,
+    pub offset: Option<Expr>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub select: Select,
+    pub recursive: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SelectBody {
+    Core(Box<SelectCore>),
+    Values(Vec<Vec<Expr>>),
+    Compound {
+        op: CompoundOp,
+        left: Box<SelectBody>,
+        right: Box<SelectBody>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompoundOp {
+    Union,
+    UnionAll,
+    Intersect,
+    Except,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectCore {
+    pub distinct: bool,
+    pub columns: Vec<ResultColumn>,
+    pub from: Vec<FromItem>,
+    pub where_: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
+    /// `WINDOW name AS (...)` definitions.
+    pub windows: Vec<(String, WindowSpec)>,
+}
+
+/// `OVER (...)`: partitioning, ordering and frame of a window function.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct WindowSpec {
+    /// A named window this one builds on (`OVER w` or `OVER (w ...)`).
+    pub base: Option<String>,
+    pub partition: Vec<Expr>,
+    pub order: Vec<OrderTerm>,
+    pub frame: Option<Frame>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameUnits {
+    Rows,
+    Range,
+    Groups,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(Box<Expr>),
+    CurrentRow,
+    Following(Box<Expr>),
+    UnboundedFollowing,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Frame {
+    pub units: FrameUnits,
+    pub start: FrameBound,
+    pub end: FrameBound,
+    pub exclude: Exclude,
+}
+
+/// `EXCLUDE ...` in a window frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exclude {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResultColumn {
+    Star,
+    TableStar(String),
+    Expr {
+        expr: Expr,
+        alias: Option<String>,
+        /// The expression exactly as written, used as the column name when
+        /// there is no alias.
+        text: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinKind {
+    /// The first item, a comma, `JOIN`, `INNER JOIN` or `CROSS JOIN`.
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FromItem {
+    pub join: JoinKind,
+    pub natural: bool,
+    pub source: TableSource,
+    pub alias: Option<String>,
+    pub on: Option<Expr>,
+    pub using: Vec<String>,
+    pub indexed: Indexed,
+}
+
+/// `INDEXED BY name` / `NOT INDEXED` after a table in FROM.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum Indexed {
+    #[default]
+    Any,
+    /// Use no index (the rowid is still allowed).
+    No,
+    /// Use exactly this index.
+    By(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TableSource {
+    Table {
+        schema: Option<String>,
+        name: String,
+    },
+    Subquery(Box<Select>),
+    /// A parenthesised join: `FROM a JOIN (b JOIN c ON ...) ON ...`.
+    Nested(Vec<FromItem>),
+    /// A table-valued function: `json_each(x)`, `json_tree(x, path)`.
+    Function {
+        name: String,
+        args: Vec<Expr>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrderTerm {
+    pub expr: Expr,
+    pub desc: bool,
+    pub nulls_first: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
+    Pos,
+    Not,
+    BitNot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Concat,
+    BitAnd,
+    BitOr,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+    /// `IS` / `IS NOT DISTINCT FROM`: equality where NULL equals NULL.
+    Is,
+    IsNot,
+}
+
+impl BinaryOp {
+    pub fn is_comparison(self) -> bool {
+        use BinaryOp::*;
+        matches!(self, Eq | Ne | Lt | Le | Gt | Ge | Is | IsNot)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LikeOp {
+    Like,
+    Glob,
+    Regexp,
+    Match,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Expr {
+    Literal(Value),
+    /// A column reference, optionally qualified. `dq` marks a bare
+    /// double-quoted name, which may turn out to be a string literal.
+    Name {
+        table: Option<String>,
+        name: String,
+        dq: bool,
+    },
+    Unary(UnaryOp, Box<Expr>),
+    Binary(BinaryOp, Box<Expr>, Box<Expr>),
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
+    },
+    Between {
+        expr: Box<Expr>,
+        lo: Box<Expr>,
+        hi: Box<Expr>,
+        negated: bool,
+    },
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
+    InSelect {
+        expr: Box<Expr>,
+        select: Box<Select>,
+        negated: bool,
+    },
+    /// `x IN tablename`
+    InTable {
+        expr: Box<Expr>,
+        table: String,
+        negated: bool,
+    },
+    Like {
+        op: LikeOp,
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        escape: Option<Box<Expr>>,
+        negated: bool,
+    },
+    Case {
+        operand: Option<Box<Expr>>,
+        whens: Vec<(Expr, Expr)>,
+        else_: Option<Box<Expr>>,
+    },
+    Cast {
+        expr: Box<Expr>,
+        type_name: String,
+    },
+    Collate {
+        expr: Box<Expr>,
+        collation: String,
+    },
+    Function {
+        name: String,
+        args: Vec<Expr>,
+        distinct: bool,
+        star: bool,
+        filter: Option<Box<Expr>>,
+        over: Option<Box<WindowSpec>>,
+    },
+    Subquery(Box<Select>),
+    Exists(Box<Select>),
+    /// A bound parameter: its 1-based number in the statement, and its
+    /// name (with the leading `:`, `@` or `$`) when it has one.
+    Param {
+        index: usize,
+        name: Option<String>,
+    },
+}
+
+/// Call `f` on each direct sub-expression of `e` (not inside subqueries).
+pub fn for_each_child(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    match e {
+        Expr::Literal(_) | Expr::Name { .. } | Expr::Param { .. } => {}
+        Expr::Subquery(_) | Expr::Exists(_) => {}
+        Expr::Unary(_, a) | Expr::IsNull { expr: a, .. } | Expr::Cast { expr: a, .. } => f(a),
+        Expr::Collate { expr: a, .. } | Expr::InTable { expr: a, .. } => f(a),
+        Expr::InSelect { expr: a, .. } => f(a),
+        Expr::Binary(_, a, b) => {
+            f(a);
+            f(b);
+        }
+        Expr::Between { expr, lo, hi, .. } => {
+            f(expr);
+            f(lo);
+            f(hi);
+        }
+        Expr::InList { expr, list, .. } => {
+            f(expr);
+            list.iter().for_each(&mut *f);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            f(expr);
+            f(pattern);
+            if let Some(x) = escape {
+                f(x);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(x) = operand {
+                f(x);
+            }
+            for (w, t) in whens {
+                f(w);
+                f(t);
+            }
+            if let Some(x) = else_ {
+                f(x);
+            }
+        }
+        Expr::Function { args, filter, .. } => {
+            args.iter().for_each(&mut *f);
+            if let Some(x) = filter {
+                f(x);
+            }
+        }
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Value) -> bool {
+        self.type_name() == other.type_name()
+            && self.compare(other, crate::value::Collation::Binary) == std::cmp::Ordering::Equal
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef {
+    pub name: String,
+    pub type_name: String,
+    pub primary_key: bool,
+    pub pk_desc: bool,
+    pub autoincrement: bool,
+    pub not_null: bool,
+    pub unique: bool,
+    pub default: Option<Expr>,
+    pub collation: Option<String>,
+    pub generated: bool,
+    /// Column-level CHECK constraints.
+    pub checks: Vec<Check>,
+}
+
+/// A CHECK constraint: its name (if given), expression and source text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Check {
+    pub name: Option<String>,
+    pub expr: Expr,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexedColumn {
+    /// Column name, or `None` when the index key is an expression.
+    pub name: Option<String>,
+    /// The key expression when it is not a plain column.
+    pub expr: Option<Expr>,
+    pub collation: Option<String>,
+    pub desc: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TableConstraint {
+    PrimaryKey(Vec<IndexedColumn>),
+    Unique(Vec<IndexedColumn>),
+    Check(Check),
+    /// FOREIGN KEY constraints are parsed and, as in SQLite by default,
+    /// not enforced.
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateTable {
+    pub name: String,
+    pub db: Option<String>,
+    /// `STRICT`: values must match the declared types.
+    pub strict: bool,
+    pub temp: bool,
+    pub if_not_exists: bool,
+    pub columns: Vec<ColumnDef>,
+    pub constraints: Vec<TableConstraint>,
+    pub without_rowid: bool,
+    pub as_select: Option<Box<Select>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateIndex {
+    pub name: String,
+    pub db: Option<String>,
+    pub table: String,
+    pub unique: bool,
+    pub if_not_exists: bool,
+    pub columns: Vec<IndexedColumn>,
+    pub partial: bool,
+    /// A partial index's WHERE.
+    pub where_: Option<Expr>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateView {
+    pub name: String,
+    pub db: Option<String>,
+    pub temp: bool,
+    pub if_not_exists: bool,
+    pub columns: Vec<String>,
+    pub select: Select,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnConflict {
+    Abort,
+    Ignore,
+    Replace,
+}
+
+/// `ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`
+#[derive(Clone, Debug, PartialEq)]
+pub struct Upsert {
+    /// The conflict target's columns (empty: any constraint).
+    pub target: Vec<String>,
+    pub action: UpsertAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpsertAction {
+    Nothing,
+    Update {
+        sets: Vec<(String, Expr)>,
+        where_: Option<Expr>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum InsertSource {
+    Select(Box<Select>),
+    DefaultValues,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Insert {
+    pub db: Option<String>,
+    pub table: String,
+    /// `ON CONFLICT ...` clauses, in order.
+    pub upsert: Vec<Upsert>,
+    /// `RETURNING ...` (empty: none).
+    pub returning: Vec<ResultColumn>,
+    pub columns: Vec<String>,
+    pub source: InsertSource,
+    pub on_conflict: OnConflict,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Update {
+    pub db: Option<String>,
+    pub table: String,
+    /// `UPDATE t AS alias`
+    pub alias: Option<String>,
+    /// A leading `WITH`.
+    pub with: Vec<Cte>,
+    /// `UPDATE ... FROM ...`: more tables joined to the target.
+    pub from: Vec<FromItem>,
+    pub returning: Vec<ResultColumn>,
+    pub sets: Vec<(String, Expr)>,
+    pub where_: Option<Expr>,
+    pub on_conflict: OnConflict,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Delete {
+    pub db: Option<String>,
+    pub table: String,
+    /// A leading `WITH`.
+    pub with: Vec<Cte>,
+    pub returning: Vec<ResultColumn>,
+    pub where_: Option<Expr>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterAction {
+    RenameTable(String),
+    RenameColumn {
+        from: String,
+        to: String,
+    },
+    /// The definition, and its text as written (it is spliced into the
+    /// stored CREATE TABLE).
+    AddColumn {
+        def: ColumnDef,
+        text: String,
+    },
+    DropColumn(String),
+}

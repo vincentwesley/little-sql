@@ -1,0 +1,10 @@
+[package]
+name = "littlesql"
+description = "A small SQL engine, written from scratch, that reads and writes SQLite database files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The engine is written from scratch: this section stays empty on purpose.
+[dependencies]
