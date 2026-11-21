@@ -52,6 +52,31 @@ by hand.
   `scripts/acceptance.sh`, `node scripts/publish-results.mjs`,
   `scripts/build-playground.sh`, and commit `docs/results/` with README.
 
+## Next: TEMP tables and ATTACH (design, not started)
+
+The engine assumes one file: `Database` owns one `Pager`, a `Table` holds
+only its root page, and the binder, executor and writer all reach that one
+pager. A second schema needs, in order:
+
+1. `Database` holds a list of attached files (`main`, `temp`, then
+   ATTACHed names), each with its own `Pager` and `Schema`; `temp` is an
+   in-memory pager created on first use.
+2. `Table` / `Index` gain a database number; cursors and the writer pick
+   the pager by it (`exec.rs` scan paths, `btree_write.rs` via `write.rs`).
+3. The binder resolves `schema.name` (`TableSource::Table { schema, .. }`
+   already parses it) and unqualified names in SQLite's order: temp, main,
+   then attached files in attach order. The current TEMP VIEW special case
+   (`temp_views`) moves into the temp schema.
+4. Transactions: BEGIN/COMMIT/ROLLBACK and savepoints take a savepoint on
+   every pager that was written; COMMIT commits each (no cross-file
+   atomicity, as in SQLite with WAL files).
+5. `ATTACH 'file' AS name`, `DETACH name`, `PRAGMA database_list`, and
+   `sqlite_temp_schema`; then lift the "TEMP tables" / "TEMP triggers"
+   refusals in `write.rs`.
+
+Verify with differential tests that create TEMP tables, shadow a main
+table of the same name, and join across an ATTACHed fixture.
+
 ## Known issues
 
 - Join order is greedy; it can pick a worse order than SQLite's for 3+
