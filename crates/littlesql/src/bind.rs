@@ -18,6 +18,8 @@ use crate::value::{Affinity, Collation, Value};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod single;
+
 struct ScopeCol {
     name: String,
     aff: Affinity,
@@ -178,6 +180,10 @@ pub struct Binder<'a> {
     /// Expression and partial indexes of each table cursor (see
     /// [`SpecialIndex`]), for ORDER BY planning.
     specials: HashMap<usize, Vec<SpecialIndex>>,
+    /// The table behind each table cursor.
+    cursor_tables: HashMap<usize, Rc<Table>>,
+    /// Cursors on the NULL-filled side of an outer join.
+    nullable: std::collections::HashSet<usize>,
 }
 
 fn lower(s: &str) -> String {
@@ -389,6 +395,8 @@ impl<'a> Binder<'a> {
             work_tables: Vec::new(),
             next_work: 0,
             specials: HashMap::new(),
+            cursor_tables: HashMap::new(),
+            nullable: std::collections::HashSet::new(),
         }
     }
 
@@ -664,6 +672,7 @@ impl<'a> Binder<'a> {
                 Some(ncols)
             },
         };
+        self.cursor_tables.insert(cursor, table.clone());
         let mut src = src;
         if table.has_virtual() {
             src.gen = self.bind_generated(table, cursor);
@@ -1432,6 +1441,7 @@ impl<'a> Binder<'a> {
                     JoinKind::Inner => {}
                     JoinKind::Left => {
                         item.left_join = true;
+                        self.nullable.insert(item.cursor);
                         left_on = Some(idx);
                     }
                     _ => return Err(Error::Unsupported("this join with a table function".into())),
@@ -1463,6 +1473,7 @@ impl<'a> Binder<'a> {
                 JoinKind::Inner => {}
                 JoinKind::Left => {
                     item.left_join = true;
+                    self.nullable.insert(item.cursor);
                     left_on = Some(idx);
                 }
                 JoinKind::Right => {
@@ -1474,6 +1485,7 @@ impl<'a> Binder<'a> {
                         ));
                     }
                     items[0].left_join = true;
+                    self.nullable.insert(items[0].cursor);
                     items.insert(0, item);
                     scope.sources.push(src);
                     let last = scope.sources.len() - 1;
@@ -1834,10 +1846,143 @@ impl<'a> Binder<'a> {
         };
 
         let (mut sources, const_filters) = self.plan_joins(items, bound)?;
+        let windowed = !self.wins.last().unwrap().calls.is_empty();
+        // A query over one table is planned with SQLite's cost model, which
+        // also weighs sorting against reading an index in order.
+        let mut order_prefix = 0;
+        let mut ordered_single = false;
+        let single = sources.len() == 1
+            && !sources[0].left_join
+            && matches!(sources[0].kind, SourceKind::Table { .. });
+        let mut distinct_free = false;
+        let mut order_by_distinct = false;
+        let mut group_sorted = false;
+        if let Some(a) = agg.as_ref().filter(|_| single) {
+            // GROUP BY is planned as an order the rows may arrive in (any
+            // term order); a plain aggregate as no order at all.
+            let gkeys: Vec<OrderKey> = a
+                .group_by
+                .iter()
+                .map(|(_, coll)| OrderKey {
+                    src: KeySrc::Result(0),
+                    desc: false,
+                    nulls_first: true,
+                    coll: *coll,
+                })
+                .collect();
+            let gexprs: Vec<Expr> = a.group_by.iter().map(|(e, _)| e.clone()).collect();
+            // `SELECT count(*) FROM t` and nothing else: SQLite counts the
+            // entries of its narrowest index (isSimpleCount).
+            let simple_count = core.where_.is_none()
+                && core.having.is_none()
+                && a.group_by.is_empty()
+                && results.len() == 1
+                && matches!(results[0], Expr::Agg { .. })
+                && a.calls.len() == 1
+                && a.calls[0].func == crate::func::AggFunc::CountStar
+                && !a.calls[0].distinct
+                && a.calls[0].filter.is_none();
+            if simple_count && self.plan_simple_count(&mut sources[0]) {
+                ordered_single = true;
+            } else if let Some(p) = self.plan_single(
+                &mut sources[0],
+                &gkeys,
+                &gexprs,
+                single::Mode::Group,
+                None,
+                None,
+                results.len(),
+            ) {
+                ordered_single = true;
+                group_sorted = !gkeys.is_empty() && p.sat == gkeys.len();
+            }
+        }
+        if single && agg.is_none() {
+            let use_keys = !windowed;
+            let exprs: Vec<Expr> = if use_keys {
+                keys.iter()
+                    .map(|k| match &k.src {
+                        KeySrc::Result(i) => results[*i].clone(),
+                        KeySrc::Expr(e) => e.clone(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let okeys: &[OrderKey] = if use_keys { &keys } else { &[] };
+            let limit_est = match &limit {
+                Some(Expr::Lit(Value::Int(n))) if *n > 0 => Some(crate::cost::log_est(*n as u64)),
+                _ => None,
+            };
+            let distinct_rs = (core.distinct && !windowed).then_some(&results[..]);
+            // SELECT DISTINCT whose ORDER BY is exactly its result list:
+            // SQLite turns it into a GROUP BY, whose sort serves both.
+            let distinct_as_group = core.distinct
+                && !windowed
+                && !keys.is_empty()
+                && keys.len() == results.len()
+                && keys.iter().enumerate().all(|(i, k)| {
+                    !k.desc
+                        && k.nulls_first
+                        && k.coll == collation(&results[i]).map_or(Collation::Binary, |c| c.0)
+                        && match &k.src {
+                            KeySrc::Result(j) => *j == i,
+                            KeySrc::Expr(e) => same_expr(e, &results[i]),
+                        }
+                });
+            if distinct_as_group {
+                if let Some(p) = self.plan_single(
+                    &mut sources[0],
+                    &keys,
+                    &exprs,
+                    single::Mode::Distinct,
+                    None,
+                    None,
+                    results.len(),
+                ) {
+                    ordered_single = true;
+                    if p.sat == keys.len() {
+                        distinct_free = true;
+                        if p.sorted {
+                            keys.clear();
+                        }
+                    } else {
+                        order_by_distinct = true;
+                    }
+                }
+            } else if let Some(p) = self.plan_single(
+                &mut sources[0],
+                okeys,
+                &exprs,
+                single::Mode::Order,
+                limit_est,
+                distinct_rs,
+                results.len(),
+            ) {
+                ordered_single = true;
+                distinct_free = p.distinct_free;
+                let sat = p.sat;
+                if use_keys && !keys.is_empty() {
+                    if sat >= keys.len() {
+                        keys.clear();
+                    } else {
+                        order_prefix = sat;
+                    }
+                }
+            }
+        }
         // Group without a hash table when the outermost loop delivers rows
         // in GROUP BY order.
         let mut agg = agg;
-        if let Some(a) = agg.as_mut().filter(|a| !a.group_by.is_empty()) {
+        if group_sorted {
+            if let Some(a) = agg.as_mut() {
+                a.sorted = true;
+            }
+        }
+        if let Some(a) = agg
+            .as_mut()
+            .filter(|a| !a.group_by.is_empty() && !ordered_single)
+        {
             let gkeys: Vec<OrderKey> = a
                 .group_by
                 .iter()
@@ -1856,8 +2001,7 @@ impl<'a> Binder<'a> {
         // Skip the sort when the outermost loop already delivers rows in
         // ORDER BY order (an index or rowid scan, possibly backwards).
         // (Window functions reorder rows, so the sort must stay.)
-        let windowed = !self.wins.last().unwrap().calls.is_empty();
-        if agg.is_none() && !keys.is_empty() && !windowed {
+        if agg.is_none() && !keys.is_empty() && !windowed && !ordered_single {
             let exprs: Vec<Expr> = keys
                 .iter()
                 .map(|k| match &k.src {
@@ -1877,12 +2021,35 @@ impl<'a> Binder<'a> {
                 distinct: core.distinct,
                 agg,
                 windows: Vec::new(),
+                order_prefix,
+                distinct_free,
+                order_by_distinct,
             })),
             order_by: keys,
             limit,
             offset,
             cols,
         })
+    }
+
+    /// A plain column reference that can never be NULL.
+    fn never_null(&self, e: &Expr) -> bool {
+        let Expr::Col { cur, col, .. } = strip_collate_ref(e) else {
+            return false;
+        };
+        if self.nullable.contains(cur) {
+            return false;
+        }
+        let Some(t) = self.cursor_tables.get(cur) else {
+            return false;
+        };
+        if !t.without_rowid && (*col == t.columns.len() || Some(*col) == t.ipk) {
+            return true;
+        }
+        t.columns
+            .get(*col)
+            .is_some_and(|c| c.not_null && c.generated.is_none())
+            || (t.without_rowid && t.pk.iter().any(|p| p.col == *col))
     }
 
     fn column_name(&self, cur: usize, col: usize) -> Option<String> {
@@ -2016,7 +2183,15 @@ impl<'a> Binder<'a> {
                 }
             }
             ast::Expr::IsNull { expr, negated } => {
-                Expr::IsNull(Box::new(self.bind_expr(expr)?), *negated)
+                let e = self.bind_expr(expr)?;
+                // Like SQLite, `x IS [NOT] NULL` on a column that can never
+                // be NULL (the rowid, a NOT NULL column, a WITHOUT ROWID
+                // key) is a constant, unless an outer join can null it.
+                if self.never_null(&e) {
+                    Expr::Lit(Value::Int(*negated as i64))
+                } else {
+                    Expr::IsNull(Box::new(e), *negated)
+                }
             }
             ast::Expr::Between {
                 expr,
@@ -2658,7 +2833,7 @@ impl<'a> Binder<'a> {
         };
         // How many lookups an equality key costs.
         let fanout = |k: &KeyExpr| match k {
-            KeyExpr::One(_) => 1.0,
+            KeyExpr::One(_) | KeyExpr::Null => 1.0,
             KeyExpr::List(l) => l.len() as f64,
             KeyExpr::Sub(_) => 10.0,
         };
@@ -3459,6 +3634,13 @@ fn col_ref(e: &Expr) -> Option<(&usize, &usize)> {
     match e {
         Expr::Col { cur, col, .. } | Expr::Gen { cur, col, .. } => Some((cur, col)),
         _ => None,
+    }
+}
+
+fn strip_collate_ref(e: &Expr) -> &Expr {
+    match e {
+        Expr::Collate(inner, _) => strip_collate_ref(inner),
+        other => other,
     }
 }
 

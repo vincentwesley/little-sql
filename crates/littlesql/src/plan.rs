@@ -196,6 +196,16 @@ pub struct Core {
     pub agg: Option<Agg>,
     /// Window functions, computed after grouping and before DISTINCT.
     pub windows: Vec<WindowCall>,
+    /// How many leading ORDER BY terms the loops already deliver (EXPLAIN
+    /// then says only the right part is sorted; all of it is sorted).
+    pub order_prefix: usize,
+    /// The plan makes DISTINCT free (a unique index, or rows arriving
+    /// grouped by the result), so EXPLAIN shows no step for it.
+    pub distinct_free: bool,
+    /// The DISTINCT's own sort also produces the ORDER BY (SQLite plans a
+    /// DISTINCT whose ORDER BY is its result list as a GROUP BY), so
+    /// EXPLAIN shows no separate ORDER BY step.
+    pub order_by_distinct: bool,
 }
 
 /// A window function: what it computes, over which rows and in which order.
@@ -319,11 +329,13 @@ pub enum KeyExpr {
     List(Vec<Expr>),
     /// `col IN (SELECT ...)`: one lookup per distinct value of the result.
     Sub(Rc<Subquery>),
+    /// `col IS NULL`: the one lookup whose key is NULL.
+    Null,
 }
 
 impl KeyExpr {
     pub fn is_one(&self) -> bool {
-        matches!(self, KeyExpr::One(_))
+        matches!(self, KeyExpr::One(_) | KeyExpr::Null)
     }
 }
 
@@ -483,6 +495,64 @@ pub fn refs(e: &Expr, out: &mut Vec<usize>) {
     }
 }
 
+/// The columns of cursor `cur` that `e` reads directly (not inside
+/// subqueries); a virtual generated column counts as itself.
+pub fn cols_of(e: &Expr, cur: usize, out: &mut Vec<usize>) {
+    let mut go = |x: &Expr| cols_of(x, cur, out);
+    match e {
+        Expr::Lit(_) | Expr::Agg { .. } | Expr::Window(_) => {}
+        Expr::Subquery(_) | Expr::Exists(_) => {}
+        Expr::Col { cur: c, col, .. } | Expr::Gen { cur: c, col, .. } => {
+            if *c == cur {
+                out.push(*col);
+            }
+        }
+        Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) | Expr::Collate(a, _) => go(a),
+        Expr::Arith(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+            go(a);
+            go(b);
+        }
+        Expr::Cmp { l, r, .. } => {
+            go(l);
+            go(r);
+        }
+        Expr::Between { e, lo, hi, .. } => {
+            go(e);
+            go(lo);
+            go(hi);
+        }
+        Expr::InList { e, list, .. } => {
+            go(e);
+            list.iter().for_each(go);
+        }
+        Expr::InSub { e, .. } => go(e),
+        Expr::Like { e, pat, esc, .. } => {
+            go(e);
+            go(pat);
+            if let Some(x) = esc {
+                go(x);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                go(o);
+            }
+            for w in whens {
+                go(&w.when);
+                go(&w.then);
+            }
+            if let Some(x) = else_ {
+                go(x);
+            }
+        }
+        Expr::Func { args, .. } => args.iter().for_each(go),
+    }
+}
+
 /// Visit every subquery that appears directly inside `e`.
 pub fn subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a Rc<Subquery>>) {
     match e {
@@ -595,9 +665,15 @@ fn describe_source(s: &Source) -> String {
                     )
                 }
                 Access::Index(ix) => {
-                    let col = |i: usize| match ix.index.exprs.get(i) {
-                        Some(Some(_)) => "<expr>".to_string(),
-                        _ => table.columns[ix.index.cols[i].col].name.clone(),
+                    let col = |i: usize| match (ix.index.exprs.get(i), ix.index.cols.get(i)) {
+                        (Some(Some(_)), _) => "<expr>".to_string(),
+                        (_, Some(c)) => table.columns[c.col].name.clone(),
+                        // Past the key: the rest of a WITHOUT ROWID primary
+                        // key, or the rowid each entry ends with.
+                        (_, None) => match ix.index.extra.get(i - ix.index.cols.len()) {
+                            Some(c) if table.without_rowid => table.columns[*c].name.clone(),
+                            _ => "rowid".to_string(),
+                        },
                     };
                     let mut terms: Vec<String> =
                         (0..ix.eq.len()).map(|i| format!("{}=?", col(i))).collect();
@@ -733,15 +809,15 @@ pub fn explain_query(q: &Query, depth: usize, out: &mut Vec<PlanLine>) {
                 if !agg.group_by.is_empty() && !agg.sorted {
                     out.push(PlanLine {
                         depth,
-                        text: "USE TEMP HASH TABLE FOR GROUP BY".into(),
+                        text: "USE TEMP B-TREE FOR GROUP BY".into(),
                         cursor: None,
                     });
                 }
             }
-            if core.distinct {
+            if core.distinct && !core.distinct_free {
                 out.push(PlanLine {
                     depth,
-                    text: "USE TEMP HASH TABLE FOR DISTINCT".into(),
+                    text: "USE TEMP B-TREE FOR DISTINCT".into(),
                     cursor: None,
                 });
             }
@@ -803,10 +879,17 @@ pub fn explain_query(q: &Query, depth: usize, out: &mut Vec<PlanLine>) {
         }
         Body::WorkTable(_) | Body::TableFn { .. } => {}
     }
-    if !q.order_by.is_empty() {
+    let hidden = matches!(&q.body, Body::Core(c) if c.order_by_distinct);
+    if !q.order_by.is_empty() && !hidden {
+        let partial = matches!(&q.body, Body::Core(c) if c.order_prefix > 0);
         out.push(PlanLine {
             depth,
-            text: "USE TEMP B-TREE FOR ORDER BY".into(),
+            text: if partial {
+                "USE TEMP B-TREE FOR RIGHT PART OF ORDER BY"
+            } else {
+                "USE TEMP B-TREE FOR ORDER BY"
+            }
+            .into(),
             cursor: None,
         });
     }

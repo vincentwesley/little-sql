@@ -42,6 +42,7 @@ pub use error::{Error, Result};
 pub use exec::Limits;
 pub use value::Value;
 pub mod check;
+pub mod cost;
 pub mod write;
 
 /// True when `sql` ends with a complete statement: its last token is a `;`

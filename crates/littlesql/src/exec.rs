@@ -283,6 +283,19 @@ fn row_key(row: &[Value], colls: &[Collation]) -> Vec<u8> {
     key
 }
 
+/// Collation and direction of field `i` of an index entry; the fields
+/// after the key (the rowid) compare as plain ascending values.
+fn key_info(index: &Index, i: usize) -> (Collation, bool) {
+    match index.cols.get(i) {
+        Some(c) => (c.collation, c.desc),
+        None => index
+            .extra_order
+            .get(i - index.cols.len())
+            .copied()
+            .unwrap_or((Collation::Binary, false)),
+    }
+}
+
 /// Order an index entry (its leading fields) against a search key.
 fn compare_entry(
     payload: &[u8],
@@ -292,19 +305,8 @@ fn compare_entry(
 ) -> Result<Ordering> {
     // The seek wants the entry compared with the key (the reverse of
     // compare_record_key's key-against-entry).
-    crate::record::compare_record_key(
-        payload,
-        key,
-        key.len(),
-        &|i| {
-            index
-                .cols
-                .get(i)
-                .map_or((Collation::Binary, false), |c| (c.collation, c.desc))
-        },
-        enc,
-    )
-    .map(Ordering::reverse)
+    crate::record::compare_record_key(payload, key, key.len(), &|i| key_info(index, i), enc)
+        .map(Ordering::reverse)
 }
 
 /// An index stores REAL column values that are whole numbers as integers;
@@ -1768,6 +1770,7 @@ impl<'a> Exec<'a> {
                 .into_iter()
                 .filter_map(|r| r.into_iter().next())
                 .collect(),
+            KeyExpr::Null => vec![Value::Null],
         })
     }
 
@@ -1784,7 +1787,7 @@ impl<'a> Exec<'a> {
             .key_exprs(k)?
             .into_iter()
             .map(|v| apply_cmp_aff(v, aff))
-            .filter(|v| !v.is_null())
+            .filter(|v| !v.is_null() || matches!(k, KeyExpr::Null))
             .collect();
         vals.sort_by(|a, b| a.compare(b, coll));
         vals.dedup_by(|a, b| a.compare(b, coll) == Ordering::Equal);
@@ -1805,8 +1808,8 @@ impl<'a> Exec<'a> {
         let index = &ix.index;
         let mut sets: Vec<Vec<Value>> = Vec::with_capacity(ix.eq.len());
         for (i, (k, aff)) in ix.eq.iter().enumerate() {
-            let ic = &index.cols[i];
-            let vals = self.key_set(k, *aff, ic.collation, ic.desc != reverse)?;
+            let (coll, desc) = key_info(index, i);
+            let vals = self.key_set(k, *aff, coll, desc != reverse)?;
             if vals.is_empty() {
                 return Ok(true);
             }
@@ -1871,8 +1874,7 @@ impl<'a> Exec<'a> {
         let enc = self.enc;
         let mask = self.used.get(cur).map(|m| m.as_slice());
         let m = key.len();
-        let range_col = index.cols.get(m);
-        let desc = range_col.is_some_and(|c| c.desc);
+        let desc = key_info(index, m).1;
         // In index order a DESC column runs from high values to low.
         let (first, last) = if desc { (hi, lo) } else { (lo, hi) };
         let (start, end) = if reverse {
@@ -1976,7 +1978,10 @@ impl<'a> Exec<'a> {
                     if ix.covering {
                         let mut out = vec![Value::Null; ncols + 1];
                         for (i, ic) in index.cols.iter().enumerate() {
-                            out[ic.col] = real_affinity(table, ic.col, vals[i].clone());
+                            // Expression keys have no column to fill.
+                            if ic.col < ncols {
+                                out[ic.col] = real_affinity(table, ic.col, vals[i].clone());
+                            }
                         }
                         if let Some(ipk) = table.ipk {
                             out[ipk] = Value::Int(rowid);
@@ -2020,16 +2025,17 @@ impl<'a> Exec<'a> {
     ) -> bool {
         for (i, k) in key.iter().enumerate() {
             match vals.get(i) {
-                Some(v) if v.compare(k, index.cols[i].collation) == Ordering::Equal => {}
+                Some(v) if v.compare(k, key_info(index, i).0) == Ordering::Equal => {}
                 _ => return false,
             }
         }
-        if let (Some(end), Some(rc)) = (end, index.cols.get(key.len())) {
+        if let Some(end) = end {
+            let (coll, desc) = key_info(index, key.len());
             let Some(v) = vals.get(key.len()) else {
                 return false;
             };
-            let mut o = v.compare(end, rc.collation);
-            if rc.desc {
+            let mut o = v.compare(end, coll);
+            if desc {
                 o = o.reverse();
             }
             // Forward scans stop past the end; backward scans before it.

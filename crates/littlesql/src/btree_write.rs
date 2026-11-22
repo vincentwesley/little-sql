@@ -144,6 +144,9 @@ pub struct Writer {
 }
 
 /// Bytes of b-tree page header for a page kind.
+/// The fewest bytes a cell occupies on a page.
+const MIN_CELL: usize = 4;
+
 fn header_len(kind: u8) -> usize {
     if kind & 8 != 0 {
         8
@@ -189,7 +192,7 @@ impl Writer {
         for i in 0..page.ncells() {
             let off = page.cell_offset(i)?;
             let cell = parse_cell(&page.data, off, kind, self.usable)?;
-            cells.push(page.data[off..off + cell.size].to_vec());
+            cells.push(page.data[off..off + cell.size.max(MIN_CELL)].to_vec());
         }
         Ok(Node {
             pgno,
@@ -321,6 +324,9 @@ impl Writer {
             let first = self.write_overflow(&payload[local..])?;
             cell.extend_from_slice(&first.to_be_bytes());
         }
+        // A cell takes at least 4 bytes on the page (SQLite's cellSize),
+        // which a one-field index entry such as [1] would not.
+        cell.resize(cell.len().max(MIN_CELL), 0);
         Ok(cell)
     }
 
@@ -875,7 +881,9 @@ impl Writer {
                 continue;
             }
             let off = page.cell_offset(k)?;
-            let len = parse_cell(&page.data, off, kind, self.usable)?.size;
+            let len = parse_cell(&page.data, off, kind, self.usable)?
+                .size
+                .max(MIN_CELL);
             content -= len;
             buf[content..content + len].copy_from_slice(&page.data[off..off + len]);
             buf[ptrs + 2 * j..ptrs + 2 * j + 2].copy_from_slice(&(content as u16).to_be_bytes());

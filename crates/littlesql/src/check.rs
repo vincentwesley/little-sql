@@ -138,13 +138,15 @@ impl Checker<'_> {
                     return;
                 }
             };
-            if off + cell.size > self.usable {
+            // A cell occupies at least 4 bytes, as in SQLite.
+            let size = cell.size.max(4);
+            if off + size > self.usable {
                 self.problem(format!(
                     "{what}: page {pgno} cell {i} extends past the page"
                 ));
                 return;
             }
-            spans.push((off, off + cell.size));
+            spans.push((off, off + size));
             if cell.overflow != 0 {
                 let rest = cell.payload_size - cell.local_len;
                 self.overflow(cell.overflow, rest, what);

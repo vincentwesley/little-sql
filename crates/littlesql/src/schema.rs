@@ -64,6 +64,9 @@ pub struct Index {
     /// for an index on a WITHOUT ROWID table, the primary key columns not
     /// already in the key. (Entries of other indexes end with the rowid.)
     pub extra: Vec<usize>,
+    /// Collation and direction of each `extra` column (from the primary
+    /// key of a WITHOUT ROWID table).
+    pub extra_order: Vec<(Collation, bool)>,
     /// True for the primary key of a WITHOUT ROWID table, whose "index" is
     /// the table b-tree itself.
     pub primary: bool,
@@ -643,6 +646,7 @@ impl Schema {
                                 usable,
                                 sql: Some(sql.clone()),
                                 extra: Vec::new(),
+                                extra_order: Vec::new(),
                                 primary: false,
                                 exprs,
                                 where_: ci.where_.clone(),
@@ -657,6 +661,7 @@ impl Schema {
                             usable: false,
                             sql: Some(sql.clone()),
                             extra: Vec::new(),
+                            extra_order: Vec::new(),
                             primary: false,
                             exprs: Vec::new(),
                             where_: None,
@@ -684,6 +689,7 @@ impl Schema {
                     usable: matched,
                     sql: None,
                     extra: Vec::new(),
+                    extra_order: Vec::new(),
                     primary: false,
                     exprs: Vec::new(),
                     where_: None,
@@ -697,10 +703,17 @@ impl Schema {
                     .indexes
                     .iter()
                     .map(|ix| {
-                        let extra = pk_cols
+                        let extra: Vec<usize> = pk_cols
                             .iter()
                             .copied()
                             .filter(|c| !ix.cols.iter().any(|ic| ic.col == *c))
+                            .collect();
+                        let extra_order = extra
+                            .iter()
+                            .map(|c| {
+                                let p = t.pk.iter().find(|p| p.col == *c).unwrap();
+                                (p.collation, p.desc)
+                            })
                             .collect();
                         Rc::new(Index {
                             name: ix.name.clone(),
@@ -711,6 +724,7 @@ impl Schema {
                             usable: ix.usable,
                             sql: ix.sql.clone(),
                             extra,
+                            extra_order,
                             primary: false,
                             exprs: ix.exprs.clone(),
                             where_: ix.where_.clone(),
@@ -726,6 +740,7 @@ impl Schema {
                     usable: true,
                     sql: None,
                     extra: t.storage_order[t.pk.len()..].to_vec(),
+                    extra_order: Vec::new(),
                     primary: true,
                     exprs: Vec::new(),
                     where_: None,
