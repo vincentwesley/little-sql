@@ -34,6 +34,7 @@ pub fn lookup_scalar(name: &str, nargs: usize) -> Result<Option<ScalarFn>> {
         ("round", 1, 2, f_round),
         ("typeof", 1, 1, f_typeof),
         ("hex", 1, 1, f_hex),
+        ("unhex", 1, 2, f_unhex),
         ("quote", 1, 1, f_quote),
         ("min", 2, N, f_min),
         ("max", 2, N, f_max),
@@ -56,6 +57,7 @@ pub fn lookup_scalar(name: &str, nargs: usize) -> Result<Option<ScalarFn>> {
         ("concat", 1, N, f_concat),
         ("concat_ws", 2, N, f_concat_ws),
         ("sqlite_version", 0, 0, f_version),
+        ("sqlite_source_id", 0, 0, f_version),
         ("ceil", 1, 1, f_ceil),
         ("ceiling", 1, 1, f_ceil),
         ("floor", 1, 1, f_floor),
@@ -542,6 +544,31 @@ fn f_hex(a: &[Value]) -> Result<Value> {
     Ok(Value::text(
         bytes.iter().map(|b| format!("{b:02X}")).collect::<String>(),
     ))
+}
+
+/// `unhex(X [, Y])`: the blob spelled by the hex digits of X, NULL if X
+/// is not pairs of hex digits; characters of Y may appear between pairs.
+fn f_unhex(a: &[Value]) -> Result<Value> {
+    if a.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    let x = a[0].to_text();
+    let pass = a.get(1).map(Value::to_text).unwrap_or_default();
+    let mut out = Vec::new();
+    let mut chars = x.chars();
+    while let Some(c) = chars.next() {
+        let Some(hi) = c.to_digit(16) else {
+            if pass.contains(c) {
+                continue;
+            }
+            return Ok(Value::Null);
+        };
+        let Some(lo) = chars.next().and_then(|c| c.to_digit(16)) else {
+            return Ok(Value::Null);
+        };
+        out.push((hi * 16 + lo) as u8);
+    }
+    Ok(Value::Blob(out.into()))
 }
 
 fn f_quote(a: &[Value]) -> Result<Value> {

@@ -73,6 +73,16 @@ pub enum Expr {
         else_: Option<Box<Expr>>,
     },
     Cast(Box<Expr>, Affinity),
+    /// Virtual generated column `col` of cursor `cur`: its expression with
+    /// the column's affinity applied, compared under its collation. On a
+    /// LEFT JOIN's null row it is NULL whatever the expression gives.
+    Gen {
+        e: Box<Expr>,
+        aff: Affinity,
+        coll: Collation,
+        cur: usize,
+        col: usize,
+    },
     Collate(Box<Expr>, Collation),
     Func {
         name: &'static str,
@@ -146,11 +156,19 @@ pub enum Body {
     },
     /// The current row of a recursive CTE, read inside its step.
     WorkTable(usize),
-    /// `json_each(args)` or `json_tree(args)` (`tree`).
+    /// A table-valued function: `json_each`, `json_tree` or `pragma_*`.
     TableFn {
-        tree: bool,
+        func: TableFunc,
         args: Vec<Expr>,
     },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum TableFunc {
+    JsonEach,
+    JsonTree,
+    /// A schema pragma, by name (see [`crate::pragma`]).
+    Pragma(&'static str),
 }
 
 pub enum KeySrc {
@@ -352,6 +370,7 @@ pub fn affinity(e: &Expr) -> Affinity {
     match e {
         Expr::Col { aff, .. } => *aff,
         Expr::Cast(_, aff) => *aff,
+        Expr::Gen { aff, .. } => *aff,
         Expr::Collate(inner, _) => affinity(inner),
         Expr::Subquery(s) => s.query.cols.first().map_or(Affinity::Blob, |c| c.aff),
         _ => Affinity::Blob,
@@ -362,7 +381,7 @@ pub fn affinity(e: &Expr) -> Affinity {
 pub fn collation(e: &Expr) -> Option<(Collation, bool)> {
     match e {
         Expr::Collate(_, c) => Some((*c, true)),
-        Expr::Col { coll, .. } => Some((*coll, false)),
+        Expr::Col { coll, .. } | Expr::Gen { coll, .. } => Some((*coll, false)),
         Expr::Cast(inner, _) | Expr::Unary(UnaryOp::Pos, inner) => collation(inner),
         Expr::Unary(_, inner) => collation(inner).filter(|c| c.1),
         Expr::Arith(_, l, r) => {
@@ -410,9 +429,11 @@ pub fn refs(e: &Expr, out: &mut Vec<usize>) {
     match e {
         Expr::Lit(_) | Expr::Agg { .. } | Expr::Window(_) => {}
         Expr::Col { cur, .. } => out.push(*cur),
-        Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) | Expr::Collate(a, _) => {
-            refs(a, out)
-        }
+        Expr::Unary(_, a)
+        | Expr::IsNull(a, _)
+        | Expr::Cast(a, _)
+        | Expr::Gen { e: a, .. }
+        | Expr::Collate(a, _) => refs(a, out),
         Expr::Arith(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
             refs(a, out);
             refs(b, out);
@@ -466,9 +487,11 @@ pub fn refs(e: &Expr, out: &mut Vec<usize>) {
 pub fn subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a Rc<Subquery>>) {
     match e {
         Expr::Lit(_) | Expr::Agg { .. } | Expr::Window(_) | Expr::Col { .. } => {}
-        Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) | Expr::Collate(a, _) => {
-            subqueries(a, out)
-        }
+        Expr::Unary(_, a)
+        | Expr::IsNull(a, _)
+        | Expr::Cast(a, _)
+        | Expr::Gen { e: a, .. }
+        | Expr::Collate(a, _) => subqueries(a, out),
         Expr::Arith(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
             subqueries(a, out);
             subqueries(b, out);
@@ -653,10 +676,15 @@ pub fn explain_query(q: &Query, depth: usize, out: &mut Vec<PlanLine>) {
                     query, correlated, ..
                 } = &s.kind
                 {
-                    if let Body::TableFn { args, .. } = &query.body {
-                        // SQLite's idxNum: bit 0 for the JSON argument,
-                        // bit 1 for the root path.
-                        let idx = if args.len() == 2 { 3 } else { 1 };
+                    if let Body::TableFn { args, func } = &query.body {
+                        // SQLite's idxNum: for JSON, bit 0 for the JSON
+                        // argument and bit 1 for the root path; pragmas
+                        // always 0.
+                        let idx = match func {
+                            TableFunc::Pragma(_) => 0,
+                            _ if args.len() == 2 => 3,
+                            _ => 1,
+                        };
                         out.push(PlanLine {
                             depth,
                             text: format!("SCAN {} VIRTUAL TABLE INDEX {idx}:", s.name),

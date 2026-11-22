@@ -475,8 +475,8 @@ fn add_column(
     if def.unique {
         return Err(Error::Sql("Cannot add a UNIQUE column".into()));
     }
-    if def.generated {
-        return Err(Error::Unsupported("generated columns".into()));
+    if def.generated.as_ref().is_some_and(|g| g.stored) {
+        return Err(Error::Runtime("cannot add a STORED column".into()));
     }
     if let Some(d) = &def.default {
         let constant = matches!(
@@ -494,7 +494,7 @@ fn add_column(
         &def.default,
         None | Some(crate::sql::ast::Expr::Literal(Value::Null))
     );
-    if def.not_null && null_default && rows > 0 {
+    if def.not_null && null_default && rows > 0 && def.generated.is_none() {
         return Err(Error::Sql(
             "Cannot add a NOT NULL column with default value NULL".into(),
         ));
@@ -546,6 +546,19 @@ fn drop_column(db: &Database, w: &Writer, t: &crate::schema::Table, col: &str) -
         return Err(Error::Sql(format!(
             "cannot drop PRIMARY KEY column: \"{col}\""
         )));
+    }
+    for (i, c) in t.columns.iter().enumerate() {
+        let Some(g) = c.generated.as_ref().filter(|_| i != ci) else {
+            continue;
+        };
+        let mut uses = false;
+        crate::schema::names_in(&g.expr, &mut |_, n| uses |= n.eq_ignore_ascii_case(col));
+        if uses {
+            return Err(Error::Runtime(format!(
+                "error in table {} after drop column: no such column: {col}",
+                t.name
+            )));
+        }
     }
     for ix in &t.indexes {
         if ix.cols.iter().any(|c| c.col == ci) {
@@ -658,8 +671,13 @@ fn drop_column(db: &Database, w: &Writer, t: &crate::schema::Table, col: &str) -
                 true,
             )?;
         } else {
-            row.remove(ci);
-            w.table_insert(t.root, rowid, &encode_record_enc(&row, enc))?;
+            let stored: Vec<Value> = row
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| *i != ci && !t.columns[*i].is_virtual())
+                .map(|(_, v)| v)
+                .collect();
+            w.table_insert(t.root, rowid, &encode_record_enc(&stored, enc))?;
         }
     }
     Ok(())

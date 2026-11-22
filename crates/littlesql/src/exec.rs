@@ -336,6 +336,19 @@ pub fn decode_table_row(
                 .cloned()
                 .unwrap_or_else(|| table.columns[*col].default_value.clone());
         }
+    } else if table.has_virtual() {
+        // The record holds only the stored columns; virtual ones are
+        // computed by the expressions the binder puts in their place.
+        let mut stored = Vec::new();
+        decode_record(payload, enc, usize::MAX, None, &mut stored)?;
+        let mut it = stored.into_iter();
+        for c in &table.columns {
+            vals.push(if c.is_virtual() {
+                Value::Null
+            } else {
+                it.next().unwrap_or_else(|| c.default_value.clone())
+            });
+        }
     } else {
         let want = match mask {
             Some(m) => m.iter().take(ncols).rposition(|u| *u).map_or(0, |p| p + 1),
@@ -541,12 +554,17 @@ impl<'a> Exec<'a> {
                 }
                 Ok(())
             }
-            Body::TableFn { tree, args } => {
+            Body::TableFn { func, args } => {
                 let vals = args
                     .iter()
                     .map(|e| self.eval(e))
                     .collect::<Result<Vec<_>>>()?;
-                for row in crate::json::table_rows(*tree, &vals)? {
+                let rows = match func {
+                    TableFunc::JsonEach => crate::json::table_rows(false, &vals)?,
+                    TableFunc::JsonTree => crate::json::table_rows(true, &vals)?,
+                    TableFunc::Pragma(name) => crate::pragma::table_rows(name, &vals)?,
+                };
+                for row in rows {
                     let keys = result_keys(&row);
                     if !emit(row, keys)? {
                         break;
@@ -2300,6 +2318,8 @@ impl<'a> Exec<'a> {
                 }
             }
             Expr::Cast(a, aff) => cast(self.eval(a)?, *aff),
+            Expr::Gen { cur, .. } if self.rows[*cur].is_empty() => Value::Null,
+            Expr::Gen { e, aff, .. } => self.eval(e)?.apply_affinity(*aff),
             Expr::Func { f, args, .. } => {
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {

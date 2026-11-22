@@ -418,7 +418,7 @@ impl<'a> Parser<'a> {
                 let def = self.column_def()?;
                 let end = self.toks[self.pos - 1].end;
                 AlterAction::AddColumn {
-                    def,
+                    def: Box::new(def),
                     text: self.sql[start..end].to_string(),
                 }
             } else if self.eat_kw("DROP") {
@@ -933,8 +933,9 @@ impl<'a> Parser<'a> {
             not_null: false,
             unique: false,
             default: None,
+            default_text: None,
             collation: None,
-            generated: false,
+            generated: None,
             checks: Vec::new(),
         };
         loop {
@@ -965,13 +966,23 @@ impl<'a> Parser<'a> {
                 let check = self.check_body(cname)?;
                 col.checks.push(check);
             } else if self.eat_kw("DEFAULT") {
-                col.default = Some(if self.eat_op("(") {
-                    let e = self.expr()?;
-                    self.expect_op(")")?;
-                    e
+                let paren = self.eat_op("(");
+                let start = self.toks[self.pos].start;
+                let e = if paren {
+                    self.expr()?
                 } else {
                     self.expr_bp(12)?
-                });
+                };
+                let end = if paren {
+                    self.toks[self.pos].start
+                } else {
+                    self.toks[self.pos - 1].end
+                };
+                if paren {
+                    self.expect_op(")")?;
+                }
+                col.default_text = Some(self.sql[start..end].trim().to_string());
+                col.default = Some(e);
             } else if self.eat_kw("COLLATE") {
                 col.collation = Some(self.ident()?);
             } else if self.eat_kw("REFERENCES") {
@@ -982,10 +993,13 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_kw("AS")?;
                 self.expect_op("(")?;
-                self.expr()?;
+                let expr = self.expr()?;
                 self.expect_op(")")?;
-                let _ = self.eat_kw("STORED") || self.eat_kw("VIRTUAL");
-                col.generated = true;
+                let stored = self.eat_kw("STORED");
+                if !stored {
+                    self.eat_kw("VIRTUAL");
+                }
+                col.generated = Some(Generated { expr, stored });
             } else {
                 return Ok(col);
             }

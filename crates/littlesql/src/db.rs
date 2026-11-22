@@ -14,15 +14,6 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-/// A column's type as `PRAGMA table_info` shows it: SQLite spells the six
-/// type names it knows (those STRICT tables accept) in upper case.
-fn table_info_type(t: &str) -> String {
-    match t.to_ascii_uppercase().as_str() {
-        u @ ("ANY" | "BLOB" | "INT" | "INTEGER" | "REAL" | "TEXT") => u.to_string(),
-        _ => t.to_string(),
-    }
-}
-
 /// The absolute form of a path, as `PRAGMA database_list` reports it.
 fn absolute(path: &Path) -> String {
     std::fs::canonicalize(path)
@@ -288,7 +279,9 @@ impl Database {
         for f in self.files.borrow().iter() {
             parts.push((f.name.clone(), Rc::new(Schema::load(&f.pager)?)));
         }
-        *self.schema.borrow_mut() = Rc::new(Schema::merge(&parts));
+        let mut merged = Schema::merge(&parts);
+        merged.paths = self.files.borrow().iter().map(|f| f.path.clone()).collect();
+        *self.schema.borrow_mut() = Rc::new(merged);
         Ok(())
     }
 
@@ -349,7 +342,7 @@ impl Database {
             let before = self.pager.stats.page_reads.get();
             let mut ex = Exec::new(self.pager.clone(), &plan);
             ex.set_limits(self.limits.get());
-            rs.rows = ex.collect(&plan.query)?;
+            rs.rows = crate::pragma::with_schema(schema.clone(), || ex.collect(&plan.query))?;
             rs.stats = ex.stats;
             rs.page_reads = self.pager.stats.page_reads.get() - before;
         }
@@ -471,81 +464,11 @@ impl Database {
                     ..Default::default()
                 })
             }
-            "table_info" => {
-                let t = match value {
-                    Some(v) => schema.table_in(db, v)?,
-                    None => None,
-                };
-                let mut rows = Vec::new();
-                if let Some(t) = t {
-                    for (i, c) in t.columns.iter().enumerate() {
-                        let pk = if t.ipk == Some(i) {
-                            1
-                        } else {
-                            t.pk.iter()
-                                .position(|k| k.col == i)
-                                .map_or(0, |p| p as i64 + 1)
-                        };
-                        rows.push(vec![
-                            Value::Int(i as i64),
-                            Value::text(&c.name),
-                            Value::text(table_info_type(&c.decl_type)),
-                            Value::Int(c.not_null as i64),
-                            c.default
-                                .as_ref()
-                                .map_or(Value::Null, |_| Value::text(c.default_value.to_text())),
-                            Value::Int(pk),
-                        ]);
-                    }
-                }
+            n if crate::pragma::columns(n).is_some() => {
+                let (cols, _) = crate::pragma::columns(n).unwrap();
                 Ok(ResultSet {
-                    columns: ["cid", "name", "type", "notnull", "dflt_value", "pk"]
-                        .map(String::from)
-                        .to_vec(),
-                    rows,
-                    ..Default::default()
-                })
-            }
-            "index_list" => {
-                let mut rows = Vec::new();
-                if let Some(t) = match value {
-                    Some(v) => schema.table_in(db, v)?,
-                    None => None,
-                } {
-                    for (i, ix) in t.indexes.iter().enumerate() {
-                        rows.push(vec![
-                            Value::Int(i as i64),
-                            Value::text(&ix.name),
-                            Value::Int(ix.unique as i64),
-                            Value::text(if ix.sql.is_some() { "c" } else { "u" }),
-                            Value::Int(0),
-                        ]);
-                    }
-                }
-                Ok(ResultSet {
-                    columns: ["seq", "name", "unique", "origin", "partial"]
-                        .map(String::from)
-                        .to_vec(),
-                    rows,
-                    ..Default::default()
-                })
-            }
-            "database_list" => {
-                let mut rows = Vec::new();
-                for (i, f) in self.files.borrow().iter().enumerate() {
-                    // temp is listed once it holds something.
-                    if f.name == "temp" && f.pager.page_count() == 0 {
-                        continue;
-                    }
-                    rows.push(vec![
-                        Value::Int(i as i64),
-                        Value::text(&f.name),
-                        Value::text(&f.path),
-                    ]);
-                }
-                Ok(ResultSet {
-                    columns: ["seq", "name", "file"].map(String::from).to_vec(),
-                    rows,
+                    columns: cols.iter().map(|c| c.to_string()).collect(),
+                    rows: crate::pragma::rows(&schema, db, n, value).unwrap()?,
                     ..Default::default()
                 })
             }

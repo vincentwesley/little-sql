@@ -558,8 +558,9 @@ fn create_table(db: &Database, ct: &CreateTable, text: &str) -> Result<ResultSet
                     not_null: false,
                     unique: false,
                     default: None,
+                    default_text: None,
                     collation: None,
-                    generated: false,
+                    generated: None,
                     checks: Vec::new(),
                 });
             }
@@ -579,11 +580,13 @@ fn create_table(db: &Database, ct: &CreateTable, text: &str) -> Result<ResultSet
         }
         None => (ct.clone(), stored_sql(text, "TABLE")?, None),
     };
-    if ct.columns.iter().any(|c| c.generated) {
-        return Err(Error::Unsupported("generated columns".into()));
-    }
     // Validate the definition the same way the schema loader will.
     let table = crate::schema::table_from_ast(&ct, &ct.name, 0, &sql)?;
+    for c in &table.columns {
+        if let Some(g) = &c.generated {
+            check_index_expr(db, &table, &g.expr, "generated columns")?;
+        }
+    }
     let root = w.create_tree(ct.without_rowid)?;
     schema_insert(db, &w, "table", &ct.name, &ct.name, root, Some(&sql))?;
     let keys = crate::schema::auto_index_keys(&ct, &table)?;
@@ -695,7 +698,7 @@ fn create_index(db: &Database, ci: &CreateIndex, text: &str) -> Result<ResultSet
         .find(|i| i.name.eq_ignore_ascii_case(&ci.name))
         .cloned()
         .ok_or_else(|| Error::Sql(format!("index {} could not be read back", ci.name)))?;
-    for (rowid, row) in all_rows(&table)? {
+    for (rowid, row) in all_rows(db, &table)? {
         let ins = Inserter::new(db, &table, OnConflict::Abort)?;
         ins.check_unique_one(&index, &row, rowid)?;
         ins.add_index_entry(&index, &row, rowid)?;
@@ -851,7 +854,7 @@ fn drop(db: &Database, kind: DropKind, if_exists: bool, name: &str) -> Result<Re
             }
             if t.autoincrement {
                 if let Some(seq) = schema.table("sqlite_sequence").cloned() {
-                    for (rowid, row) in all_rows(&seq)? {
+                    for (rowid, row) in all_rows(db, &seq)? {
                         if row[0].to_text().eq_ignore_ascii_case(name) {
                             w.table_delete(seq.root, rowid)?;
                         }
@@ -1196,9 +1199,47 @@ fn trigger_row(
 
 // ---------------------------------------------------------------- rows
 
+/// Compute a row's generated columns (only the virtual ones when
+/// `only_virtual`), each after those it reads, with its affinity applied.
+fn fill_generated(
+    db: &Database,
+    table: &Table,
+    row: &mut [Value],
+    only_virtual: bool,
+) -> Result<()> {
+    for &i in &table.gen_order {
+        let c = &table.columns[i];
+        let Some(g) = &c.generated else { continue };
+        if only_virtual && g.stored {
+            continue;
+        }
+        let ctx = crate::bind::RowContext {
+            name: table.name.clone(),
+            columns: table.columns.iter().map(|c| c.name.clone()).collect(),
+            values: row.to_vec(),
+            rowid: None,
+            bare: true,
+        };
+        let rs = crate::bind::with_row_contexts(vec![ctx], || {
+            db.run_select(
+                &select_of(vec![result(g.expr.clone())], Vec::new(), None),
+                true,
+            )
+        })?;
+        let v = rs
+            .rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next())
+            .unwrap_or(Value::Null);
+        row[i] = v.apply_affinity(c.affinity);
+    }
+    Ok(())
+}
+
 /// Every row of a table as (rowid, column values); rowid is 0 for
 /// WITHOUT ROWID tables.
-fn all_rows(table: &Table) -> Result<Vec<(i64, Vec<Value>)>> {
+fn all_rows(db: &Database, table: &Table) -> Result<Vec<(i64, Vec<Value>)>> {
     let enc = table.file().encoding();
     let mut out = Vec::new();
     let mut c = Cursor::new(table.file().clone(), table.root);
@@ -1206,7 +1247,9 @@ fn all_rows(table: &Table) -> Result<Vec<(i64, Vec<Value>)>> {
     while c.valid() {
         let rowid = if table.without_rowid { 0 } else { c.rowid()? };
         let row = crate::exec::decode_table_row(table, c.payload()?.as_slice(), rowid, enc, None)?;
-        out.push((rowid, row[..table.columns.len()].to_vec()));
+        let mut row = row[..table.columns.len()].to_vec();
+        fill_generated(db, table, &mut row, true)?;
+        out.push((rowid, row));
         c.next()?;
     }
     Ok(out)
@@ -1352,8 +1395,10 @@ impl<'d> Inserter<'d> {
             Con::PrimaryKey => {
                 let pk = self.table.pk_index.clone().unwrap();
                 let key: Vec<Value> = pk.cols.iter().map(|c| row[c.col].clone()).collect();
-                self.find_entry(&pk, &key)?
-                    .map(|found| (0, self.wr_row(&found)))
+                match self.find_entry(&pk, &key)? {
+                    Some(found) => Some((0, self.wr_row(&found)?)),
+                    None => None,
+                }
             }
             Con::Index(ix) => {
                 let me = if self.table.without_rowid { 0 } else { rowid };
@@ -1509,7 +1554,9 @@ impl<'d> Inserter<'d> {
                 self.enc,
                 None,
             )?;
-            return Ok(Some(row[..self.table.columns.len()].to_vec()));
+            let mut row = row[..self.table.columns.len()].to_vec();
+            fill_generated(self.db, &self.table, &mut row, true)?;
+            return Ok(Some(row));
         }
         Ok(None)
     }
@@ -1579,7 +1626,10 @@ impl<'d> Inserter<'d> {
             }
             let pkey: Vec<Value> = pk.cols.iter().map(|c| full[c.col].clone()).collect();
             let existing = self.find_entry(&pk, &pkey)?;
-            return Ok(existing.map(|e| (0, self.wr_row(&e))));
+            return match existing {
+                Some(e) => Ok(Some((0, self.wr_row(&e)?))),
+                None => Ok(None),
+            };
         }
         let Some(Value::Int(other)) = entry.last().cloned() else {
             return Ok(None);
@@ -1591,12 +1641,13 @@ impl<'d> Inserter<'d> {
     }
 
     /// A WITHOUT ROWID row from its stored record (storage order).
-    fn wr_row(&self, stored: &[Value]) -> Vec<Value> {
+    fn wr_row(&self, stored: &[Value]) -> Result<Vec<Value>> {
         let mut row = vec![Value::Null; self.table.columns.len()];
         for (i, c) in self.table.storage_order.iter().enumerate() {
             row[*c] = stored.get(i).cloned().unwrap_or(Value::Null);
         }
-        row
+        fill_generated(self.db, &self.table, &mut row, true)?;
+        Ok(row)
     }
 
     fn unique_error(&self, index: &Index) -> Error {
@@ -1621,10 +1672,21 @@ impl<'d> Inserter<'d> {
 
     /// Apply column affinities and defaults' NOT NULL rules to a full row.
     /// Returns None when the row is to be skipped (OR IGNORE).
-    fn prepare(&self, mut row: Vec<Value>) -> Result<Option<Vec<Value>>> {
+    fn prepare(&self, mut row: Vec<Value>, given: Option<i64>) -> Result<Option<Vec<Value>>> {
         for (i, c) in self.table.columns.iter().enumerate() {
             let v = std::mem::replace(&mut row[i], Value::Null);
             row[i] = v.apply_affinity(c.affinity);
+        }
+        if !self.table.gen_order.is_empty() {
+            // Generated columns see the rowid the row will get.
+            if let Some(ipk) = self.table.ipk {
+                if row[ipk].is_null() {
+                    row[ipk] = Value::Int(self.new_rowid(&row, given)?);
+                }
+            }
+            fill_generated(self.db, &self.table, &mut row, false)?;
+        }
+        for (i, c) in self.table.columns.iter().enumerate() {
             if self.table.strict {
                 let decl = c.decl_type.to_ascii_uppercase();
                 let ok = matches!(
@@ -1752,7 +1814,7 @@ impl<'d> Inserter<'d> {
         let Some(seq) = self.db.target_schema().table("sqlite_sequence").cloned() else {
             return Ok(None);
         };
-        for (_, row) in all_rows(&seq)? {
+        for (_, row) in all_rows(self.db, &seq)? {
             if row[0].to_text().eq_ignore_ascii_case(&self.table.name) {
                 return Ok(Some(row[1].to_int()));
             }
@@ -1768,7 +1830,7 @@ impl<'d> Inserter<'d> {
             return Ok(());
         };
         let mut found = None;
-        for (rid, row) in all_rows(&seq)? {
+        for (rid, row) in all_rows(self.db, &seq)? {
             if row[0].to_text().eq_ignore_ascii_case(&self.table.name) {
                 found = Some((rid, row[1].to_int()));
             }
@@ -1829,7 +1891,7 @@ impl<'d> Inserter<'d> {
         row: Vec<Value>,
         given_rowid: Option<i64>,
     ) -> Result<Option<(i64, Vec<Value>)>> {
-        let Some(mut row) = self.prepare(row)? else {
+        let Some(mut row) = self.prepare(row, given_rowid)? else {
             return Ok(None);
         };
         let rowid = if self.table.without_rowid {
@@ -1855,7 +1917,7 @@ impl<'d> Inserter<'d> {
         // `excluded` is the row as proposed: defaults filled in, no
         // affinity yet (what SQLite shows).
         let proposed = row.clone();
-        let Some(mut row) = self.prepare(row)? else {
+        let Some(mut row) = self.prepare(row, given_rowid)? else {
             return Ok(Inserted::Skipped);
         };
         let rowid = if self.table.without_rowid {
@@ -1901,6 +1963,14 @@ impl<'d> Inserter<'d> {
             let mut vals = row.to_vec();
             if let Some(ipk) = self.table.ipk {
                 vals[ipk] = Value::Null;
+            }
+            if self.table.has_virtual() {
+                vals = vals
+                    .into_iter()
+                    .zip(&self.table.columns)
+                    .filter(|(_, c)| !c.is_virtual())
+                    .map(|(v, _)| v)
+                    .collect();
             }
             // Trailing NULLs are still stored: SQLite keeps every column.
             let rec = encode_record_enc(&vals, self.enc);
@@ -2048,12 +2118,22 @@ fn insert(db: &Database, ins: &ast::Insert) -> Result<ResultSet> {
     let triggered = has_triggers(db, &table.name, Event::Insert);
     let ncols = table.columns.len();
     // Which table column each supplied value goes to (None: the rowid).
+    // Generated columns take no values.
     let targets: Vec<Option<usize>> = if ins.columns.is_empty() {
-        (0..ncols).map(Some).collect()
+        (0..ncols)
+            .filter(|i| table.columns[*i].generated.is_none())
+            .map(Some)
+            .collect()
     } else {
         let mut t = Vec::new();
         for c in &ins.columns {
             match table.column_index(c) {
+                Some(i) if table.columns[i].generated.is_some() => {
+                    return Err(Error::Sql(format!(
+                        "cannot INSERT into generated column \"{}\"",
+                        table.columns[i].name
+                    )))
+                }
                 Some(i) => t.push(Some(i)),
                 None if !table.without_rowid
                     && ["rowid", "_rowid_", "oid"]
@@ -2081,7 +2161,7 @@ fn insert(db: &Database, ins: &ast::Insert) -> Result<ResultSet> {
                         format!(
                             "table {} has {} columns but {} values were supplied",
                             table.name,
-                            ncols,
+                            targets.len(),
                             bad.len()
                         )
                     } else {
@@ -2095,7 +2175,7 @@ fn insert(db: &Database, ins: &ast::Insert) -> Result<ResultSet> {
                     format!(
                         "table {} has {} columns but {} values were supplied",
                         table.name,
-                        ncols,
+                        targets.len(),
                         rs.columns.len()
                     )
                 } else {
@@ -2212,6 +2292,12 @@ fn insert(db: &Database, ins: &ast::Insert) -> Result<ResultSet> {
                 let mut targets = Vec::new();
                 for (name, _) in sets {
                     match table.column_index(name) {
+                        Some(i) if table.columns[i].generated.is_some() => {
+                            return Err(Error::Sql(format!(
+                                "cannot UPDATE generated column \"{}\"",
+                                table.columns[i].name
+                            )))
+                        }
                         Some(i) => targets.push(Some(i)),
                         None if !table.without_rowid && is_rowid_word(name) => targets.push(None),
                         None => return Err(Error::Sql(format!("no such column: {name}"))),
@@ -2459,6 +2545,12 @@ fn update(db: &Database, up: &ast::Update) -> Result<ResultSet> {
     let mut sets: Vec<(Option<usize>, AExpr)> = Vec::new();
     for (name, e) in &up.sets {
         match table.column_index(name) {
+            Some(i) if table.columns[i].generated.is_some() => {
+                return Err(Error::Sql(format!(
+                    "cannot UPDATE generated column \"{}\"",
+                    table.columns[i].name
+                )))
+            }
             Some(i) => sets.push((Some(i), e.clone())),
             None if !table.without_rowid
                 && ["rowid", "_rowid_", "oid"]
@@ -2531,7 +2623,7 @@ fn apply_update(
             row[ipk] = Value::Int(new_rowid);
         }
     }
-    let Some(mut row) = ins.prepare(row)? else {
+    let Some(mut row) = ins.prepare(row, Some(new_rowid))? else {
         return Ok(None);
     };
     if let Some(ipk) = table.ipk {

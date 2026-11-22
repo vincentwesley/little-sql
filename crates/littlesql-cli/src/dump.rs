@@ -138,7 +138,18 @@ pub fn dump(db: &Database, pattern: Option<&str>) -> Result<String, String> {
         } else {
             out.push_str(&format!("{sql};\n"));
         }
-        let rows = q(&format!("SELECT * FROM {}", quote_name(&name)))?;
+        // Generated columns are left out: they are computed again.
+        let cols = q(&format!("PRAGMA table_info({})", quote_name(&name)))?;
+        let list: Vec<String> = cols.iter().map(|c| quote_name(&c[1].to_text())).collect();
+        let rows = q(&format!(
+            "SELECT {} FROM {}",
+            if list.is_empty() {
+                "*".to_string()
+            } else {
+                list.join(",")
+            },
+            quote_name(&name)
+        ))?;
         for r in rows {
             let vals: Vec<String> = r.iter().map(dump_value).collect();
             out.push_str(&format!(

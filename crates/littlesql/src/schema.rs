@@ -27,6 +27,17 @@ pub struct Column {
     /// The DEFAULT as a constant, used for rows written before the column
     /// was added by `ALTER TABLE ADD COLUMN`.
     pub default_value: Value,
+    /// `AS (expr) [STORED | VIRTUAL]`.
+    pub generated: Option<ast::Generated>,
+    /// The DEFAULT as written.
+    pub default_text: Option<String>,
+}
+
+impl Column {
+    /// A generated column whose value is computed, not stored.
+    pub fn is_virtual(&self) -> bool {
+        self.generated.as_ref().is_some_and(|g| !g.stored)
+    }
 }
 
 /// One key column of an index (or of a WITHOUT ROWID primary key).
@@ -97,9 +108,16 @@ pub struct Table {
     pub pager: Option<Rc<Pager>>,
     /// A STRICT table: each column's value must have its declared type.
     pub strict: bool,
+    /// Generated columns in the order their values are computed.
+    pub gen_order: Vec<usize>,
 }
 
 impl Table {
+    /// Whether some column is generated and not stored.
+    pub fn has_virtual(&self) -> bool {
+        self.columns.iter().any(Column::is_virtual)
+    }
+
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns
             .iter()
@@ -169,6 +187,8 @@ pub struct Schema {
     /// schema by name, in `PRAGMA database_list` order (main, temp, then
     /// attached files). Empty for a single file's schema.
     pub dbs: Vec<(String, Rc<Schema>)>,
+    /// For the merged schema: each file's path, in the order of `dbs`.
+    pub paths: Vec<String>,
 }
 
 fn lower(s: &str) -> String {
@@ -261,12 +281,87 @@ pub(crate) fn auto_index_keys(ct: &CreateTable, table: &Table) -> Result<Vec<Vec
     Ok(keys)
 }
 
+/// Call `f` with the (qualifier, name) of every column name in `e`.
+pub(crate) fn names_in(e: &ast::Expr, f: &mut dyn FnMut(Option<&str>, &str)) {
+    if let ast::Expr::Name { table, name, .. } = e {
+        f(table.as_deref(), name);
+    }
+    ast::for_each_child(e, &mut |c| names_in(c, f));
+}
+
+/// The order in which generated columns are computed: each after the
+/// generated columns it reads. A cycle is an error naming the last
+/// column of the final pass that could not be computed, as SQLite does.
+fn generated_order(columns: &[Column]) -> Result<Vec<usize>> {
+    let mut pending: Vec<usize> = (0..columns.len())
+        .filter(|i| columns[*i].generated.is_some())
+        .collect();
+    let mut order = Vec::new();
+    loop {
+        let mut progress = false;
+        let mut redo = None;
+        let mut still = Vec::new();
+        for &i in &pending {
+            let g = columns[i].generated.as_ref().unwrap();
+            let mut blocked = false;
+            names_in(&g.expr, &mut |_, n| {
+                if let Some(j) = columns.iter().position(|c| c.name.eq_ignore_ascii_case(n)) {
+                    if j == i || (pending.contains(&j) && !order.contains(&j)) {
+                        blocked = true;
+                    }
+                }
+            });
+            if blocked {
+                redo = Some(i);
+                still.push(i);
+            } else {
+                progress = true;
+                order.push(i);
+            }
+        }
+        pending = still;
+        match redo {
+            None => return Ok(order),
+            Some(i) if !progress => {
+                return Err(Error::Runtime(format!(
+                    "generated column loop on \"{}\"",
+                    columns[i].name
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+}
+
 /// Build a table definition from its parsed `CREATE TABLE`.
 pub fn table_from_ast(ct: &CreateTable, name: &str, root: u32, sql: &str) -> Result<Table> {
     let mut columns = Vec::new();
     for c in &ct.columns {
-        if c.generated {
-            return Err(Error::Unsupported("generated columns".into()));
+        if let Some(g) = &c.generated {
+            if c.default.is_some() {
+                return Err(Error::Sql(
+                    "cannot use DEFAULT on a generated column".into(),
+                ));
+            }
+            if c.primary_key {
+                return Err(Error::Sql(
+                    "generated columns cannot be part of the PRIMARY KEY".into(),
+                ));
+            }
+            let mut bad = None;
+            names_in(&g.expr, &mut |t, n| {
+                let ok = t.is_none_or(|t| t.eq_ignore_ascii_case(name))
+                    && ct.columns.iter().any(|c| c.name.eq_ignore_ascii_case(n));
+                if !ok && bad.is_none() {
+                    bad = Some(match t {
+                        Some(t) => format!("{t}.{n}"),
+                        None => n.to_string(),
+                    });
+                }
+            });
+            if let Some(b) = bad {
+                return Err(Error::Sql(format!("no such column: {b}")));
+            }
         }
         columns.push(Column {
             name: c.name.clone(),
@@ -276,8 +371,16 @@ pub fn table_from_ast(ct: &CreateTable, name: &str, root: u32, sql: &str) -> Res
             not_null: c.not_null,
             default_value: c.default.as_ref().map(const_default).unwrap_or(Value::Null),
             default: c.default.clone(),
+            generated: c.generated.clone(),
+            default_text: c.default_text.clone(),
         });
     }
+    if !columns.is_empty() && columns.iter().all(|c| c.generated.is_some()) {
+        return Err(Error::Sql(
+            "must have at least one non-generated column".into(),
+        ));
+    }
+    let gen_order = generated_order(&columns)?;
     let mut table = Table {
         name: name.to_string(),
         root,
@@ -308,6 +411,7 @@ pub fn table_from_ast(ct: &CreateTable, name: &str, root: u32, sql: &str) -> Res
         row_estimate: Cell::new(None),
         pager: None,
         strict: ct.strict,
+        gen_order,
     };
     if ct.strict {
         for c in table.columns.iter_mut() {
@@ -379,7 +483,7 @@ pub fn table_from_ast(ct: &CreateTable, name: &str, root: u32, sql: &str) -> Res
             }
         }
         for i in 0..table.columns.len() {
-            if !order.contains(&i) {
+            if !order.contains(&i) && !table.columns[i].is_virtual() {
                 order.push(i);
             }
         }

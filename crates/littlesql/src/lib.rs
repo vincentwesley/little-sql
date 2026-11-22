@@ -29,6 +29,7 @@ pub mod func;
 pub mod json;
 pub mod pager;
 pub mod plan;
+pub mod pragma;
 pub mod record;
 pub mod schema;
 pub mod sql;

@@ -450,10 +450,21 @@ pub struct ColumnDef {
     pub not_null: bool,
     pub unique: bool,
     pub default: Option<Expr>,
+    /// The DEFAULT as written (inside its parentheses, if any), as
+    /// `PRAGMA table_info` shows it.
+    pub default_text: Option<String>,
     pub collation: Option<String>,
-    pub generated: bool,
+    /// `AS (expr) [STORED | VIRTUAL]`.
+    pub generated: Option<Generated>,
     /// Column-level CHECK constraints.
     pub checks: Vec<Check>,
+}
+
+/// A generated column's expression and whether its value is stored.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Generated {
+    pub expr: Expr,
+    pub stored: bool,
 }
 
 /// A CHECK constraint: its name (if given), expression and source text.
@@ -600,7 +611,7 @@ pub enum AlterAction {
     /// The definition, and its text as written (it is spliced into the
     /// stored CREATE TABLE).
     AddColumn {
-        def: ColumnDef,
+        def: Box<ColumnDef>,
         text: String,
     },
     DropColumn(String),

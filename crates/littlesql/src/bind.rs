@@ -30,6 +30,10 @@ struct ScopeCol {
     nostar: bool,
 }
 
+/// Per column of a table, the bound expression of a virtual generated
+/// column and the (cursor, column) pairs it reads.
+type GenCols = Vec<Option<(Expr, Vec<(usize, usize)>)>>;
+
 struct ScopeSource {
     cursor: usize,
     /// Lower-cased alias or table name; empty for an unnamed subquery.
@@ -43,6 +47,9 @@ struct ScopeSource {
     /// For each virtual column, the (cursor, column) pairs it reads; they
     /// are marked as used only when the column itself is used.
     virt_used: Vec<Vec<(usize, usize)>>,
+    /// For a table with virtual generated columns: per column, the bound
+    /// expression that computes it and the (cursor, column) pairs it reads.
+    gen: GenCols,
 }
 
 #[derive(Default)]
@@ -615,6 +622,7 @@ impl<'a> Binder<'a> {
         let src = ScopeSource {
             virt_used: Vec::new(),
             virt: None,
+            gen: Vec::new(),
             cursor,
             name: lower(&name),
             cols: table
@@ -634,6 +642,10 @@ impl<'a> Binder<'a> {
                 Some(ncols)
             },
         };
+        let mut src = src;
+        if table.has_virtual() {
+            src.gen = self.bind_generated(table, cursor);
+        }
         (
             Item {
                 cursor,
@@ -646,6 +658,61 @@ impl<'a> Binder<'a> {
             },
             src,
         )
+    }
+
+    /// Bind the expressions of a table's virtual generated columns over
+    /// the table's cursor, in the order they depend on each other.
+    fn bind_generated(&mut self, table: &Rc<Table>, cursor: usize) -> GenCols {
+        let refs_len = self.refs.len();
+        let before = self.used.clone();
+        let virt_hit = self.virt_hit.take();
+        let mut gen: GenCols = vec![None; table.columns.len()];
+        for &i in &table.gen_order {
+            let c = &table.columns[i];
+            let Some(g) = c.generated.as_ref().filter(|g| !g.stored) else {
+                continue;
+            };
+            let tmp = ScopeSource {
+                cursor,
+                name: lower(&table.name),
+                cols: table
+                    .columns
+                    .iter()
+                    .map(|c| ScopeCol {
+                        name: c.name.clone(),
+                        aff: c.affinity,
+                        coll: c.collation,
+                        hidden: false,
+                        nostar: false,
+                    })
+                    .collect(),
+                rowid: None,
+                virt: None,
+                virt_used: Vec::new(),
+                gen: gen.clone(),
+            };
+            self.scopes.push(Scope {
+                sources: vec![tmp],
+                aliases: Vec::new(),
+            });
+            let bound = self.bind_expr(&g.expr);
+            self.scopes.pop();
+            let e = bound.unwrap_or(Expr::Lit(Value::Null));
+            let uses = self.take_new_uses(&before);
+            gen[i] = Some((
+                Expr::Gen {
+                    e: Box::new(e),
+                    aff: c.affinity,
+                    coll: c.collation,
+                    cur: cursor,
+                    col: i,
+                },
+                uses,
+            ));
+        }
+        self.refs.truncate(refs_len);
+        self.virt_hit = virt_hit;
+        gen
     }
 
     fn query_source(
@@ -680,6 +747,7 @@ impl<'a> Binder<'a> {
         let src = ScopeSource {
             virt_used: Vec::new(),
             virt: None,
+            gen: Vec::new(),
             cursor,
             name: lower(name),
             cols,
@@ -843,16 +911,31 @@ impl<'a> Binder<'a> {
         args: &[ast::Expr],
         scope: &mut Scope,
     ) -> Result<(Item, ScopeSource)> {
-        let tree = match lower(name).as_str() {
-            "json_each" => false,
-            "json_tree" => true,
+        let lname = lower(name);
+        let pragma = lname
+            .strip_prefix("pragma_")
+            .and_then(|p| crate::pragma::PRAGMAS.iter().find(|(n, _, _)| *n == p));
+        let func = match (lname.as_str(), pragma) {
+            ("json_each", _) => TableFunc::JsonEach,
+            ("json_tree", _) => TableFunc::JsonTree,
+            (_, Some((n, _, _))) => TableFunc::Pragma(n),
             _ => return Err(Error::Sql(format!("no such table: {name}"))),
         };
-        if args.is_empty() || args.len() > 2 {
-            return Err(Error::Sql(format!(
-                "wrong number of arguments to function {}()",
-                lower(name)
-            )));
+        match pragma {
+            Some((_, _, takes_arg)) => {
+                let max = if *takes_arg { 2 } else { 0 };
+                if args.len() > max {
+                    return Err(Error::Sql(format!(
+                        "too many arguments on {lname}() - max {max}"
+                    )));
+                }
+            }
+            None if args.is_empty() || args.len() > 2 => {
+                return Err(Error::Sql(format!(
+                    "wrong number of arguments to function {lname}()"
+                )));
+            }
+            None => {}
         }
         let mark = self.refs.len();
         self.scopes.push(std::mem::take(scope));
@@ -870,7 +953,16 @@ impl<'a> Binder<'a> {
             d
         };
         let correlated = !self.refs[mark..].is_empty();
-        let cols = crate::json::TABLE_COLUMNS
+        let names: Vec<&str> = match pragma {
+            Some((_, cols, true)) => cols.iter().copied().chain(["arg", "schema"]).collect(),
+            Some((_, cols, false)) => cols.to_vec(),
+            None => crate::json::TABLE_COLUMNS.to_vec(),
+        };
+        let visible = match pragma {
+            Some((_, cols, _)) => cols.len(),
+            None => 8,
+        };
+        let cols = names
             .iter()
             .map(|n| ColInfo {
                 name: n.to_string(),
@@ -879,7 +971,7 @@ impl<'a> Binder<'a> {
             })
             .collect();
         let q = Query {
-            body: Body::TableFn { tree, args: bound },
+            body: Body::TableFn { func, args: bound },
             order_by: Vec::new(),
             limit: None,
             offset: None,
@@ -887,10 +979,10 @@ impl<'a> Binder<'a> {
         };
         let alias = fi.alias.clone().unwrap_or_else(|| lower(name));
         let (mut item, mut src) = self.query_source(q, correlated, &alias, &[])?;
-        for c in src.cols.iter_mut().skip(8) {
+        for c in src.cols.iter_mut().skip(visible) {
             c.nostar = true;
         }
-        src.rowid = Some(10);
+        src.rowid = if pragma.is_some() { None } else { Some(10) };
         item.deps = deps;
         Ok((item, src))
     }
@@ -1112,6 +1204,7 @@ impl<'a> Binder<'a> {
             rowid: None,
             virt: Some(exprs),
             virt_used: reads,
+            gen: Vec::new(),
         }))
     }
 
@@ -1135,6 +1228,14 @@ impl<'a> Binder<'a> {
     }
 
     fn make_col(&mut self, src: &ScopeSource, col: usize) -> Expr {
+        if let Some(Some((e, uses))) = src.gen.get(col) {
+            for (c, k) in uses {
+                self.used[*c][*k] = true;
+            }
+            self.refs.push(src.cursor);
+            self.virt_hit = src.cols.get(col).map(|c| c.name.clone());
+            return e.clone();
+        }
         if let Some(v) = &src.virt {
             let e = v[col].clone();
             for (c, k) in &src.virt_used[col] {
@@ -1186,7 +1287,25 @@ impl<'a> Binder<'a> {
                 continue;
             }
             let has_right = list.iter().any(|f| f.join == JoinKind::Right);
-            if let TableSource::Function { name, args } = &fi.source {
+            // `FROM pragma_x` without arguments, unless something else
+            // has that name.
+            let no_args: Vec<ast::Expr> = Vec::new();
+            let eponymous = match &fi.source {
+                TableSource::Table { schema: None, name }
+                    if lower(name).starts_with("pragma_")
+                        && self.schema.table(name).is_none()
+                        && self.schema.view(name).is_none()
+                        && !self.ctes.iter().any(|c| c.name == lower(name)) =>
+                {
+                    Some((name, &no_args))
+                }
+                _ => None,
+            };
+            let func = match &fi.source {
+                TableSource::Function { name, args } => Some((name, args)),
+                _ => eponymous,
+            };
+            if let Some((name, args)) = func {
                 if has_right {
                     return Err(Error::Unsupported(
                         "a table-valued function in a RIGHT JOIN".into(),
@@ -2262,7 +2381,7 @@ impl<'a> Binder<'a> {
                 BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
             ) =>
             {
-                if let Expr::Col { cur, col, .. } = l.as_ref() {
+                if let Some((cur, col)) = col_ref(l) {
                     if *cur == cursor && !reads(r) {
                         out.push(Constraint {
                             col: *col,
@@ -2273,7 +2392,7 @@ impl<'a> Binder<'a> {
                         });
                     }
                 }
-                if let Expr::Col { cur, col, .. } = r.as_ref() {
+                if let Some((cur, col)) = col_ref(r) {
                     if *cur == cursor && !reads(l) {
                         let flipped = match op {
                             BinaryOp::Lt => BinaryOp::Gt,
@@ -2300,7 +2419,7 @@ impl<'a> Binder<'a> {
                 lo_cmp,
                 hi_cmp,
             } => {
-                if let Expr::Col { cur, col, .. } = e.as_ref() {
+                if let Some((cur, col)) = col_ref(e) {
                     if *cur == cursor {
                         if !reads(lo) {
                             out.push(Constraint {
@@ -2330,7 +2449,7 @@ impl<'a> Binder<'a> {
                 aff,
                 coll,
             } if !list.is_empty() => {
-                if let Expr::Col { cur, col, .. } = e.as_ref() {
+                if let Some((cur, col)) = col_ref(e) {
                     if *cur == cursor && !list.iter().any(reads) {
                         out.push(Constraint {
                             col: *col,
@@ -2353,7 +2472,7 @@ impl<'a> Binder<'a> {
                 aff,
                 coll,
             } if sub.query.cols.len() == 1 => {
-                if let Expr::Col { cur, col, .. } = e.as_ref() {
+                if let Some((cur, col)) = col_ref(e) {
                     if *cur == cursor && !sub.outer_refs.contains(&cursor) {
                         out.push(Constraint {
                             col: *col,
@@ -2669,7 +2788,7 @@ impl<'a> Binder<'a> {
         // The keys that still need ordering, as (column, desc, collation).
         let mut want = Vec::new();
         for (k, e) in keys.iter().zip(exprs) {
-            let Expr::Col { cur, col, .. } = e else {
+            let Some((cur, col)) = col_ref(e) else {
                 return false;
             };
             if *cur != cursor || k.nulls_first == k.desc {
@@ -3111,6 +3230,8 @@ fn intern(name: &str) -> &'static str {
         "concat",
         "concat_ws",
         "sqlite_version",
+        "sqlite_source_id",
+        "unhex",
     ];
     NAMES
         .iter()
@@ -3119,13 +3240,24 @@ fn intern(name: &str) -> &'static str {
         .unwrap_or("function")
 }
 
+/// The (cursor, column) a column reference reads: a stored column, or a
+/// virtual generated one (which an index on it can serve).
+fn col_ref(e: &Expr) -> Option<(&usize, &usize)> {
+    match e {
+        Expr::Col { cur, col, .. } | Expr::Gen { cur, col, .. } => Some((cur, col)),
+        _ => None,
+    }
+}
+
 fn contains_agg(e: &Expr) -> bool {
     match e {
         Expr::Agg { .. } | Expr::Window(_) => true,
         Expr::Lit(_) | Expr::Col { .. } | Expr::Subquery(_) | Expr::Exists(_) => false,
-        Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) | Expr::Collate(a, _) => {
-            contains_agg(a)
-        }
+        Expr::Unary(_, a)
+        | Expr::IsNull(a, _)
+        | Expr::Cast(a, _)
+        | Expr::Gen { e: a, .. }
+        | Expr::Collate(a, _) => contains_agg(a),
         Expr::Arith(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
             contains_agg(a) || contains_agg(b)
         }
