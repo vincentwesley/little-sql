@@ -18,7 +18,7 @@ checks, verified from a fresh clone of `claude/nice-brown-acniv0` (1 min
 | sqllogictest CI sample (49 files), read mode | 240,267 | 0 | 100.00 % |
 | Differential tests vs sqlite3 3.45.1 (21 files, 6 fixtures) | 443 | 0 | 100.00 % |
 | Planner: plans identical to sqlite3's `EXPLAIN QUERY PLAN` | 57 | 0 | — |
-| Shell scripts identical to sqlite3 (`tests/shell`) | 14 | 0 | — |
+| Shell scripts identical to sqlite3 (`tests/shell`) | 18 | 0 | — |
 
 Reference: sqlite3 3.45.1 (DECISIONS D25). Numbers come from
 `docs/results/*.json` via `node scripts/publish-results.mjs`; never edit them
@@ -29,7 +29,9 @@ by hand.
 - `crates/littlesql` — the engine, zero dependencies: `storage`, `pager`,
   `wal`, `btree` (read), `btree_write` (insert/split/delete/merge, overflow,
   freelist), `record`, `schema`, `sql/` (lexer, parser, AST), `bind`
-  (resolution, planner, view flattening, windows), `plan` (plan + EXPLAIN),
+  (resolution, planner, view flattening, windows; `bind/single.rs` plans
+  one-table queries with SQLite's cost model), `cost` (SQLite's LogEst
+  arithmetic and estimates), `plan` (plan + EXPLAIN),
   `exec` (executor, windows), `write` (DDL, DML, constraints, triggers,
   transactions, upsert, RETURNING), `alter`, `attach`, `pragma` (schema
   pragmas and `pragma_*` functions), `check` (integrity check), `fp`
@@ -44,7 +46,7 @@ by hand.
   `build-demo-db.sh`, `build-playground.sh`, `playground-smoke.mjs`,
   `publish-results.mjs`, `write-check.sh`, `crash-check.sh`, `bench.sh`.
 - `data/` — the HDB resale CSV (2022 onwards, Singapore Open Data Licence).
-- `docs/` — PLAN, DECISIONS (D1–D45), RESEARCH, ACCEPTANCE, results/.
+- `docs/` — PLAN, DECISIONS (D1–D47), RESEARCH, ACCEPTANCE, results/.
 
 ## How to continue
 
@@ -75,11 +77,14 @@ by hand.
 - `EXPLAIN QUERY PLAN` shows nothing for the window-function step, and
   shows `AUTOMATIC HASH INDEX` where SQLite shows a Bloom filter plus an
   automatic covering index.
-- The planner does not weigh sorting cost against walking an index in
-  order, and never sorts only the right part of an ORDER BY ("USE TEMP
-  B-TREE FOR RIGHT PART OF ORDER BY"); SQLite does both. Answers are the
-  same; such plans differ (about a fifth of random queries over
-  expression and partial indexes, D41).
+- Joins are still planned with the greedy heuristics of D16; only
+  one-table queries use SQLite's cost model (D46). SQLite's WHERE
+  constant propagation (rewriting `s > 0 AND s = 2.5`) is not done, which
+  changes a few single-table plans (3 in 6,000 random queries).
+- `min(x)` / `max(x)` over an index is computed by a scan; SQLite seeks
+  one entry and EXPLAIN says SEARCH where Little SQL says SCAN.
+- Rows that tie on every ORDER BY key can come out in a different order
+  than sqlite3's (SQL leaves it open).
 - `excluded.<generated column>` in an upsert reads NULL; SQLite computes it.
 - ATTACH needs a file system, so in the playground (WebAssembly) only
   `ATTACH ':memory:'` works.
@@ -162,6 +167,13 @@ sqllogictest corpus in native mode; 443 / 443 differential tests.
   scripts grew from 7 to 14 (`upsert_returning`, `update_from`,
   `expression_indexes`, `strict`, `generated`, `pragma_functions`,
   `index_planning`), all identical to sqlite3.
+- Planner, round two (D46): one-table queries use a port of SQLite's
+  cost model and path solver (sorting cost, partial ORDER BY sorts,
+  whereShortCut, LIKE/GLOB prefix ranges, IS NULL searches, searches into
+  the rowid after an index key, the count(*) index, DISTINCT planning,
+  IS NULL folding). Random single-table plans identical to sqlite3's
+  went from 71 % to 99.95 %. The random workloads also found a write bug
+  (D47: 3-byte index cells), now fixed. Shell scripts: 18.
 - M10 Final review: fresh-clone acceptance (19/19), README read-through
   and CLI / playground run as a stranger (fixed: a new empty database
   reported corruption on `.tables`; README test commands), one pull
@@ -175,8 +187,9 @@ sqllogictest corpus in native mode; 443 / 443 differential tests.
 - **`jsonb_*` functions** (which return binary JSON) and **virtual tables**
   other than `json_each` / `json_tree`: not exercised by the corpus; each is
   rejected with a clear "not supported" error rather than approximated.
-  Most useful next: SQLite's sorting-cost model in the planner (see Known
-  issues), then `jsonb_*` (needs SQLite's exact JSONB encoding choices).
+  Most useful next: SQLite's cost model for joins (the path solver with
+  several loops, D46 covers one table), then `jsonb_*` (needs SQLite's
+  exact JSONB encoding choices).
 - **Multi-process access** (file locks, `-shm`): out of scope by design
   (DECISIONS D13).
 - **SQLite-grade speed**: would need a bytecode VM and three-sibling

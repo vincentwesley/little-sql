@@ -530,11 +530,9 @@ unless the table order already gives the ORDER BY.
 
 Checked against sqlite3 on the shell script `index_planning.sql` (plans
 and answers) and 700 random scripts of queries, updates and deletes over
-such indexes, all with identical output. On random queries the plans
-agree 79 % of the time; the rest differ where SQLite weighs the cost of
-sorting against walking an index in order, and where it sorts only the
-right part of an ORDER BY. Neither is modelled by this planner for any
-index (D16), and neither changes answers.
+such indexes, all with identical output. With the cost model of D46 the
+plans of 2,400 random queries over these indexes are all identical to
+SQLite's (79 % before it).
 
 ## D42. Generated columns: virtual ones are computed by the binder
 
@@ -579,3 +577,62 @@ BLOB, ANY) at CREATE time, and each written value is checked after the
 column's affinity has been applied, so `'5'` goes into an INTEGER column
 as 5 while `'x'` fails with "cannot store TEXT value in INTEGER column
 t.c", exactly as in SQLite. ANY keeps values as given.
+
+## D46. One-table queries use SQLite's own cost model
+
+The heuristics of D16 picked an access path by estimated rows, then
+checked afterwards whether it happened to deliver the ORDER BY. SQLite
+instead weighs a sort against walking an index in order, and can sort
+only the right part of an ORDER BY; on random single-table queries our
+plans agreed with SQLite's only 71 % of the time. Queries over one table
+(most queries, and the case where plans are easiest to compare) now go
+through a port of SQLite 3.45's planner for that case (`bind/single.rs`,
+`cost.rs`):
+
+- every way in, in SQLite's order: the table scan, scans of indexes that
+  may help the ORDER BY or are narrower, and searches on each prefix of
+  each index, extended past the key into the rowid (or the rest of a
+  WITHOUT ROWID primary key), with `=`, `IN`, `IS NULL`, ranges, the
+  `col > NULL` that STAT4 builds derive from `col IS NOT NULL`, and the
+  prefix range of `LIKE` / `GLOB`;
+- costs and row counts in LogEst units with SQLite's constants: the
+  million-row table, row widths from declared types, the default row
+  estimates of index prefixes, the lookup cost of non-covering indexes,
+  the cut of each unused WHERE term;
+- the plan list kept as whereLoopInsert keeps it (dominated plans
+  dropped per sort slot, costs adjusted for plans whose terms are a
+  subset of another's), whereShortCut for `rowid = ?` and fully
+  constrained unique indexes, the count(*) index choice;
+- the path solver: the cheapest plan without the ORDER BY fixes the row
+  estimate, then each plan is charged SQLite's sorting cost for the part
+  of the ORDER BY (or GROUP BY, or DISTINCT) it does not deliver, with
+  the LIMIT and DISTINCT adjustments. EXPLAIN then shows `RIGHT PART OF
+  ORDER BY` for a partial sort (the executor still sorts all keys, which
+  gives the same rows).
+
+Two binder rules came with it because they change which terms exist:
+`x IS [NOT] NULL` on a column that cannot be NULL is a constant, as in
+SQLite, and a DISTINCT whose ORDER BY is its result list is planned as a
+GROUP BY. EXPLAIN now says `USE TEMP B-TREE` for GROUP BY and DISTINCT,
+as SQLite does, although Little SQL uses a hash table for both.
+
+Measured on random workloads against sqlite3 (6,000 queries over plain,
+unique, multi-column and DESC indexes on rowid and WITHOUT ROWID tables,
+with LIMIT, DISTINCT, IN, IS NULL, LIKE and BETWEEN): 99.95 % of plans
+identical, up from 71 %. The three that differ come from SQLite's WHERE
+constant propagation, which rewrites `s > 0 AND s = 2.5` into
+`2.5 > 0 AND s = 2.5`; Little SQL only adds derived terms (D16) because
+rewriting terms changes how affinities apply. Answers are identical
+except for the order of rows that tie on every ORDER BY key, which SQL
+leaves open. Joins still use the greedy order of D16.
+
+## D47. A cell takes at least four bytes
+
+SQLite never gives a b-tree cell fewer than four bytes on the page. An
+index entry with one small field (an index on exactly the primary key of
+a WITHOUT ROWID table, holding an integer 0 or 1) encodes to three, and
+the writer stored it in three, so a cell at the very end of a page ended
+before the four bytes the reader checks for: CREATE INDEX on a non-empty
+table failed with "database disk image is malformed". Cells are now
+padded to four bytes when written and copied, and the integrity check
+counts them the same way. Found by the random planner workloads.

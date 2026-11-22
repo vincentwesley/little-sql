@@ -191,9 +191,14 @@ push and keeps it as a downloadable artifact.
   without a usable index, greedy join ordering, and `INDEXED BY` /
   `NOT INDEXED`, expression and partial indexes (matched against the
   query's expressions and WHERE as SQLite matches them), and indexes on
-  generated columns, all under SQLite's no-statistics assumptions. On the
-  planner test set (57 queries over real, tiny and empty tables) its
-  `EXPLAIN QUERY PLAN` output is identical to SQLite's.
+  generated columns, all under SQLite's no-statistics assumptions.
+  Queries over one table are planned with a port of SQLite's own cost
+  model, which weighs sorting against reading an index in order, sorts
+  only the right part of an ORDER BY when it can, and uses `LIKE` / `GLOB`
+  prefixes, `IS NULL` and the rowid after an index key as SQLite does. On
+  the planner test set (57 queries over real, tiny and empty tables) its
+  `EXPLAIN QUERY PLAN` output is identical to SQLite's, and on 6,000
+  random single-table queries 99.95 % of plans are identical.
 
 ## Not supported (yet)
 

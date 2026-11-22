@@ -202,7 +202,7 @@ if want M7; then
   }
   check A7.1 "sqllogictest sample, native mode, at or above the floor" a71
   check A7.2 "Files written by Little SQL pass sqlite3's integrity check" scripts/write-check.sh
-  check A7.3 "Whole shell scripts match sqlite3 (14 scripts)" scripts/shell-check.sh
+  check A7.3 "Whole shell scripts match sqlite3 (18 scripts)" scripts/shell-check.sh
 fi
 
 # ---------------------------------------------------------------- M8
