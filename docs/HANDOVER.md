@@ -3,7 +3,7 @@
 Updated after every milestone so a new session can continue from here.
 This is the final state at the end of the first build (M0–M10).
 
-## Status (2026-11-21)
+## Status (2026-11-22)
 
 All milestones in PLAN.md are done. `scripts/acceptance.sh` passes all 20
 checks, verified from a fresh clone of `claude/nice-brown-acniv0` (1 min
@@ -18,7 +18,7 @@ checks, verified from a fresh clone of `claude/nice-brown-acniv0` (1 min
 | sqllogictest CI sample (49 files), read mode | 240,267 | 0 | 100.00 % |
 | Differential tests vs sqlite3 3.45.1 (21 files, 6 fixtures) | 443 | 0 | 100.00 % |
 | Planner: plans identical to sqlite3's `EXPLAIN QUERY PLAN` | 57 | 0 | — |
-| Shell scripts identical to sqlite3 (`tests/shell`) | 7 | 0 | — |
+| Shell scripts identical to sqlite3 (`tests/shell`) | 14 | 0 | — |
 
 Reference: sqlite3 3.45.1 (DECISIONS D25). Numbers come from
 `docs/results/*.json` via `node scripts/publish-results.mjs`; never edit them
@@ -31,7 +31,9 @@ by hand.
   freelist), `record`, `schema`, `sql/` (lexer, parser, AST), `bind`
   (resolution, planner, view flattening, windows), `plan` (plan + EXPLAIN),
   `exec` (executor, windows), `write` (DDL, DML, constraints, triggers,
-  transactions), `check` (integrity check), `func`, `datetime`, `json`, `db`.
+  transactions, upsert, RETURNING), `alter`, `attach`, `pragma` (schema
+  pragmas and `pragma_*` functions), `check` (integrity check), `fp`
+  (long double conversions), `func`, `datetime`, `json`, `db`.
 - `crates/littlesql-cli` — the `littlesql` shell.
 - `crates/littlesql-wasm` + `playground/` — WebAssembly build and static site.
 - `crates/slt` — sqllogictest and differential runners.
@@ -42,7 +44,7 @@ by hand.
   `build-demo-db.sh`, `build-playground.sh`, `playground-smoke.mjs`,
   `publish-results.mjs`, `write-check.sh`, `crash-check.sh`, `bench.sh`.
 - `data/` — the HDB resale CSV (2022 onwards, Singapore Open Data Licence).
-- `docs/` — PLAN, DECISIONS (D1–D39), RESEARCH, ACCEPTANCE, results/.
+- `docs/` — PLAN, DECISIONS (D1–D45), RESEARCH, ACCEPTANCE, results/.
 
 ## How to continue
 
@@ -73,6 +75,12 @@ by hand.
 - `EXPLAIN QUERY PLAN` shows nothing for the window-function step, and
   shows `AUTOMATIC HASH INDEX` where SQLite shows a Bloom filter plus an
   automatic covering index.
+- The planner does not weigh sorting cost against walking an index in
+  order, and never sorts only the right part of an ORDER BY ("USE TEMP
+  B-TREE FOR RIGHT PART OF ORDER BY"); SQLite does both. Answers are the
+  same; such plans differ (about a fifth of random queries over
+  expression and partial indexes, D41).
+- `excluded.<generated column>` in an upsert reads NULL; SQLite computes it.
 - ATTACH needs a file system, so in the playground (WebAssembly) only
   `ATTACH ':memory:'` works.
 
@@ -138,6 +146,22 @@ sqllogictest corpus in native mode; 443 / 443 differential tests.
   identical).
 - Planner (D39): SQLite's million-row table assumption and tie rules; the
   planner suite grew from 33 to 57 plans, all identical to sqlite3's.
+- Writes, round two: upsert (`ON CONFLICT ... DO NOTHING / DO UPDATE`,
+  several clauses), `RETURNING`, `UPDATE ... FROM`, `UPDATE t AS a`,
+  `WITH` before UPDATE / DELETE (D40); expression and partial indexes
+  kept exact on every write and used by the planner (D41); STRICT tables
+  (D45); generated
+  columns, virtual and stored, with indexes on them used by the planner
+  (D42); `total_changes()` counts trigger changes; an engine panic in the
+  shell rolls back and reports instead of exiting (D44).
+- Schema pragmas (D43): `index_info`, `index_xinfo`, `table_xinfo`,
+  `index_list` in SQLite's order, `dflt_value` as written, and the
+  table-valued `pragma_table_info` / `pragma_index_list` / ... (also
+  correlated); `unhex()`, `sqlite_source_id()`. EXPLAIN now writes range
+  bounds as `>?` / `<?` whether inclusive or not, as SQLite does. Shell
+  scripts grew from 7 to 14 (`upsert_returning`, `update_from`,
+  `expression_indexes`, `strict`, `generated`, `pragma_functions`,
+  `index_planning`), all identical to sqlite3.
 - M10 Final review: fresh-clone acceptance (19/19), README read-through
   and CLI / playground run as a stranger (fixed: a new empty database
   reported corruption on `.tables`; README test commands), one pull
@@ -151,8 +175,8 @@ sqllogictest corpus in native mode; 443 / 443 differential tests.
 - **`jsonb_*` functions** (which return binary JSON) and **virtual tables**
   other than `json_each` / `json_tree`: not exercised by the corpus; each is
   rejected with a clear "not supported" error rather than approximated.
-  Most useful next: upsert (`ON CONFLICT ... DO`) and `RETURNING`, then
-  `jsonb_*` (needs SQLite's exact JSONB encoding choices).
+  Most useful next: SQLite's sorting-cost model in the planner (see Known
+  issues), then `jsonb_*` (needs SQLite's exact JSONB encoding choices).
 - **Multi-process access** (file locks, `-shm`): out of scope by design
   (DECISIONS D13).
 - **SQLite-grade speed**: would need a bytecode VM and three-sibling

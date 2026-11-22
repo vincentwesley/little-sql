@@ -107,7 +107,25 @@ struct Item {
     /// Cursors of this query's other FROM items that this one reads (the
     /// arguments of a table-valued function); it must run inside them.
     deps: Vec<usize>,
+    /// The table's expression and partial indexes, bound over its cursor.
+    special: Vec<SpecialIndex>,
 }
+
+/// An expression or partial index, with its key expressions and WHERE
+/// terms bound over the cursor of the table it indexes, so the planner
+/// can match them against the query's own expressions.
+#[derive(Clone)]
+struct SpecialIndex {
+    index: Rc<Index>,
+    /// Per key column: the bound expression, or None for a plain column.
+    keys: Vec<Option<Expr>>,
+    /// The AND terms of a partial index's WHERE.
+    terms: Vec<Expr>,
+}
+
+/// Constraint column numbers from here up stand for the expression key at
+/// that offset of the index being considered.
+const EXPR_KEY: usize = usize::MAX / 2;
 
 struct Conj {
     expr: Expr,
@@ -157,6 +175,9 @@ pub struct Binder<'a> {
     indexed: HashMap<usize, ast::Indexed>,
     work_tables: Vec<WorkDef>,
     next_work: usize,
+    /// Expression and partial indexes of each table cursor (see
+    /// [`SpecialIndex`]), for ORDER BY planning.
+    specials: HashMap<usize, Vec<SpecialIndex>>,
 }
 
 fn lower(s: &str) -> String {
@@ -367,6 +388,7 @@ impl<'a> Binder<'a> {
             indexed: HashMap::new(),
             work_tables: Vec::new(),
             next_work: 0,
+            specials: HashMap::new(),
         }
     }
 
@@ -646,6 +668,18 @@ impl<'a> Binder<'a> {
         if table.has_virtual() {
             src.gen = self.bind_generated(table, cursor);
         }
+        let special = if table
+            .indexes
+            .iter()
+            .any(|i| !i.usable && !i.cols.is_empty())
+        {
+            let gen = src.gen.clone();
+            let sp = self.bind_special(table, cursor, &gen);
+            self.specials.insert(cursor, sp.clone());
+            sp
+        } else {
+            Vec::new()
+        };
         (
             Item {
                 cursor,
@@ -655,9 +689,88 @@ impl<'a> Binder<'a> {
                 ncols,
                 indexed: ast::Indexed::Any,
                 deps: Vec::new(),
+                special,
             },
             src,
         )
+    }
+
+    /// Bind the key expressions and WHERE terms of a table's expression and
+    /// partial indexes over its cursor. Uses are not recorded: they only
+    /// help choose an access path.
+    fn bind_special(
+        &mut self,
+        table: &Rc<Table>,
+        cursor: usize,
+        gen: &GenCols,
+    ) -> Vec<SpecialIndex> {
+        let mut out = Vec::new();
+        let refs_len = self.refs.len();
+        let before = self.used.clone();
+        let virt_hit = self.virt_hit.take();
+        for index in table
+            .indexes
+            .iter()
+            .filter(|i| !i.usable && !i.cols.is_empty())
+        {
+            let tmp = ScopeSource {
+                cursor,
+                name: lower(&table.name),
+                cols: table
+                    .columns
+                    .iter()
+                    .map(|c| ScopeCol {
+                        name: c.name.clone(),
+                        aff: c.affinity,
+                        coll: c.collation,
+                        hidden: false,
+                        nostar: false,
+                    })
+                    .collect(),
+                rowid: if table.without_rowid {
+                    None
+                } else {
+                    Some(table.columns.len())
+                },
+                virt: None,
+                virt_used: Vec::new(),
+                gen: gen.clone(),
+            };
+            self.scopes.push(Scope {
+                sources: vec![tmp],
+                aliases: Vec::new(),
+            });
+            let bound = (|| -> Result<SpecialIndex> {
+                let mut keys = Vec::new();
+                for k in 0..index.cols.len() {
+                    keys.push(match index.exprs.get(k).cloned().flatten() {
+                        Some(e) => Some(self.bind_expr(&e)?),
+                        None => None,
+                    });
+                }
+                let mut terms = Vec::new();
+                if let Some(w) = &index.where_ {
+                    let mut parts = Vec::new();
+                    split_and(w, &mut parts);
+                    for p in parts {
+                        terms.push(self.bind_expr(p)?);
+                    }
+                }
+                Ok(SpecialIndex {
+                    index: index.clone(),
+                    keys,
+                    terms,
+                })
+            })();
+            self.scopes.pop();
+            if let Ok(sp) = bound {
+                out.push(sp);
+            }
+        }
+        self.take_new_uses(&before);
+        self.refs.truncate(refs_len);
+        self.virt_hit = virt_hit;
+        out
     }
 
     /// Bind the expressions of a table's virtual generated columns over
@@ -768,6 +881,7 @@ impl<'a> Binder<'a> {
             ncols,
             indexed: ast::Indexed::Any,
             deps: Vec::new(),
+            special: Vec::new(),
         };
         Ok((item, src))
     }
@@ -2499,6 +2613,7 @@ impl<'a> Binder<'a> {
         conjs: &[Conj],
     ) -> (f64, Option<Access>, Option<HashProbe>) {
         let mut cons = Vec::new();
+        let mut terms: Vec<&Expr> = Vec::new();
         let mut filtered = false;
         for c in conjs {
             let mine = if item.left_join {
@@ -2514,6 +2629,7 @@ impl<'a> Binder<'a> {
                 filtered = true;
             }
             self.constraints(&c.expr, item.cursor, &mut cons);
+            terms.push(&c.expr);
         }
         let varies = |e: &Expr| {
             let mut r = Vec::new();
@@ -2591,18 +2707,42 @@ impl<'a> Binder<'a> {
             .iter()
             .filter(|_| item.indexed != ast::Indexed::No)
             .chain(table.indexes.iter().filter(|i| allowed(i)))
-            .filter(|i| i.usable && !i.cols.is_empty());
+            .filter(|i| !i.cols.is_empty())
+            .filter(|i| i.usable || item.special.iter().any(|s| Rc::ptr_eq(&s.index, i)));
         for index in candidates {
+            // An expression or partial index: its WHERE must be implied by
+            // the query's terms, and its expression keys are matched
+            // against the query's expressions.
+            let sp = item.special.iter().find(|s| Rc::ptr_eq(&s.index, index));
+            let mut extra = Vec::new();
+            if let Some(sp) = sp {
+                if !sp.terms.iter().all(|t| implied(t, &terms)) {
+                    continue;
+                }
+                for (k, key) in sp.keys.iter().enumerate() {
+                    let Some(key) = key else { continue };
+                    for e in &terms {
+                        if let Some(swapped) = swap_key(e, key, item.cursor, EXPR_KEY + k) {
+                            self.constraints(&swapped, item.cursor, &mut extra);
+                        }
+                    }
+                }
+            }
+            let key_expr = |k: usize| sp.and_then(|s| s.keys.get(k)).and_then(Option::as_ref);
             let fits = |c: &Constraint, k: usize| {
                 let ic = &index.cols[k];
-                let col_aff = table.columns[ic.col].affinity;
+                let (col, col_aff) = match key_expr(k) {
+                    Some(e) => (EXPR_KEY + k, affinity(e)),
+                    None => (ic.col, table.columns[ic.col].affinity),
+                };
                 let aff_ok = match c.aff {
                     Affinity::Blob => true,
                     Affinity::Text => col_aff == Affinity::Text,
                     _ => col_aff.is_numeric(),
                 };
-                c.col == ic.col && c.coll == ic.collation && aff_ok
+                c.col == col && c.coll == ic.collation && aff_ok
             };
+            let cons: Vec<&Constraint> = cons.iter().chain(extra.iter()).collect();
             let mut eq: Vec<(KeyExpr, Affinity)> = Vec::new();
             let mut lookups = 1.0;
             for k in 0..index.cols.len() {
@@ -2657,7 +2797,8 @@ impl<'a> Binder<'a> {
                 }
                 (e * lookups).max(1.0)
             };
-            let covering = index.primary || covers(index);
+            let plain = sp.is_none_or(|s| s.keys.iter().all(Option::is_none));
+            let covering = plain && (index.primary || covers(index));
             // A lookup through a non-covering index also reads the table.
             let est = if covering { est } else { est * 1.01 };
             // SQLite searches an index rather than scanning the table even
@@ -2703,6 +2844,25 @@ impl<'a> Binder<'a> {
             let est = (n / 10.0).max(1.0) * 1.01;
             if est < best.0 {
                 best = (est, Access::Hash(h));
+            }
+        }
+        // A partial index whose WHERE the query implies holds fewer rows
+        // than the table (SQLite assumes half), so SQLite scans it rather
+        // than the table; the newest such index wins a tie.
+        if matches!(best.1, Access::Scan) && item.indexed == ast::Indexed::Any {
+            let partial = item
+                .special
+                .iter()
+                .rev()
+                .find(|s| !s.terms.is_empty() && s.terms.iter().all(|t| implied(t, &terms)));
+            if let Some(sp) = partial {
+                best.1 = Access::Index(IndexAccess {
+                    index: sp.index.clone(),
+                    eq: Vec::new(),
+                    lo: None,
+                    hi: None,
+                    covering: false,
+                });
             }
         }
         // A full scan reads fewer pages through a covering index, which is
@@ -2785,16 +2945,35 @@ impl<'a> Binder<'a> {
             .filter(|c| c.op == BinaryOp::Eq && c.rhs.is_one())
             .map(|c| norm(c.col))
             .collect();
+        // Expression index keys stand for columns numbered from EXPR_KEY,
+        // one number per distinct expression.
+        let specials: &[SpecialIndex] = self.specials.get(&cursor).map_or(&[], |v| v.as_slice());
+        let all_keys: Vec<&Expr> = specials
+            .iter()
+            .flat_map(|s| s.keys.iter().flatten())
+            .collect();
+        let key_id = |e: &Expr| {
+            all_keys
+                .iter()
+                .position(|k| same_expr(k, e))
+                .map(|j| EXPR_KEY + j)
+        };
+        let special_of = |ix: &Index| specials.iter().find(|s| std::ptr::eq(s.index.as_ref(), ix));
         // The keys that still need ordering, as (column, desc, collation).
         let mut want = Vec::new();
         for (k, e) in keys.iter().zip(exprs) {
-            let Some((cur, col)) = col_ref(e) else {
-                return false;
+            let col = match col_ref(e) {
+                Some((cur, col)) if *cur == cursor => *col,
+                Some(_) => return false,
+                None => match key_id(e) {
+                    Some(id) => id,
+                    None => return false,
+                },
             };
-            if *cur != cursor || k.nulls_first == k.desc {
+            if k.nulls_first == k.desc {
                 return false;
             }
-            let col = norm(*col);
+            let col = norm(col);
             if fixed.contains(&col) {
                 continue;
             }
@@ -2808,9 +2987,19 @@ impl<'a> Binder<'a> {
             }
         };
         let index_order = |ix: &Index, from: usize| -> Vec<(usize, bool, Collation)> {
-            let mut v: Vec<(usize, bool, Collation)> = ix.cols[from..]
+            let sp = special_of(ix);
+            let mut v: Vec<(usize, bool, Collation)> = ix
+                .cols
                 .iter()
-                .map(|c| (norm(c.col), c.desc, c.collation))
+                .enumerate()
+                .skip(from)
+                .map(|(i, c)| {
+                    let id = match sp.and_then(|s| s.keys.get(i)).and_then(Option::as_ref) {
+                        Some(key) => key_id(key).unwrap_or(usize::MAX),
+                        None => norm(c.col),
+                    };
+                    (id, c.desc, c.collation)
+                })
                 .collect();
             if table.without_rowid {
                 let pk = table.pk_index.as_ref().unwrap();
@@ -2849,6 +3038,25 @@ impl<'a> Binder<'a> {
         if want.is_empty() {
             return true;
         }
+        // A full scan of a partial index was chosen only because it reads
+        // fewer rows; SQLite prefers the table scan when that already
+        // gives the ORDER BY.
+        if let Access::Index(ix) = access {
+            let partial_scan =
+                ix.eq.is_empty() && ix.lo.is_none() && ix.hi.is_none() && ix.index.where_.is_some();
+            let table_order = if table.without_rowid {
+                Some(index_order(table.pk_index.as_ref().unwrap(), 0))
+            } else {
+                rowid_order()
+            };
+            if partial_scan {
+                if let Some(rev) = table_order.as_deref().and_then(matches) {
+                    *access = Access::Scan;
+                    first.reverse = rev;
+                    return true;
+                }
+            }
+        }
         let have = match access {
             Access::Scan => {
                 if table.without_rowid {
@@ -2879,16 +3087,21 @@ impl<'a> Binder<'a> {
         let free = matches!(self.indexed.get(&cursor), None | Some(ast::Indexed::Any));
         if matches!(access, Access::Scan) && free {
             let used = &self.used[cursor];
-            for ix in table
-                .indexes
-                .iter()
-                .filter(|i| i.usable && !i.cols.is_empty())
-            {
+            let filters: Vec<&Expr> = first.filters.iter().collect();
+            // Expression and partial indexes qualify when the query
+            // implies a partial index's WHERE.
+            let ok = |i: &Index| match special_of(i) {
+                Some(s) => s.terms.iter().all(|t| implied(t, &filters)),
+                None => i.usable,
+            };
+            for ix in table.indexes.iter().filter(|i| !i.cols.is_empty() && ok(i)) {
                 if let Some(rev) = matches(&index_order(ix, 0)) {
-                    let covering = used
-                        .iter()
-                        .enumerate()
-                        .all(|(c, u)| !u || norm(c) == rowid_slot || ix.holds(c));
+                    let plain = special_of(ix).is_none_or(|s| s.keys.iter().all(Option::is_none));
+                    let covering = plain
+                        && used
+                            .iter()
+                            .enumerate()
+                            .all(|(c, u)| !u || norm(c) == rowid_slot || ix.holds(c));
                     *access = Access::Index(IndexAccess {
                         index: ix.clone(),
                         eq: Vec::new(),
@@ -3247,6 +3460,221 @@ fn col_ref(e: &Expr) -> Option<(&usize, &usize)> {
         Expr::Col { cur, col, .. } | Expr::Gen { cur, col, .. } => Some((cur, col)),
         _ => None,
     }
+}
+
+/// Whether two bound expressions are the same expression (the way SQLite
+/// matches an index's expressions and WHERE against a query's).
+fn same_expr(a: &Expr, b: &Expr) -> bool {
+    let both = |x: &[Expr], y: &[Expr]| {
+        x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_expr(p, q))
+    };
+    match (a, b) {
+        (Expr::Lit(x), Expr::Lit(y)) => match (x, y) {
+            (Value::Null, Value::Null) => true,
+            (Value::Int(p), Value::Int(q)) => p == q,
+            (Value::Real(p), Value::Real(q)) => p.to_bits() == q.to_bits(),
+            (Value::Text(p), Value::Text(q)) => p == q,
+            (Value::Blob(p), Value::Blob(q)) => p == q,
+            _ => false,
+        },
+        (
+            Expr::Col {
+                cur: c1, col: k1, ..
+            },
+            Expr::Col {
+                cur: c2, col: k2, ..
+            },
+        )
+        | (
+            Expr::Gen {
+                cur: c1, col: k1, ..
+            },
+            Expr::Gen {
+                cur: c2, col: k2, ..
+            },
+        ) => c1 == c2 && k1 == k2,
+        (Expr::Unary(o1, x), Expr::Unary(o2, y)) => o1 == o2 && same_expr(x, y),
+        (Expr::Arith(o1, x1, y1), Expr::Arith(o2, x2, y2)) => {
+            o1 == o2 && same_expr(x1, x2) && same_expr(y1, y2)
+        }
+        (Expr::And(x1, y1), Expr::And(x2, y2)) | (Expr::Or(x1, y1), Expr::Or(x2, y2)) => {
+            same_expr(x1, x2) && same_expr(y1, y2)
+        }
+        (
+            Expr::Cmp {
+                op: o1,
+                l: l1,
+                r: r1,
+                coll: c1,
+                ..
+            },
+            Expr::Cmp {
+                op: o2,
+                l: l2,
+                r: r2,
+                coll: c2,
+                ..
+            },
+        ) => o1 == o2 && c1 == c2 && same_expr(l1, l2) && same_expr(r1, r2),
+        (Expr::IsNull(x, n1), Expr::IsNull(y, n2)) => n1 == n2 && same_expr(x, y),
+        (
+            Expr::Between {
+                e: e1,
+                lo: lo1,
+                hi: hi1,
+                negated: n1,
+                ..
+            },
+            Expr::Between {
+                e: e2,
+                lo: lo2,
+                hi: hi2,
+                negated: n2,
+                ..
+            },
+        ) => n1 == n2 && same_expr(e1, e2) && same_expr(lo1, lo2) && same_expr(hi1, hi2),
+        (
+            Expr::InList {
+                e: e1,
+                list: l1,
+                negated: n1,
+                ..
+            },
+            Expr::InList {
+                e: e2,
+                list: l2,
+                negated: n2,
+                ..
+            },
+        ) => n1 == n2 && same_expr(e1, e2) && both(l1, l2),
+        (Expr::Cast(x, a1), Expr::Cast(y, a2)) => a1 == a2 && same_expr(x, y),
+        (Expr::Collate(x, c1), Expr::Collate(y, c2)) => c1 == c2 && same_expr(x, y),
+        (
+            Expr::Func {
+                name: n1, args: a1, ..
+            },
+            Expr::Func {
+                name: n2, args: a2, ..
+            },
+        ) => n1 == n2 && n1 != &"function" && both(a1, a2),
+        _ => false,
+    }
+}
+
+/// Whether a partial index's WHERE term is implied by the query's terms:
+/// one of them is the same expression, or the term is `x IS NOT NULL` and
+/// a query term compares `x` with `=`, `<`, `<=`, `>` or `>=` (which is
+/// never true for NULL).
+fn implied(term: &Expr, terms: &[&Expr]) -> bool {
+    // SQLite also sees `5 = x` as `x = 5` when the right side is a column.
+    let commuted = |t: &Expr| match t {
+        Expr::Cmp {
+            op,
+            l,
+            r,
+            aff,
+            coll,
+        } if matches!(**r, Expr::Col { .. } | Expr::Gen { .. }) => {
+            let op = match op {
+                BinaryOp::Lt => BinaryOp::Gt,
+                BinaryOp::Le => BinaryOp::Ge,
+                BinaryOp::Gt => BinaryOp::Lt,
+                BinaryOp::Ge => BinaryOp::Le,
+                o => *o,
+            };
+            Some(Expr::Cmp {
+                op,
+                l: r.clone(),
+                r: l.clone(),
+                aff: *aff,
+                coll: *coll,
+            })
+        }
+        _ => None,
+    };
+    if terms
+        .iter()
+        .any(|t| same_expr(t, term) || commuted(t).is_some_and(|c| same_expr(&c, term)))
+    {
+        return true;
+    }
+    match term {
+        Expr::Or(l, r) => implied(l, terms) || implied(r, terms),
+        Expr::IsNull(x, true) => terms.iter().any(|t| implies_not_null(t, x, false)),
+        _ => false,
+    }
+}
+
+/// SQLite's exprImpliesNotNull: whether `p` being true means `x` is not
+/// NULL. `seen_not` is set once inside an operator for which a NULL
+/// operand makes the whole expression NULL (so not true).
+fn implies_not_null(p: &Expr, x: &Expr, seen_not: bool) -> bool {
+    if same_expr(p, x) {
+        return !matches!(x, Expr::Lit(Value::Null));
+    }
+    match p {
+        Expr::InList { e, .. } => implies_not_null(e, x, true),
+        Expr::InSub { e, .. } => !seen_not && implies_not_null(e, x, true),
+        Expr::Between { e, lo, hi, .. } => {
+            !seen_not
+                && (implies_not_null(lo, x, true)
+                    || implies_not_null(hi, x, true)
+                    || implies_not_null(e, x, true))
+        }
+        Expr::Cmp { op, l, r, .. } if !matches!(op, BinaryOp::Is | BinaryOp::IsNot) => {
+            implies_not_null(r, x, true) || implies_not_null(l, x, true)
+        }
+        Expr::Arith(op, l, r) => {
+            let strict = !matches!(
+                op,
+                BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::BitAnd
+            );
+            let seen = seen_not || strict;
+            implies_not_null(r, x, seen) || implies_not_null(l, x, seen)
+        }
+        Expr::Collate(a, _) | Expr::Unary(ast::UnaryOp::Pos | ast::UnaryOp::Neg, a) => {
+            implies_not_null(a, x, seen_not)
+        }
+        Expr::Unary(ast::UnaryOp::Not | ast::UnaryOp::BitNot, a) => implies_not_null(a, x, true),
+        _ => false,
+    }
+}
+
+/// `conj` with an operand that is the index expression `key` replaced by a
+/// stand-in column (`col` of `cursor`), so the usual constraint matching
+/// applies to it. None when no operand is `key`.
+fn swap_key(conj: &Expr, key: &Expr, cursor: usize, col: usize) -> Option<Expr> {
+    let stand_in = || {
+        Box::new(Expr::Col {
+            cur: cursor,
+            col,
+            aff: affinity(key),
+            coll: collation(key).map_or(Collation::Binary, |c| c.0),
+        })
+    };
+    let mut out = conj.clone();
+    let hit = match &mut out {
+        Expr::Cmp { l, r, .. } => {
+            if same_expr(l, key) {
+                *l = stand_in();
+                true
+            } else if same_expr(r, key) {
+                *r = stand_in();
+                true
+            } else {
+                false
+            }
+        }
+        Expr::Between { e, .. } | Expr::InList { e, .. } | Expr::InSub { e, .. } => {
+            let hit = same_expr(e, key);
+            if hit {
+                *e = stand_in();
+            }
+            hit
+        }
+        _ => false,
+    };
+    hit.then_some(out)
 }
 
 fn contains_agg(e: &Expr) -> bool {

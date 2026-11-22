@@ -1,7 +1,7 @@
 {
  "reference": "sqlite3 3.45.1",
  "engine": "littlesql 0.1.0",
- "date": "2026-11-21",
+ "date": "2026-11-22",
  "suites": [
   {
    "suite": "sqllogictest full corpus",

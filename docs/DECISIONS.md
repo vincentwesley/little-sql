@@ -490,3 +490,92 @@ use a real index instead of an automatic one. On 30 extra plans over
 empty, tiny and real tables, differences from sqlite3 fell from 16 to 4
 (the rest are SQLite's Bloom filters and automatic covering indexes); the
 24 that match joined the planner suite, now 57 plans, all identical.
+
+## D40. Upsert, RETURNING and UPDATE ... FROM reuse the existing write path
+
+`INSERT ... ON CONFLICT` is resolved where uniqueness was already checked:
+the inserter lists the table's constraints (rowid, primary key, unique
+indexes) with the upsert targets first, as SQLite checks them, and each
+conflict resolves to store, skip or update. `DO UPDATE` runs through the
+same function as `UPDATE` (constraints, indexes and UPDATE triggers), with
+`excluded.*` and the existing row made visible to binding as named rows
+rather than through a new kind of plan node. `RETURNING` evaluates its
+expressions against each changed row the same way, after the row is
+written. `UPDATE ... FROM` runs one SELECT over the target and the FROM
+items, then keeps one update per target row (its first position and last
+values), which is what SQLite does. Every shape was compared with sqlite3
+in `tests/shell/upsert_returning.sql` and `update_from.sql`.
+
+## D41. Expression and partial indexes: maintained and planned
+
+Writes keep expression and partial indexes exact: each key is evaluated
+against the row (a partial index skips rows whose WHERE is not true), and
+uniqueness through them is enforced with SQLite's error text. The CREATE
+INDEX checks (no subqueries, only deterministic functions) match SQLite's
+wording.
+
+The planner uses them the way SQLite does. Each table in a query has its
+expression and partial indexes bound over its own cursor, so their key
+expressions and WHERE terms are plan expressions that can be compared
+structurally with the query's. A partial index qualifies when every term
+of its WHERE is one of the query's terms (also in commuted form, `5 = x`
+as `x = 5`) or is `x IS NOT NULL` and a query term implies it, by
+SQLite's exprImpliesNotNull rules (comparisons, BETWEEN, IN, arithmetic).
+An expression key is matched by putting a stand-in column in place of the
+expression in a query term, after which the ordinary constraint logic
+applies; EXPLAIN shows it as `<expr>`, as SQLite does. ORDER BY can be
+delivered by an expression index, and a qualifying partial index is
+scanned instead of the table (SQLite assumes it holds half the rows)
+unless the table order already gives the ORDER BY.
+
+Checked against sqlite3 on the shell script `index_planning.sql` (plans
+and answers) and 700 random scripts of queries, updates and deletes over
+such indexes, all with identical output. On random queries the plans
+agree 79 % of the time; the rest differ where SQLite weighs the cost of
+sorting against walking an index in order, and where it sorts only the
+right part of an ORDER BY. Neither is modelled by this planner for any
+index (D16), and neither changes answers.
+
+## D42. Generated columns: virtual ones are computed by the binder
+
+A STORED generated column is computed on every write and stored like any
+column. A VIRTUAL one is not in the record at all (as in SQLite's file
+format), so reading one means computing it. Rather than teach the row
+decoder to evaluate expressions, the binder replaces a reference to a
+virtual column with its expression over the same table cursor (a `Gen`
+plan node that applies the column's affinity and collation, and is NULL
+on a LEFT JOIN's null row). Because that node still names its table and
+column, the planner treats it as a column: an index on a virtual column
+is used for `=`, ranges, `IN` and ORDER BY, as SQLite uses it. Writes
+compute generated columns in dependency order after the rowid is chosen;
+loops, defaults, primary keys and writes to them fail with SQLite's
+messages. All of it is compared with sqlite3 in `tests/shell/generated.sql`.
+
+## D43. Schema pragmas are one function of the schema
+
+`PRAGMA table_info` and its relatives depend only on the schema, so they
+moved to `pragma.rs` and the same code serves the table-valued
+`pragma_table_info(...)` and friends. The executor has no database handle,
+so the schema a SELECT is bound against is made available to it for the
+duration of the statement; correlated use such as
+`FROM sqlite_schema s, pragma_table_info(s.name)` works like
+`json_each`. Only the schema pragmas are offered as functions;
+`pragma_function_list` is not, because its rows (SQLite's 200-odd
+functions and their flags) cannot be honestly reproduced.
+`sqlite_source_id()` reports Little SQL's own version, as
+`sqlite_version()` does.
+
+## D44. An internal error in the shell rolls back instead of exiting
+
+The CLI catches a panic inside the engine for one statement, rolls back
+whatever that statement and any open transaction left uncommitted, and
+reports `internal error (please report it)`. The database file stays
+consistent and the session continues; the engine itself is unchanged.
+
+## D45. STRICT tables check types after affinity
+
+A STRICT table accepts only the six type names (INT, INTEGER, REAL, TEXT,
+BLOB, ANY) at CREATE time, and each written value is checked after the
+column's affinity has been applied, so `'5'` goes into an INTEGER column
+as 5 while `'x'` fails with "cannot store TEXT value in INTEGER column
+t.c", exactly as in SQLite. ANY keeps values as given.

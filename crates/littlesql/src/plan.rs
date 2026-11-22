@@ -561,12 +561,13 @@ pub struct PlanLine {
     pub cursor: Option<usize>,
 }
 
-fn op_text(inclusive: bool, lower: bool) -> &'static str {
-    match (lower, inclusive) {
-        (true, true) => ">=",
-        (true, false) => ">",
-        (false, true) => "<=",
-        (false, false) => "<",
+/// How a range bound is shown: SQLite writes `>` and `<` whether or not
+/// the bound is inclusive.
+fn op_text(_inclusive: bool, lower: bool) -> &'static str {
+    if lower {
+        ">"
+    } else {
+        "<"
     }
 }
 
@@ -594,7 +595,10 @@ fn describe_source(s: &Source) -> String {
                     )
                 }
                 Access::Index(ix) => {
-                    let col = |i: usize| table.columns[ix.index.cols[i].col].name.clone();
+                    let col = |i: usize| match ix.index.exprs.get(i) {
+                        Some(Some(_)) => "<expr>".to_string(),
+                        _ => table.columns[ix.index.cols[i].col].name.clone(),
+                    };
                     let mut terms: Vec<String> =
                         (0..ix.eq.len()).map(|i| format!("{}=?", col(i))).collect();
                     if let Some((_, _, inc)) = &ix.lo {

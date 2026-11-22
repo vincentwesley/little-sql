@@ -130,10 +130,15 @@ push and keeps it as a downloadable artifact.
   record serial types, UTF-8 and UTF-16 databases, `WITHOUT ROWID` tables,
   automatic indexes for `UNIQUE` and `PRIMARY KEY`, the freelist, and the
   write-ahead log (read, written, recovered and checkpointed).
-- **Writes:** `CREATE TABLE` (also `AS SELECT`), `CREATE INDEX`,
-  `CREATE VIEW` (also `TEMP`), `CREATE TRIGGER`, `DROP`, `INSERT` (values,
-  `SELECT`, `DEFAULT VALUES`, `WITH`), `UPDATE`, `DELETE`, `OR IGNORE` /
-  `OR REPLACE`, `NOT NULL`, `UNIQUE`, `PRIMARY KEY` and `CHECK` constraints,
+- **Writes:** `CREATE TABLE` (also `AS SELECT`, `STRICT`, and generated
+  columns, `VIRTUAL` or `STORED`), `CREATE INDEX` (also on expressions and
+  partial, with `WHERE`), `CREATE VIEW` (also `TEMP`), `CREATE TRIGGER`,
+  `DROP`, `INSERT` (values, `SELECT`, `DEFAULT VALUES`, `WITH`), upsert
+  (`ON CONFLICT ... DO NOTHING / DO UPDATE`, several clauses,
+  `excluded.*`), `UPDATE` (also `UPDATE ... FROM` and `AS alias`),
+  `DELETE`, `WITH` before `UPDATE` / `DELETE`, `RETURNING` on all three,
+  `OR IGNORE` / `OR REPLACE`, `NOT NULL`, `UNIQUE`, `PRIMARY KEY` and
+  `CHECK` constraints,
   `AUTOINCREMENT`, `BEGIN` / `COMMIT` / `ROLLBACK` (a failing statement
   inside a transaction undoes only itself), savepoints (`SAVEPOINT`,
   `RELEASE`, `ROLLBACK TO`), and `ALTER TABLE` (`RENAME TO`,
@@ -142,6 +147,10 @@ push and keeps it as a downloadable artifact.
   `BEFORE`, `AFTER`, `INSTEAD OF` on views, `UPDATE OF`, `WHEN`, and
   `RAISE(IGNORE | ABORT | FAIL | ROLLBACK, ...)`. `PRAGMA integrity_check` checks
   the whole file structurally.
+- **Schema pragmas:** `table_info`, `table_xinfo`, `index_list`,
+  `index_info`, `index_xinfo` and `database_list`, also as the
+  table-valued `pragma_table_info(...)` and friends in `FROM` (including
+  correlated use, `FROM sqlite_schema s, pragma_table_info(s.name)`).
 - **Several files:** `TEMP` tables, indexes, views and triggers (they shadow
   main objects of the same name), `ATTACH` / `DETACH` of other database
   files (or `':memory:'`), `db.name` everywhere a name goes, joins and
@@ -172,7 +181,7 @@ push and keeps it as a downloadable artifact.
   reals to text (`printf`, `CAST`, `round`, `.dump`) with the same long
   double arithmetic SQLite 3.45 uses, so even the last digits agree.
 - **Functions:** the core scalar functions (string, numeric, `printf`,
-  `like`/`glob`, math), the aggregates (`count`, `sum`, `total`, `avg`, `min`,
+  `like`/`glob`, `hex` / `unhex`, math), the aggregates (`count`, `sum`, `total`, `avg`, `min`,
   `max`, `group_concat`, with `DISTINCT` and `FILTER`), and the date and time
   functions.
 - **Planner:** WHERE-clause constant propagation, rowid lookups and ranges, index searches on an equality prefix
@@ -180,7 +189,9 @@ push and keeps it as a downloadable artifact.
   indexes, index order used instead of sorting (forwards or backwards),
   streaming `GROUP BY` over sorted input, automatic hash indexes for joins
   without a usable index, greedy join ordering, and `INDEXED BY` /
-  `NOT INDEXED`, all under SQLite's no-statistics assumptions. On the
+  `NOT INDEXED`, expression and partial indexes (matched against the
+  query's expressions and WHERE as SQLite matches them), and indexes on
+  generated columns, all under SQLite's no-statistics assumptions. On the
   planner test set (57 queries over real, tiny and empty tables) its
   `EXPLAIN QUERY PLAN` output is identical to SQLite's.
 
@@ -188,8 +199,8 @@ push and keeps it as a downloadable artifact.
 
 - The `jsonb_*` functions that return binary JSON (JSONB input is read),
   and virtual tables other than `json_each` / `json_tree`.
-- Expression and partial indexes: tables with them are readable (the
-  planner ignores those indexes) but Little SQL refuses to write to them.
+- `pragma_function_list` and the other pragmas that are not about the
+  schema are not available as table-valued functions.
 - Foreign keys are parsed but not enforced, which is also SQLite's default.
 - Concurrent access from several processes: Little SQL takes no file locks.
   Use one process at a time.
