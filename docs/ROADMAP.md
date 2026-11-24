@@ -16,7 +16,7 @@ The project is finished when every box is ticked:
       the playground as a zip, attached to a GitHub release on a `v*` tag.
 - [x] Docs tidied: a final status in HANDOVER, a CHANGELOG with the 1.0
       notes, and NEEDS-VIN reduced to the owner's remaining clicks.
-- [ ] Acceptance passes from a fresh clone (all 20 checks) and CI is green.
+- [x] Acceptance passes from a fresh clone (all 20 checks) and CI is green.
 - [ ] Owner steps done (only the repository owner can do these):
   - [ ] Enable GitHub Pages (Settings → Pages → Source: GitHub Actions)
         and run the Pages workflow, which gives the live demo URL.
