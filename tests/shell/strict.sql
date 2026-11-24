@@ -1,0 +1,21 @@
+-- STRICT tables: declared types enforced after affinity, ANY, type-name checks.
+create table s(i integer, n int, r real, t text, b blob, a any) strict;
+insert into s values(1, 2, 3.5, 'x', x'00', 'any');
+insert into s values('12', '13', '1.5', 5, x'01', 7);
+insert into s values('abc', 1, 1, 'x', null, null);
+insert into s values(1, 2.5, 1, 'x', null, null);
+insert into s values(1, 2.0, 1, 'x', null, null);
+insert into s values(1, 2, 'x', 'x', null, null);
+insert into s values(1, 2, 3, 'x', 'notblob', null);
+insert into s values(1, 2, 3, x'41', null, null);
+insert into s values(1, 2, 3, 4.5, null, 1.25);
+select *, typeof(i), typeof(n), typeof(r), typeof(t), typeof(a) from s;
+update s set i = 'q' where n = 13;
+update s set r = 7 where n = 13;
+select r, typeof(r) from s where n = 13;
+create table bad(x varchar(10)) strict;
+create table bad2(x) strict;
+create table ok2(x integer primary key, y text not null) strict, without rowid;
+create table ok3(x integer primary key, y text not null) without rowid, strict;
+insert into ok3 values('5', 7);
+select * from ok3;

@@ -1,0 +1,62 @@
+# The sqllogictest files run in CI. Paths are relative to the corpus's test/
+# directory. Why each group is here is explained in tests/slt/MANIFEST.md.
+# Changing this list changes the score: update FLOOR and the README with it.
+
+# Hand-written core: every SELECT feature, 1-5 tables, 64-way joins in select5.
+select1.test
+select2.test
+select3.test
+select4.test
+select5.test
+
+# Evidence tests: one file per SQL language feature, written against the docs.
+evidence/in1.test
+evidence/in2.test
+evidence/slt_lang_aggfunc.test
+evidence/slt_lang_createtrigger.test
+evidence/slt_lang_createview.test
+evidence/slt_lang_dropindex.test
+evidence/slt_lang_droptable.test
+evidence/slt_lang_droptrigger.test
+evidence/slt_lang_dropview.test
+evidence/slt_lang_reindex.test
+evidence/slt_lang_replace.test
+evidence/slt_lang_update.test
+
+# Index tests: the first file of every category and table size, so the
+# planner's index paths (BETWEEN, IN, ORDER BY, commuted terms, views,
+# deletes) are all exercised at 10 to 10000 rows.
+index/between/1/slt_good_0.test
+index/between/10/slt_good_0.test
+index/between/100/slt_good_0.test
+index/between/1000/slt_good_0.test
+index/commute/10/slt_good_0.test
+index/commute/100/slt_good_0.test
+index/commute/1000/slt_good_0.test
+index/delete/1/slt_good_0.test
+index/delete/10/slt_good_0.test
+index/delete/100/slt_good_0.test
+index/delete/1000/slt_good_0.test
+index/delete/10000/slt_good_0.test
+index/in/10/slt_good_0.test
+index/in/100/slt_good_0.test
+index/in/1000/slt_good_0.test
+index/orderby/10/slt_good_0.test
+index/orderby/100/slt_good_0.test
+index/orderby/1000/slt_good_0.test
+index/orderby_nosort/10/slt_good_0.test
+index/orderby_nosort/100/slt_good_0.test
+index/orderby_nosort/1000/slt_good_0.test
+index/random/10/slt_good_0.test
+index/random/100/slt_good_0.test
+index/random/1000/slt_good_0.test
+index/view/10/slt_good_1.test
+index/view/100/slt_good_0.test
+index/view/1000/slt_good_0.test
+index/view/10000/slt_good_0.test
+
+# Random query tests: the first file of each generator.
+random/aggregates/slt_good_0.test
+random/expr/slt_good_0.test
+random/groupby/slt_good_0.test
+random/select/slt_good_0.test

@@ -1,0 +1,934 @@
+//! The schema: what tables, indexes and views a database contains.
+//!
+//! SQLite stores its schema as rows of the `sqlite_schema` table (rooted at
+//! page 1). Each row carries the original `CREATE` statement, so recovering
+//! the column layout means parsing that SQL again.
+
+use crate::btree::{estimate_rows, Cursor};
+use crate::error::{Error, Result};
+use crate::pager::Pager;
+use crate::record::decode_all;
+use crate::sql::ast::{self, CreateTable, Stmt, TableConstraint};
+use crate::sql::parser::parse_one;
+use crate::value::{Affinity, Collation, Value};
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+#[derive(Debug, Clone)]
+pub struct Column {
+    pub name: String,
+    pub decl_type: String,
+    pub affinity: Affinity,
+    pub collation: Collation,
+    pub not_null: bool,
+    /// The DEFAULT expression, if any.
+    pub default: Option<ast::Expr>,
+    /// The DEFAULT as a constant, used for rows written before the column
+    /// was added by `ALTER TABLE ADD COLUMN`.
+    pub default_value: Value,
+    /// `AS (expr) [STORED | VIRTUAL]`.
+    pub generated: Option<ast::Generated>,
+    /// The DEFAULT as written.
+    pub default_text: Option<String>,
+}
+
+impl Column {
+    /// A generated column whose value is computed, not stored.
+    pub fn is_virtual(&self) -> bool {
+        self.generated.as_ref().is_some_and(|g| !g.stored)
+    }
+}
+
+/// One key column of an index (or of a WITHOUT ROWID primary key).
+#[derive(Debug, Clone)]
+pub struct IndexCol {
+    /// Position in the table's column list.
+    pub col: usize,
+    pub collation: Collation,
+    pub desc: bool,
+}
+
+#[derive(Debug)]
+pub struct Index {
+    pub name: String,
+    pub table: String,
+    pub root: u32,
+    pub cols: Vec<IndexCol>,
+    pub unique: bool,
+    /// False for partial and expression indexes, which the planner ignores
+    /// (and which make their table read-only for this engine).
+    pub usable: bool,
+    pub sql: Option<String>,
+    /// Columns stored after the key in every entry, before nothing else:
+    /// for an index on a WITHOUT ROWID table, the primary key columns not
+    /// already in the key. (Entries of other indexes end with the rowid.)
+    pub extra: Vec<usize>,
+    /// Collation and direction of each `extra` column (from the primary
+    /// key of a WITHOUT ROWID table).
+    pub extra_order: Vec<(Collation, bool)>,
+    /// True for the primary key of a WITHOUT ROWID table, whose "index" is
+    /// the table b-tree itself.
+    pub primary: bool,
+    /// Key expressions, one per key column (None: the plain column); empty
+    /// when every key is a plain column. An expression's `IndexCol::col`
+    /// is `usize::MAX`.
+    pub exprs: Vec<Option<ast::Expr>>,
+    /// A partial index's WHERE.
+    pub where_: Option<ast::Expr>,
+}
+
+impl Index {
+    /// Does every entry carry column `col` (in its key or after it)?
+    pub fn holds(&self, col: usize) -> bool {
+        self.cols.iter().any(|c| c.col == col) || self.extra.contains(&col)
+    }
+}
+
+#[derive(Debug)]
+pub struct Table {
+    pub name: String,
+    pub root: u32,
+    pub columns: Vec<Column>,
+    /// The column that aliases the rowid (`INTEGER PRIMARY KEY`).
+    pub ipk: Option<usize>,
+    pub without_rowid: bool,
+    /// For WITHOUT ROWID tables: the order in which columns are stored in
+    /// the b-tree record (primary key columns first).
+    pub storage_order: Vec<usize>,
+    /// Primary key columns of a WITHOUT ROWID table.
+    pub pk: Vec<IndexCol>,
+    pub indexes: Vec<Rc<Index>>,
+    /// The primary key of a WITHOUT ROWID table, as an index over the
+    /// table's own b-tree.
+    pub pk_index: Option<Rc<Index>>,
+    pub autoincrement: bool,
+    /// CHECK constraints: (text used in the error message, expression).
+    pub checks: Vec<(String, ast::Expr)>,
+    pub sql: String,
+    row_estimate: Cell<Option<u64>>,
+    /// The database file the table lives in (main, temp or attached).
+    pub pager: Option<Rc<Pager>>,
+    /// A STRICT table: each column's value must have its declared type.
+    pub strict: bool,
+    /// Generated columns in the order their values are computed.
+    pub gen_order: Vec<usize>,
+}
+
+impl Table {
+    /// Whether some column is generated and not stored.
+    pub fn has_virtual(&self) -> bool {
+        self.columns.iter().any(Column::is_virtual)
+    }
+
+    pub fn column_index(&self, name: &str) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The pager of the file the table lives in.
+    pub fn file(&self) -> &Rc<Pager> {
+        self.pager.as_ref().expect("a loaded table knows its file")
+    }
+
+    /// Estimated number of rows, computed on first use.
+    pub fn row_estimate(&self) -> u64 {
+        if let Some(n) = self.row_estimate.get() {
+            return n;
+        }
+        let _ = estimate_rows;
+        let n = 1_048_576;
+        self.row_estimate.set(Some(n));
+        n
+    }
+}
+
+#[derive(Debug)]
+pub struct View {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub select: ast::Select,
+    pub sql: String,
+    pub pager: Option<Rc<Pager>>,
+}
+
+/// A trigger, parsed from its CREATE TRIGGER text.
+#[derive(Debug)]
+pub struct Trigger {
+    pub name: String,
+    pub table: String,
+    pub def: ast::CreateTrigger,
+    /// The file the trigger is stored in.
+    pub pager: Option<Rc<Pager>>,
+}
+
+/// One row of `sqlite_schema`.
+#[derive(Debug, Clone)]
+pub struct SchemaRow {
+    pub rowid: i64,
+    pub kind: String,
+    pub name: String,
+    pub tbl_name: String,
+    pub root: u32,
+    pub sql: Option<String>,
+}
+
+#[derive(Default)]
+pub struct Schema {
+    pub tables: HashMap<String, Rc<Table>>,
+    pub views: HashMap<String, Rc<View>>,
+    /// Index name (lower case) to the lower-case name of its table.
+    pub index_tables: HashMap<String, String>,
+    /// Objects whose SQL this engine cannot handle, with the reason.
+    pub broken: HashMap<String, String>,
+    pub rows: Vec<SchemaRow>,
+    pub triggers: Vec<Rc<Trigger>>,
+    /// The file this schema describes (None for a merged schema).
+    pub pager: Option<Rc<Pager>>,
+    /// For the merged schema a connection binds against: each file's own
+    /// schema by name, in `PRAGMA database_list` order (main, temp, then
+    /// attached files). Empty for a single file's schema.
+    pub dbs: Vec<(String, Rc<Schema>)>,
+    /// For the merged schema: each file's path, in the order of `dbs`.
+    pub paths: Vec<String>,
+}
+
+fn lower(s: &str) -> String {
+    s.to_ascii_lowercase()
+}
+
+fn collation_of(name: &Option<String>) -> Result<Collation> {
+    match name {
+        None => Ok(Collation::Binary),
+        Some(n) => {
+            Collation::from_name(n).ok_or_else(|| Error::Unsupported(format!("collation {n}")))
+        }
+    }
+}
+
+fn const_default(e: &ast::Expr) -> Value {
+    match e {
+        ast::Expr::Literal(v) => v.clone(),
+        ast::Expr::Unary(ast::UnaryOp::Pos, inner) => const_default(inner),
+        ast::Expr::Name { name, .. } => Value::text(name),
+        _ => Value::Null,
+    }
+}
+
+/// The key columns of every UNIQUE / PRIMARY KEY constraint that SQLite
+/// backs with an automatic index, in the order SQLite numbers them.
+pub(crate) fn auto_index_keys(ct: &CreateTable, table: &Table) -> Result<Vec<Vec<IndexCol>>> {
+    let mut keys: Vec<Vec<IndexCol>> = Vec::new();
+    let add = |cols: Vec<IndexCol>, keys: &mut Vec<Vec<IndexCol>>| {
+        let dup = keys.iter().any(|k| {
+            k.len() == cols.len()
+                && k.iter()
+                    .zip(&cols)
+                    .all(|(a, b)| a.col == b.col && a.collation == b.collation)
+        });
+        if !dup {
+            keys.push(cols);
+        }
+    };
+    let resolve = |cols: &[ast::IndexedColumn]| -> Result<Vec<IndexCol>> {
+        cols.iter()
+            .map(|c| {
+                let name = c
+                    .name
+                    .as_ref()
+                    .ok_or_else(|| Error::Unsupported("expression in key".into()))?;
+                let col = table
+                    .column_index(name)
+                    .ok_or_else(|| Error::Sql(format!("no such column: {name}")))?;
+                let collation = match &c.collation {
+                    Some(n) => collation_of(&Some(n.clone()))?,
+                    None => table.columns[col].collation,
+                };
+                Ok(IndexCol {
+                    col,
+                    collation,
+                    desc: c.desc,
+                })
+            })
+            .collect()
+    };
+    for (i, c) in ct.columns.iter().enumerate() {
+        let single = || {
+            vec![IndexCol {
+                col: i,
+                collation: table.columns[i].collation,
+                desc: false,
+            }]
+        };
+        if c.primary_key && table.ipk != Some(i) && !ct.without_rowid {
+            add(single(), &mut keys);
+        }
+        if c.unique {
+            add(single(), &mut keys);
+        }
+    }
+    for tc in &ct.constraints {
+        match tc {
+            TableConstraint::PrimaryKey(cols) => {
+                let k = resolve(cols)?;
+                let is_ipk = k.len() == 1 && table.ipk == Some(k[0].col);
+                if !is_ipk && !ct.without_rowid {
+                    add(k, &mut keys);
+                }
+            }
+            TableConstraint::Unique(cols) => add(resolve(cols)?, &mut keys),
+            TableConstraint::Check(_) | TableConstraint::Other => {}
+        }
+    }
+    Ok(keys)
+}
+
+/// Call `f` with the (qualifier, name) of every column name in `e`.
+pub(crate) fn names_in(e: &ast::Expr, f: &mut dyn FnMut(Option<&str>, &str)) {
+    if let ast::Expr::Name { table, name, .. } = e {
+        f(table.as_deref(), name);
+    }
+    ast::for_each_child(e, &mut |c| names_in(c, f));
+}
+
+/// The order in which generated columns are computed: each after the
+/// generated columns it reads. A cycle is an error naming the last
+/// column of the final pass that could not be computed, as SQLite does.
+fn generated_order(columns: &[Column]) -> Result<Vec<usize>> {
+    let mut pending: Vec<usize> = (0..columns.len())
+        .filter(|i| columns[*i].generated.is_some())
+        .collect();
+    let mut order = Vec::new();
+    loop {
+        let mut progress = false;
+        let mut redo = None;
+        let mut still = Vec::new();
+        for &i in &pending {
+            let g = columns[i].generated.as_ref().unwrap();
+            let mut blocked = false;
+            names_in(&g.expr, &mut |_, n| {
+                if let Some(j) = columns.iter().position(|c| c.name.eq_ignore_ascii_case(n)) {
+                    if j == i || (pending.contains(&j) && !order.contains(&j)) {
+                        blocked = true;
+                    }
+                }
+            });
+            if blocked {
+                redo = Some(i);
+                still.push(i);
+            } else {
+                progress = true;
+                order.push(i);
+            }
+        }
+        pending = still;
+        match redo {
+            None => return Ok(order),
+            Some(i) if !progress => {
+                return Err(Error::Runtime(format!(
+                    "generated column loop on \"{}\"",
+                    columns[i].name
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// Build a table definition from its parsed `CREATE TABLE`.
+pub fn table_from_ast(ct: &CreateTable, name: &str, root: u32, sql: &str) -> Result<Table> {
+    let mut columns = Vec::new();
+    for c in &ct.columns {
+        if let Some(g) = &c.generated {
+            if c.default.is_some() {
+                return Err(Error::Sql(
+                    "cannot use DEFAULT on a generated column".into(),
+                ));
+            }
+            if c.primary_key {
+                return Err(Error::Sql(
+                    "generated columns cannot be part of the PRIMARY KEY".into(),
+                ));
+            }
+            let mut bad = None;
+            names_in(&g.expr, &mut |t, n| {
+                let ok = t.is_none_or(|t| t.eq_ignore_ascii_case(name))
+                    && ct.columns.iter().any(|c| c.name.eq_ignore_ascii_case(n));
+                if !ok && bad.is_none() {
+                    bad = Some(match t {
+                        Some(t) => format!("{t}.{n}"),
+                        None => n.to_string(),
+                    });
+                }
+            });
+            if let Some(b) = bad {
+                return Err(Error::Sql(format!("no such column: {b}")));
+            }
+        }
+        columns.push(Column {
+            name: c.name.clone(),
+            decl_type: c.type_name.clone(),
+            affinity: Affinity::from_decl_type(&c.type_name),
+            collation: collation_of(&c.collation)?,
+            not_null: c.not_null,
+            default_value: c.default.as_ref().map(const_default).unwrap_or(Value::Null),
+            default: c.default.clone(),
+            generated: c.generated.clone(),
+            default_text: c.default_text.clone(),
+        });
+    }
+    if !columns.is_empty() && columns.iter().all(|c| c.generated.is_some()) {
+        return Err(Error::Sql(
+            "must have at least one non-generated column".into(),
+        ));
+    }
+    let gen_order = generated_order(&columns)?;
+    let mut table = Table {
+        name: name.to_string(),
+        root,
+        columns,
+        ipk: None,
+        without_rowid: ct.without_rowid,
+        storage_order: Vec::new(),
+        pk: Vec::new(),
+        indexes: Vec::new(),
+        pk_index: None,
+        checks: ct
+            .columns
+            .iter()
+            .flat_map(|c| c.checks.iter())
+            .chain(ct.constraints.iter().filter_map(|c| match c {
+                TableConstraint::Check(k) => Some(k),
+                _ => None,
+            }))
+            .map(|k| {
+                (
+                    k.name.clone().unwrap_or_else(|| k.text.clone()),
+                    k.expr.clone(),
+                )
+            })
+            .collect(),
+        autoincrement: ct.columns.iter().any(|c| c.autoincrement),
+        sql: sql.to_string(),
+        row_estimate: Cell::new(None),
+        pager: None,
+        strict: ct.strict,
+        gen_order,
+    };
+    if ct.strict {
+        for c in table.columns.iter_mut() {
+            let t = c.decl_type.to_ascii_uppercase();
+            match t.as_str() {
+                "INT" | "INTEGER" | "REAL" | "TEXT" | "BLOB" => {}
+                // ANY keeps values exactly as given.
+                "ANY" => c.affinity = Affinity::Blob,
+                "" => {
+                    return Err(Error::Sql(format!(
+                        "missing datatype for {name}.{}",
+                        c.name
+                    )))
+                }
+                _ => {
+                    return Err(Error::Sql(format!(
+                        "unknown datatype for {name}.{}: \"{}\"",
+                        c.name, c.decl_type
+                    )))
+                }
+            }
+        }
+    }
+    // Primary key columns, from a column constraint or a table constraint.
+    let mut pk_cols: Vec<IndexCol> = Vec::new();
+    let mut pk_desc = false;
+    for (i, c) in ct.columns.iter().enumerate() {
+        if c.primary_key {
+            pk_cols.push(IndexCol {
+                col: i,
+                collation: table.columns[i].collation,
+                desc: c.pk_desc,
+            });
+            pk_desc = c.pk_desc;
+        }
+    }
+    for tc in &ct.constraints {
+        if let TableConstraint::PrimaryKey(cols) = tc {
+            for c in cols {
+                let name = c
+                    .name
+                    .as_ref()
+                    .ok_or_else(|| Error::Unsupported("expression in primary key".into()))?;
+                let col = table
+                    .column_index(name)
+                    .ok_or_else(|| Error::Sql(format!("no such column: {name}")))?;
+                let collation = match &c.collation {
+                    Some(n) => collation_of(&Some(n.clone()))?,
+                    None => table.columns[col].collation,
+                };
+                pk_cols.push(IndexCol {
+                    col,
+                    collation,
+                    desc: c.desc,
+                });
+            }
+        }
+    }
+    if ct.without_rowid {
+        if pk_cols.is_empty() {
+            return Err(Error::Sql(format!("PRIMARY KEY missing on table {name}")));
+        }
+        let mut order: Vec<usize> = Vec::new();
+        let mut pk: Vec<IndexCol> = Vec::new();
+        for k in pk_cols {
+            if !order.contains(&k.col) {
+                order.push(k.col);
+                pk.push(k);
+            }
+        }
+        for i in 0..table.columns.len() {
+            if !order.contains(&i) && !table.columns[i].is_virtual() {
+                order.push(i);
+            }
+        }
+        table.storage_order = order;
+        table.pk = pk;
+    } else if pk_cols.len() == 1 {
+        let c = pk_cols[0].col;
+        // The rowid alias rule: declared type exactly INTEGER. (A column
+        // constraint written "INTEGER PRIMARY KEY DESC" is a historical
+        // exception and does not alias the rowid.)
+        if table.columns[c].decl_type.eq_ignore_ascii_case("INTEGER") && !pk_desc {
+            table.ipk = Some(c);
+        }
+    }
+    Ok(table)
+}
+
+impl Schema {
+    /// Read and parse `sqlite_schema`.
+    pub fn load(pager: &Rc<Pager>) -> Result<Schema> {
+        let mut schema = Schema {
+            pager: Some(pager.clone()),
+            ..Schema::default()
+        };
+        if pager.page_count() == 0 {
+            schema.add_schema_table();
+            return Ok(schema);
+        }
+        let mut cur = Cursor::new(pager.clone(), 1);
+        cur.first()?;
+        while cur.valid() {
+            let payload = cur.payload()?;
+            let vals = decode_all(payload.as_slice(), pager.encoding())?;
+            let text = |i: usize| match vals.get(i) {
+                Some(Value::Text(s)) => Some(s.to_string()),
+                _ => None,
+            };
+            schema.rows.push(SchemaRow {
+                rowid: cur.rowid()?,
+                kind: text(0).unwrap_or_default(),
+                name: text(1).unwrap_or_default(),
+                tbl_name: text(2).unwrap_or_default(),
+                root: match vals.get(3) {
+                    Some(Value::Int(i)) => *i as u32,
+                    _ => 0,
+                },
+                sql: text(4),
+            });
+            cur.next()?;
+        }
+        schema.build();
+        Ok(schema)
+    }
+
+    fn add_schema_table(&mut self) {
+        let sql = "CREATE TABLE sqlite_schema(type text, name text, tbl_name text, rootpage integer, sql text)";
+        if let Ok(Stmt::CreateTable(ct)) = parse_one(sql) {
+            if let Ok(mut t) = table_from_ast(&ct, "sqlite_schema", 1, sql) {
+                t.pager = self.pager.clone();
+                let t = Rc::new(t);
+                self.tables.insert("sqlite_schema".into(), t.clone());
+                self.tables.insert("sqlite_master".into(), t);
+            }
+        }
+    }
+
+    /// Turn the raw rows into table, index and view definitions.
+    fn build(&mut self) {
+        self.add_schema_table();
+        let rows = self.rows.clone();
+        let mut tables: HashMap<String, (Table, Option<CreateTable>)> = HashMap::new();
+        for r in rows.iter().filter(|r| r.kind == "table") {
+            let Some(sql) = &r.sql else { continue };
+            let parsed = parse_one(sql).and_then(|s| match s {
+                Stmt::CreateTable(ct) => {
+                    table_from_ast(&ct, &r.name, r.root, sql).map(|t| (t, Some(ct)))
+                }
+                _ => Err(Error::Unsupported("virtual tables".into())),
+            });
+            match parsed {
+                Ok(t) => {
+                    tables.insert(lower(&r.name), t);
+                }
+                Err(e) => {
+                    self.broken.insert(lower(&r.name), e.to_string());
+                }
+            }
+        }
+        // Explicit indexes carry their own SQL; automatic ones are matched
+        // to the table's constraints by their sequence number.
+        let mut auto: HashMap<String, Vec<(u32, &SchemaRow)>> = HashMap::new();
+        for r in rows.iter().filter(|r| r.kind == "index") {
+            let tkey = lower(&r.tbl_name);
+            let Some((table, _)) = tables.get_mut(&tkey) else {
+                continue;
+            };
+            self.index_tables.insert(lower(&r.name), tkey.clone());
+            match &r.sql {
+                None => {
+                    let n = r
+                        .name
+                        .rsplit('_')
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    auto.entry(tkey).or_default().push((n, r));
+                }
+                Some(sql) => {
+                    let idx = match parse_one(sql) {
+                        Ok(Stmt::CreateIndex(ci)) => {
+                            let mut cols = Vec::new();
+                            let mut exprs = Vec::new();
+                            let mut usable = !ci.partial;
+                            for c in &ci.columns {
+                                let col = c.name.as_ref().and_then(|n| table.column_index(n));
+                                let coll = c.collation.as_ref().map(|n| Collation::from_name(n));
+                                match (col, coll, &c.expr) {
+                                    (Some(col), None, _) => {
+                                        cols.push(IndexCol {
+                                            col,
+                                            collation: table.columns[col].collation,
+                                            desc: c.desc,
+                                        });
+                                        exprs.push(None);
+                                    }
+                                    (Some(col), Some(Some(collation)), _) => {
+                                        cols.push(IndexCol {
+                                            col,
+                                            collation,
+                                            desc: c.desc,
+                                        });
+                                        exprs.push(None);
+                                    }
+                                    // An expression key: the planner does not
+                                    // use these indexes; writes keep them.
+                                    (None, coll, Some(e)) => {
+                                        usable = false;
+                                        cols.push(IndexCol {
+                                            col: usize::MAX,
+                                            collation: coll.flatten().unwrap_or(Collation::Binary),
+                                            desc: c.desc,
+                                        });
+                                        exprs.push(Some(e.clone()));
+                                    }
+                                    _ => usable = false,
+                                }
+                            }
+                            if exprs.iter().all(Option::is_none) {
+                                exprs.clear();
+                            }
+                            Index {
+                                name: r.name.clone(),
+                                table: table.name.clone(),
+                                root: r.root,
+                                cols,
+                                unique: ci.unique,
+                                usable,
+                                sql: Some(sql.clone()),
+                                extra: Vec::new(),
+                                extra_order: Vec::new(),
+                                primary: false,
+                                exprs,
+                                where_: ci.where_.clone(),
+                            }
+                        }
+                        _ => Index {
+                            name: r.name.clone(),
+                            table: table.name.clone(),
+                            root: r.root,
+                            cols: Vec::new(),
+                            unique: false,
+                            usable: false,
+                            sql: Some(sql.clone()),
+                            extra: Vec::new(),
+                            extra_order: Vec::new(),
+                            primary: false,
+                            exprs: Vec::new(),
+                            where_: None,
+                        },
+                    };
+                    table.indexes.push(Rc::new(idx));
+                }
+            }
+        }
+        for (tkey, mut list) in auto {
+            list.sort_by_key(|(n, _)| *n);
+            let (table, ct) = tables.get_mut(&tkey).unwrap();
+            let keys = ct
+                .as_ref()
+                .and_then(|ct| auto_index_keys(ct, table).ok())
+                .unwrap_or_default();
+            let matched = keys.len() == list.len();
+            for (i, (_, r)) in list.iter().enumerate() {
+                table.indexes.push(Rc::new(Index {
+                    name: r.name.clone(),
+                    table: table.name.clone(),
+                    root: r.root,
+                    cols: if matched { keys[i].clone() } else { Vec::new() },
+                    unique: true,
+                    usable: matched,
+                    sql: None,
+                    extra: Vec::new(),
+                    extra_order: Vec::new(),
+                    primary: false,
+                    exprs: Vec::new(),
+                    where_: None,
+                }));
+            }
+        }
+        for (k, (mut t, _)) in tables {
+            if t.without_rowid {
+                let pk_cols: Vec<usize> = t.pk.iter().map(|c| c.col).collect();
+                t.indexes = t
+                    .indexes
+                    .iter()
+                    .map(|ix| {
+                        let extra: Vec<usize> = pk_cols
+                            .iter()
+                            .copied()
+                            .filter(|c| !ix.cols.iter().any(|ic| ic.col == *c))
+                            .collect();
+                        let extra_order = extra
+                            .iter()
+                            .map(|c| {
+                                let p = t.pk.iter().find(|p| p.col == *c).unwrap();
+                                (p.collation, p.desc)
+                            })
+                            .collect();
+                        Rc::new(Index {
+                            name: ix.name.clone(),
+                            table: ix.table.clone(),
+                            root: ix.root,
+                            cols: ix.cols.clone(),
+                            unique: ix.unique,
+                            usable: ix.usable,
+                            sql: ix.sql.clone(),
+                            extra,
+                            extra_order,
+                            primary: false,
+                            exprs: ix.exprs.clone(),
+                            where_: ix.where_.clone(),
+                        })
+                    })
+                    .collect();
+                t.pk_index = Some(Rc::new(Index {
+                    name: "PRIMARY KEY".into(),
+                    table: t.name.clone(),
+                    root: t.root,
+                    cols: t.pk.clone(),
+                    unique: true,
+                    usable: true,
+                    sql: None,
+                    extra: t.storage_order[t.pk.len()..].to_vec(),
+                    extra_order: Vec::new(),
+                    primary: true,
+                    exprs: Vec::new(),
+                    where_: None,
+                }));
+            }
+            t.pager = self.pager.clone();
+            self.tables.insert(k, Rc::new(t));
+        }
+        for r in rows.iter().filter(|r| r.kind == "view") {
+            let Some(sql) = &r.sql else { continue };
+            match parse_one(sql) {
+                Ok(Stmt::CreateView(cv)) => {
+                    self.views.insert(
+                        lower(&r.name),
+                        Rc::new(View {
+                            name: r.name.clone(),
+                            columns: cv.columns,
+                            select: cv.select,
+                            sql: sql.clone(),
+                            pager: self.pager.clone(),
+                        }),
+                    );
+                }
+                Ok(_) => {
+                    self.broken
+                        .insert(lower(&r.name), "not a view definition".into());
+                }
+                Err(e) => {
+                    self.broken.insert(lower(&r.name), e.to_string());
+                }
+            }
+        }
+        for r in rows.iter().filter(|r| r.kind == "trigger") {
+            let Some(sql) = &r.sql else { continue };
+            if let Ok(Stmt::CreateTrigger(def)) = parse_one(sql) {
+                self.triggers.push(Rc::new(Trigger {
+                    name: r.name.clone(),
+                    table: r.tbl_name.clone(),
+                    def,
+                    pager: self.pager.clone(),
+                }));
+            }
+        }
+    }
+
+    /// The schema a connection binds against: unqualified names resolve
+    /// to `temp` first, then `main`, then attached files in the order they
+    /// were attached, as in SQLite. `files` is in `database_list` order.
+    pub fn merge(files: &[(String, Rc<Schema>)]) -> Schema {
+        let mut m = Schema {
+            dbs: files.to_vec(),
+            ..Schema::default()
+        };
+        let order = files
+            .iter()
+            .position(|(n, _)| n == "temp")
+            .into_iter()
+            .chain((0..files.len()).filter(|i| files[*i].0 != "temp"));
+        for i in order {
+            let (name, s) = &files[i];
+            for (k, t) in &s.tables {
+                m.tables.entry(k.clone()).or_insert_with(|| t.clone());
+            }
+            for (k, v) in &s.views {
+                m.views.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            for (k, v) in &s.broken {
+                m.broken.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            if name == "temp" {
+                if let Some(t) = s.tables.get("sqlite_schema") {
+                    m.tables.insert("sqlite_temp_schema".into(), t.clone());
+                    m.tables.insert("sqlite_temp_master".into(), t.clone());
+                }
+            }
+        }
+        // `sqlite_schema` is always main's.
+        if let Some((_, main)) = files.iter().find(|(n, _)| n == "main") {
+            for k in ["sqlite_schema", "sqlite_master"] {
+                if let Some(t) = main.tables.get(k) {
+                    m.tables.insert(k.into(), t.clone());
+                }
+            }
+            m.rows = main.rows.clone();
+            m.pager = main.pager.clone();
+        }
+        for (_, s) in files {
+            m.triggers.extend(s.triggers.iter().cloned());
+        }
+        m
+    }
+
+    /// For a merged schema: the file a view's own names resolve in, or
+    /// None for a TEMP view (which uses the usual search).
+    pub fn view_file(&self, v: &View) -> Option<String> {
+        let p = v.pager.as_ref()?;
+        let (name, _) = self
+            .dbs
+            .iter()
+            .find(|(_, s)| s.pager.as_ref().is_some_and(|q| Rc::ptr_eq(p, q)))?;
+        (name != "temp").then(|| name.clone())
+    }
+
+    /// The schema of the file called `db` (`main`, `temp` or an attached
+    /// name), for a merged schema.
+    pub fn db(&self, db: &str) -> Option<&Rc<Schema>> {
+        self.dbs
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(db))
+            .map(|(_, s)| s)
+    }
+
+    /// The schema a `db.` qualifier names, or an error for an unknown name.
+    pub fn db_or_err(&self, db: &str) -> Result<&Rc<Schema>> {
+        self.db(db)
+            .ok_or_else(|| Error::Sql(format!("unknown database {db}")))
+    }
+
+    /// A table by optionally qualified name.
+    pub fn table_in(&self, db: Option<&str>, name: &str) -> Result<Option<Rc<Table>>> {
+        Ok(match db {
+            None => self.table(name).cloned(),
+            Some(d) => {
+                // An unknown database simply has no such table.
+                let Some(s) = self.db(d) else { return Ok(None) };
+                let l = lower(name);
+                // `temp.sqlite_master` is the temp file's schema table.
+                let l = match l.as_str() {
+                    "sqlite_temp_master" | "sqlite_temp_schema"
+                        if d.eq_ignore_ascii_case("temp") =>
+                    {
+                        "sqlite_schema".to_string()
+                    }
+                    _ => l,
+                };
+                s.tables.get(&l).cloned()
+            }
+        })
+    }
+
+    /// A view by optionally qualified name.
+    pub fn view_in(&self, db: Option<&str>, name: &str) -> Result<Option<Rc<View>>> {
+        Ok(match db {
+            None => self.view(name).cloned(),
+            Some(d) => self.db(d).and_then(|s| s.view(name).cloned()),
+        })
+    }
+
+    /// The files of a merged schema in name-resolution order.
+    pub fn priority(&self) -> impl Iterator<Item = &Rc<Schema>> {
+        let temp = self.dbs.iter().filter(|(n, _)| n == "temp");
+        let rest = self.dbs.iter().filter(|(n, _)| n != "temp");
+        temp.chain(rest).map(|(_, s)| s)
+    }
+
+    pub fn trigger(&self, name: &str) -> Option<&Rc<Trigger>> {
+        self.triggers
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn table(&self, name: &str) -> Option<&Rc<Table>> {
+        self.tables.get(&lower(name))
+    }
+
+    pub fn view(&self, name: &str) -> Option<&Rc<View>> {
+        self.views.get(&lower(name))
+    }
+
+    /// Find an index by name, with its table.
+    pub fn index(&self, name: &str) -> Option<(Rc<Table>, Rc<Index>)> {
+        if !self.dbs.is_empty() {
+            return self.priority().find_map(|s| s.index(name));
+        }
+        let t = self.tables.get(self.index_tables.get(&lower(name))?)?;
+        let i = t
+            .indexes
+            .iter()
+            .find(|i| i.name.eq_ignore_ascii_case(name))?;
+        Some((t.clone(), i.clone()))
+    }
+
+    /// User table names in schema order.
+    pub fn table_names(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|r| (r.kind == "table" || r.kind == "view") && !r.name.starts_with("sqlite_"))
+            .map(|r| r.name.clone())
+            .collect()
+    }
+}
