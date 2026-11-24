@@ -238,9 +238,14 @@ function renderResult(r) {
   const what = r.columns.length
     ? `${fmtInt(r.rowCount)} row${r.rowCount === 1 ? "" : "s"}${shown}`
     : r.changes ? `${fmtInt(r.changes)} row(s) changed` : "Done";
+  // The database is in memory, so page reads are only counted when the
+  // page cache had to load a page; zero says nothing, so it is not shown.
+  const reads = r.pageReads
+    ? [el("span", { class: "muted", text: `${fmtInt(r.pageReads)} page${r.pageReads === 1 ? "" : "s"} read` })]
+    : [];
   box.append(el("div", { class: "result-head" },
     el("strong", { text: what }),
-    el("span", { class: "muted", text: `${fmtInt(r.pageReads)} page${r.pageReads === 1 ? "" : "s"} read` }),
+    ...reads,
     el("code", { text: r.sql.replace(/\s+/g, " ") })));
   if (r.plan.length) box.append(renderPlan(r.plan));
   if (r.columns.length && !r.explain) box.append(renderTable(r));

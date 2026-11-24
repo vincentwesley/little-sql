@@ -1,5 +1,11 @@
 # Little SQL
 
+[![CI](https://github.com/vincentwesley/little-sql/actions/workflows/ci.yml/badge.svg)](https://github.com/vincentwesley/little-sql/actions/workflows/ci.yml)
+
+**[Try it in your browser](https://vincentwesley.github.io/little-sql/)** ·
+**[Download](https://github.com/vincentwesley/little-sql/releases/latest)** ·
+[Changelog](CHANGELOG.md)
+
 A small SQL database engine written from scratch in Rust. It opens real
 SQLite database files, answers queries on them and writes to them: it reads
 and writes the SQLite file format and its write-ahead log, walks and splits
@@ -10,6 +16,8 @@ a WebAssembly playground that runs in the browser.
 
 The engine has no dependencies: no SQL parser, storage or query library,
 and no third-party crates at all.
+
+![The Little SQL playground running a query on the demo database, with its query plan and row counts](docs/images/playground.png)
 
 ## How well does it work?
 
@@ -46,7 +54,7 @@ What the numbers mean:
   indexes, views and basic DML; features it never exercises (window
   and JSON functions, for example) are covered by the differential tests,
   and what is missing is listed under
-  [Not supported](#not-supported-yet) below.
+  [Limits](#limits) below.
 
 Details of the scoring rules are in [docs/DECISIONS.md](docs/DECISIONS.md)
 (D5, D6, D14), and which test files the CI sample includes and why is in
@@ -54,7 +62,9 @@ Details of the scoring rules are in [docs/DECISIONS.md](docs/DECISIONS.md)
 
 ## Quick start
 
-You need a Rust toolchain ([rustup.rs](https://rustup.rs)).
+Prebuilt `littlesql` shells for Linux, macOS and Windows are on the
+[releases page](https://github.com/vincentwesley/little-sql/releases/latest).
+To build from source you need a Rust toolchain ([rustup.rs](https://rustup.rs)).
 
 ```bash
 git clone https://github.com/vincentwesley/little-sql
@@ -200,8 +210,16 @@ push and keeps it as a downloadable artifact.
   `EXPLAIN QUERY PLAN` output is identical to SQLite's, and on 6,000
   random single-table queries 99.95 % of plans are identical.
 
-## Not supported (yet)
+## Limits
 
+Little SQL is finished at 1.0 ([roadmap](docs/ROADMAP.md)); these are known
+and deliberately left as they are:
+
+- Joins are planned with simpler heuristics than SQLite's cost model (which
+  Little SQL uses for single-table queries), so some join plans differ.
+  The answers are the same.
+- `min(x)` / `max(x)` scan an index where SQLite seeks one entry, and
+  SQLite's rewriting of `x > 0 AND x = 5` into constants is not done.
 - The `jsonb_*` functions that return binary JSON (JSONB input is read),
   and virtual tables other than `json_each` / `json_tree`.
 - `pragma_function_list` and the other pragmas that are not about the
@@ -257,8 +275,10 @@ SQL text ─▶ lexer ─▶ parser ─▶ AST ─▶ binder/planner ─▶ plan
 | `playground/` | The browser playground (HTML, CSS, JavaScript; no build step) |
 
 [docs/PLAN.md](docs/PLAN.md) describes the architecture and milestones,
-[docs/DECISIONS.md](docs/DECISIONS.md) every design decision and why, and
-[docs/RESEARCH.md](docs/RESEARCH.md) the sources it was built from.
+[docs/DECISIONS.md](docs/DECISIONS.md) every design decision and why,
+[docs/RESEARCH.md](docs/RESEARCH.md) the sources it was built from, and
+[docs/ROADMAP.md](docs/ROADMAP.md) what 1.0 includes and what is
+deliberately out of scope.
 
 ## Running the tests
 

@@ -1,11 +1,13 @@
 # Handover
 
 Updated after every milestone so a new session can continue from here.
-This is the final state at the end of the first build (M0–M10).
 
-## Status (2026-11-22)
+## Status (2026-11-24): finished at 1.0
 
-All milestones in PLAN.md are done. `scripts/acceptance.sh` passes all 20
+The project is feature-frozen and ready to ship as 1.0; what is left are
+the owner's steps in [ROADMAP.md](ROADMAP.md) (enable Pages, merge, tag
+`v1.0.0`, which publishes the release through `.github/workflows/release.yml`).
+After that only reported bugs are fixed. All milestones in PLAN.md are done. `scripts/acceptance.sh` passes all 20
 checks, verified from a fresh clone of `claude/nice-brown-acniv0` (1 min
 45 s on a 4-core VM). The whole project is in one pull request:
 [vincentwesley/little-sql#1](https://github.com/vincentwesley/little-sql/pull/1).
@@ -181,15 +183,13 @@ sqllogictest corpus in native mode; 443 / 443 differential tests.
 
 ## Not done, and why
 
-- **Hosting the playground.** Optional in the brief, and it needs the
-  repository owner to enable GitHub Pages (or choose another host); see
-  NEEDS-VIN. CI keeps the built site as a downloadable artifact.
+- **Hosting the playground.** Needs the repository owner to enable GitHub
+  Pages; see NEEDS-VIN. CI keeps the built site as a downloadable artifact.
 - **`jsonb_*` functions** (which return binary JSON) and **virtual tables**
   other than `json_each` / `json_tree`: not exercised by the corpus; each is
   rejected with a clear "not supported" error rather than approximated.
-  Most useful next: SQLite's cost model for joins (the path solver with
-  several loops, D46 covers one table), then `jsonb_*` (needs SQLite's
-  exact JSONB encoding choices).
+  Like SQLite's cost model for joins (D46 covers one table), they are out
+  of scope for 1.0 (docs/ROADMAP.md).
 - **Multi-process access** (file locks, `-shm`): out of scope by design
   (DECISIONS D13).
 - **SQLite-grade speed**: would need a bytecode VM and three-sibling
@@ -197,7 +197,5 @@ sqllogictest corpus in native mode; 443 / 443 differential tests.
 
 ## Items in NEEDS-VIN.md
 
-- Nothing is required. One optional item: publishing the playground. A
-  ready workflow (`.github/workflows/pages.yml`, run by hand) needs only
-  GitHub Pages enabled with "Source: GitHub Actions" (steps in
-  docs/NEEDS-VIN.md).
+- The owner's steps to ship 1.0: merge, enable Pages and run the Pages
+  workflow, push the tag `v1.0.0` (steps in docs/NEEDS-VIN.md).

@@ -1,21 +1,31 @@
 # Things only Vin can do
 
-Nothing here blocks the project; each item is optional.
+These are the last steps to ship 1.0 (see [ROADMAP.md](ROADMAP.md)). Each
+needs the repository owner; none needs a key or a paid service.
 
-## Optional: publish the playground
+1. **Merge the pull request** into `main`.
+2. **Publish the playground.** In **Settings → Pages**, set **Source** to
+   **GitHub Actions**. Then in the **Actions** tab choose **Publish the
+   playground** and press **Run workflow**. The site appears at
+   https://vincentwesley.github.io/little-sql/, the link at the top of the
+   README.
+3. **Release 1.0.0.** On `main`, run:
 
-The playground is a plain static site; finishing the project did not depend
-on hosting it. To put it online with GitHub Pages (free, no keys):
+   ```bash
+   git tag v1.0.0
+   ```
 
-1. Merge the pull request into `main`.
-2. In the repository's **Settings → Pages**, set **Source** to
-   **GitHub Actions** (only the repository owner can do this).
-3. In the **Actions** tab, choose **Publish the playground** and press
-   **Run workflow**. It builds `playground/dist/` and deploys it; the page
-   address appears in the run's summary.
+   ```bash
+   git push origin v1.0.0
+   ```
 
-The workflow (`.github/workflows/pages.yml`) only runs when started by
-hand, so it cannot fail on its own before Pages is enabled.
+   The **Release** workflow then builds the shell for Linux, macOS and
+   Windows and the playground, and publishes them as a GitHub release with
+   the notes from CHANGELOG.md. The README's Download link points there.
+4. **Optional:** set the repository description (for example "A
+   SQLite-compatible database engine written from scratch in Rust, with a
+   browser playground"), add topics such as `rust`, `sqlite`, `database`,
+   `webassembly`, and pin it on your profile.
 
-Any other static host works the same way: serve the contents of
+Any static host also works for the playground: serve the contents of
 `playground/dist/` (largest file: the 18 MB demo database).

@@ -73,7 +73,8 @@ if want M0; then
     local missing=0
     for f in LICENSE SECURITY.md README.md .github/workflows/ci.yml \
       docs/RESEARCH.md docs/DECISIONS.md docs/PLAN.md docs/ACCEPTANCE.md \
-      docs/HANDOVER.md docs/NEEDS-VIN.md tests/slt/SAMPLE tests/slt/MANIFEST.md \
+      docs/HANDOVER.md docs/NEEDS-VIN.md docs/ROADMAP.md CHANGELOG.md \
+      .github/workflows/release.yml tests/slt/SAMPLE tests/slt/MANIFEST.md \
       tests/slt/FLOOR; do
       [ -s "$f" ] || { echo "missing or empty: $f"; missing=1; }
     done
